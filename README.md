@@ -118,7 +118,9 @@ Stop with **Ctrl+C**. Parsed signals are appended to `logs/signals.jsonl`.
 The dashboard reads `logs/*.jsonl` and gives you a live, visual view of all
 captured signals plus a real-time stream of new ones via Server-Sent Events.
 
-One command starts both the FastAPI backend and the Vite frontend:
+One command starts the FastAPI backend, the Vite frontend, **and** the
+Discord listener — so anything posted in the watched channel shows up in
+the dashboard immediately:
 
 ```bash
 python -m bot.dashboard
@@ -126,7 +128,17 @@ python -m bot.dashboard
 
 Then open http://localhost:5173 in your browser.
 
-Or run them separately (handy for development):
+If the listener crashes (bad token, network blip, Discord rate limit), the
+dashboard keeps running so you can still inspect historical data — you'll
+see a warning in the launcher's terminal.
+
+If you only want the dashboard (no listener), use:
+
+```bash
+python -m bot.dashboard --no-listener
+```
+
+Or run each piece in its own terminal (handy for development):
 
 ```bash
 # Terminal 1 -- backend on :8787
@@ -134,10 +146,10 @@ python -m server.api
 
 # Terminal 2 -- frontend on :5173 (proxies /api to :8787)
 cd web && npm run dev
-```
 
-You can run the dashboard alongside the listener -- the listener writes to
-`logs/signals.jsonl` and the dashboard tails it.
+# Terminal 3 -- live Discord capture (writes logs/signals.jsonl)
+python -m bot.listener
+```
 
 ### One-time frontend setup
 

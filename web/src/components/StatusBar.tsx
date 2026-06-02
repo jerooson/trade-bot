@@ -6,10 +6,11 @@ import clsx from "clsx";
 interface Props {
   conn: ConnectionState;
   lastEventAt: string | null;
-  totalSignals: number;
+  total: number;
+  totalLabel?: string;
 }
 
-export function StatusBar({ conn, lastEventAt, totalSignals }: Props) {
+export function StatusBar({ conn, lastEventAt, total, totalLabel = "signals on file" }: Props) {
   const [now, setNow] = useState<Date>(new Date());
 
   useEffect(() => {
@@ -75,8 +76,8 @@ export function StatusBar({ conn, lastEventAt, totalSignals }: Props) {
             }
           />
           <Stat
-            label="signals on file"
-            value={<span className="tabular text-bone-100">{totalSignals.toLocaleString()}</span>}
+            label={totalLabel}
+            value={<span className="tabular text-bone-100">{total.toLocaleString()}</span>}
           />
         </div>
 

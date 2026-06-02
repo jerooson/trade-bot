@@ -25,3 +25,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Verification screenshots and Playwright MCP scratch outputs (never tracked)
+*.png
+.playwright-mcp/

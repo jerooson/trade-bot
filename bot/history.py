@@ -1,65 +1,50 @@
 """
 One-shot historical message backfill.
 
-Pulls the last N messages from each configured channel, parses them, prints
-parsed signals, and writes them to a JSONL file. Then exits cleanly.
+Pulls the last N messages from each configured channel, parses them with the
+right parser for that channel's role (signal vs plan), and appends recognized
+records to JSONL files. Then exits cleanly.
 
-This is the same parsing pipeline the live listener uses; the only difference
-is the source of messages (channel.history paginated fetch instead of
-gateway message_create events).
+Output files:
+  - signal channels  -> ./logs/history.jsonl        (overridable via --signal-out)
+  - plan channels    -> ./logs/plans_history.jsonl  (overridable via --plan-out)
+  - swing channels   -> ./logs/swings_history.jsonl (overridable via --swing-out)
 
 Useful for:
-  - Verifying the parser against REAL channel messages (not just unit fixtures)
   - Catching up after the listener was offline
   - Building a dataset for backtesting
+  - Verifying parsers against REAL channel messages
 
 Run:
-    python -m bot.history                        # default 200 messages/channel
-    python -m bot.history --limit 1000           # go further back
-    python -m bot.history --out logs/dump.jsonl  # custom output path
-    python -m bot.history --since 2026-05-01     # only messages on/after this date
-
-Stop with Ctrl-C.
+    python -m bot.history                           # all configured channels
+    python -m bot.history --limit 1000              # go further back
+    python -m bot.history --since 2026-05-07        # only on/after this date
+    python -m bot.history --kind signal             # only signal channels
+    python -m bot.history --kind plan               # only plan channels
+    python -m bot.history --kind swing              # only swing channels
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import discord
 
-from bot.listener import _load_config, _setup_logging
-from bot.parser import Signal, parse_message
+from bot.listener import _embed_text, _load_config, _setup_logging
+from bot.parser import parse_message
+from bot.plan_parser import parse_plan
+from bot.swing_parser import parse_swing
 
 log = logging.getLogger("bot.history")
 
 
-def _extract_text_candidates(message: discord.Message) -> list[str]:
-    """Same logic as the live listener: look at message.content AND embeds."""
-    candidates: list[str] = []
-    if message.content:
-        candidates.append(message.content)
-    for embed in message.embeds:
-        chunks: list[str] = []
-        if embed.title:
-            chunks.append(str(embed.title))
-        if embed.description:
-            chunks.append(str(embed.description))
-        for fld in embed.fields:
-            chunks.append(f"{fld.name}: {fld.value}")
-        if chunks:
-            candidates.append("\n".join(chunks))
-    return candidates
-
-
-def _record(sig: Signal, message: discord.Message, channel: discord.abc.GuildChannel | discord.DMChannel) -> dict:
-    record = sig.to_dict()
-    record["discord"] = {
+def _discord_metadata(message: discord.Message, channel) -> dict:
+    return {
         "message_id": message.id,
         "channel_id": channel.id,
         "channel_name": getattr(channel, "name", None),
@@ -68,47 +53,47 @@ def _record(sig: Signal, message: discord.Message, channel: discord.abc.GuildCha
         "author_name": str(message.author),
         "created_at": message.created_at.isoformat(),
     }
-    return record
 
 
-async def _backfill_channel(
+async def _backfill_signal_channel(
     client: discord.Client,
     channel_id: int,
     limit: int,
     after: datetime | None,
     out_path: Path,
 ) -> tuple[int, int]:
-    """Returns (messages_scanned, signals_parsed)."""
-    channel = client.get_channel(channel_id)
+    """Returns (messages_scanned, signals_parsed) for a SIGNAL channel."""
+    channel = client.get_channel(channel_id) or await _safe_fetch(client, channel_id)
     if channel is None:
-        try:
-            channel = await client.fetch_channel(channel_id)
-        except Exception as e:
-            log.error("Could not access channel %s: %s", channel_id, e)
-            return 0, 0
+        return 0, 0
 
-    name = getattr(channel, "name", "?")
-    log.info("Fetching up to %d messages from #%s (%s)%s",
-             limit, name, channel_id,
+    log.info("[signal] Fetching up to %d msgs from #%s (%s)%s",
+             limit, getattr(channel, "name", "?"), channel_id,
              f" since {after.date()}" if after else "")
 
-    scanned = 0
-    parsed = 0
-    # oldest_first=False is the default; we go newest-first and let "limit"
-    # bound how far back we go. If "after" is set we let history filter for us.
+    scanned = parsed = 0
     async for message in channel.history(limit=limit, after=after, oldest_first=False):
         scanned += 1
-        for text in _extract_text_candidates(message):
+        candidates: list[str] = []
+        if message.content:
+            candidates.append(message.content)
+        for embed in message.embeds:
+            text = _embed_text(embed)
+            if text:
+                candidates.append(text)
+
+        for text in candidates:
             sig = parse_message(text)
             if sig is None:
                 continue
             parsed += 1
-
+            record = sig.to_dict()
+            record["discord"] = _discord_metadata(message, channel)
             with out_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(_record(sig, message, channel), ensure_ascii=False) + "\n")
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
             log.info(
-                "%-7s %-6s side=%-5s trigger=%-7s target=%-7s current=%-7s  [%s]",
+                "[signal] %-7s %-6s side=%-5s trigger=%-7s target=%-7s current=%-7s  [%s]",
                 sig.kind.value,
                 sig.ticker,
                 sig.side.value if sig.side else "?",
@@ -118,14 +103,111 @@ async def _backfill_channel(
                 message.created_at.strftime("%Y-%m-%d %H:%M"),
             )
 
-    log.info("Channel %s done: %d messages scanned, %d signals parsed.", channel_id, scanned, parsed)
+    log.info("[signal] Channel %s done: %d msgs scanned, %d signals parsed.",
+             channel_id, scanned, parsed)
     return scanned, parsed
+
+
+async def _backfill_plan_channel(
+    client: discord.Client,
+    channel_id: int,
+    limit: int,
+    after: datetime | None,
+    out_path: Path,
+) -> tuple[int, int]:
+    """Returns (messages_scanned, plans_parsed) for a PLAN channel."""
+    channel = client.get_channel(channel_id) or await _safe_fetch(client, channel_id)
+    if channel is None:
+        return 0, 0
+
+    log.info("[plan]   Fetching up to %d msgs from #%s (%s)%s",
+             limit, getattr(channel, "name", "?"), channel_id,
+             f" since {after.date()}" if after else "")
+
+    scanned = parsed = 0
+    async for message in channel.history(limit=limit, after=after, oldest_first=False):
+        scanned += 1
+
+        embed_title: str | None = None
+        if message.embeds and message.embeds[0].title:
+            embed_title = str(message.embeds[0].title)
+
+        plan = parse_plan(message.content or "", embed_title=embed_title)
+        if plan is None:
+            continue
+        parsed += 1
+        record = plan.to_dict()
+        record["discord"] = _discord_metadata(message, channel)
+        with out_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        log.info(
+            "[plan]   %-6s levels=%s  [%s]",
+            plan.ticker,
+            plan.watch_levels,
+            message.created_at.strftime("%Y-%m-%d %H:%M"),
+        )
+
+    log.info("[plan]   Channel %s done: %d msgs scanned, %d plans parsed.",
+             channel_id, scanned, parsed)
+    return scanned, parsed
+
+
+async def _backfill_swing_channel(
+    client: discord.Client,
+    channel_id: int,
+    limit: int,
+    after: datetime | None,
+    out_path: Path,
+) -> tuple[int, int]:
+    """Returns (messages_scanned, actions_parsed) for a SWING channel."""
+    channel = client.get_channel(channel_id) or await _safe_fetch(client, channel_id)
+    if channel is None:
+        return 0, 0
+
+    log.info("[swing]  Fetching up to %d msgs from #%s (%s)%s",
+             limit, getattr(channel, "name", "?"), channel_id,
+             f" since {after.date()}" if after else "")
+
+    scanned = parsed = 0
+    async for message in channel.history(limit=limit, after=after, oldest_first=False):
+        scanned += 1
+        action = parse_swing(message.content or "")
+        if action is None:
+            continue
+        parsed += 1
+        record = action.to_dict()
+        record["discord"] = _discord_metadata(message, channel)
+        with out_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        log.info(
+            "[swing]  %-16s %-6s side=%-5s price=%-8s size=%-12s stop=%-12s [%s]",
+            action.kind.value,
+            action.ticker,
+            action.side.value if action.side else "?",
+            action.price,
+            action.position_size or "",
+            action.stop_loss_label or "",
+            message.created_at.strftime("%Y-%m-%d %H:%M"),
+        )
+
+    log.info("[swing]  Channel %s done: %d msgs scanned, %d actions parsed.",
+             channel_id, scanned, parsed)
+    return scanned, parsed
+
+
+async def _safe_fetch(client: discord.Client, channel_id: int):
+    try:
+        return await client.fetch_channel(channel_id)
+    except Exception as e:
+        log.error("Could not access channel %s: %s", channel_id, e)
+        return None
 
 
 def _parse_since(value: str | None) -> datetime | None:
     if not value:
         return None
-    # Accept YYYY-MM-DD or full ISO 8601.
     try:
         if len(value) == 10:
             dt = datetime.strptime(value, "%Y-%m-%d")
@@ -139,20 +221,46 @@ def _parse_since(value: str | None) -> datetime | None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Backfill historical signals from Discord channels.")
+    ap = argparse.ArgumentParser(description="Backfill historical messages from Discord channels.")
     ap.add_argument("--limit", type=int, default=200, help="Max messages per channel (default 200).")
     ap.add_argument("--since", type=str, default=None,
                     help="Only fetch messages on/after this date (YYYY-MM-DD or ISO 8601 UTC).")
-    ap.add_argument("--out", type=Path, default=Path("./logs/history.jsonl"),
-                    help="Output JSONL file (default ./logs/history.jsonl). Records are APPENDED.")
+    ap.add_argument("--kind", choices=("all", "signal", "plan", "swing"), default="all",
+                    help="Limit backfill to a specific channel role (default all).")
+    ap.add_argument("--signal-out", type=Path, default=Path("./logs/history.jsonl"),
+                    help="Output JSONL for signal channels (default ./logs/history.jsonl).")
+    ap.add_argument("--plan-out", type=Path, default=Path("./logs/plans_history.jsonl"),
+                    help="Output JSONL for plan channels (default ./logs/plans_history.jsonl).")
+    ap.add_argument("--swing-out", type=Path, default=Path("./logs/swings_history.jsonl"),
+                    help="Output JSONL for swing channels (default ./logs/swings_history.jsonl).")
     args = ap.parse_args()
 
     _setup_logging()
-    token, channel_ids, _ = _load_config()
+    config = _load_config()
     after = _parse_since(args.since)
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    log.info("Writing parsed signals to %s", args.out)
+    args.signal_out.parent.mkdir(parents=True, exist_ok=True)
+    args.plan_out.parent.mkdir(parents=True, exist_ok=True)
+    args.swing_out.parent.mkdir(parents=True, exist_ok=True)
+
+    do_signals = args.kind in ("all", "signal") and bool(config.signal_channels)
+    do_plans = args.kind in ("all", "plan") and bool(config.plan_channels)
+    do_swings = args.kind in ("all", "swing") and bool(config.swing_channels)
+
+    if not (do_signals or do_plans or do_swings):
+        sys_exit_msg = "Nothing to backfill -- "
+        if args.kind != "all":
+            sys_exit_msg += f"no {args.kind} channels are configured."
+        else:
+            sys_exit_msg += "no channels configured in .env."
+        raise SystemExit(sys_exit_msg)
+
+    if do_signals:
+        log.info("Signal backfill -> %s", args.signal_out)
+    if do_plans:
+        log.info("Plan   backfill -> %s", args.plan_out)
+    if do_swings:
+        log.info("Swing  backfill -> %s", args.swing_out)
 
     client = discord.Client()
 
@@ -162,17 +270,28 @@ def main() -> None:
         total_scanned = 0
         total_parsed = 0
         try:
-            for cid in channel_ids:
-                s, p = await _backfill_channel(client, cid, args.limit, after, args.out)
-                total_scanned += s
-                total_parsed += p
+            if do_signals:
+                for cid in config.signal_channels:
+                    s, p = await _backfill_signal_channel(client, cid, args.limit, after, args.signal_out)
+                    total_scanned += s
+                    total_parsed += p
+            if do_plans:
+                for cid in config.plan_channels:
+                    s, p = await _backfill_plan_channel(client, cid, args.limit, after, args.plan_out)
+                    total_scanned += s
+                    total_parsed += p
+            if do_swings:
+                for cid in config.swing_channels:
+                    s, p = await _backfill_swing_channel(client, cid, args.limit, after, args.swing_out)
+                    total_scanned += s
+                    total_parsed += p
         finally:
-            log.info("All channels done: %d messages scanned, %d signals parsed total.",
+            log.info("All channels done: %d msgs scanned, %d records parsed total.",
                      total_scanned, total_parsed)
             await client.close()
 
     try:
-        client.run(token)
+        client.run(config.token)
     except KeyboardInterrupt:
         log.info("Interrupted.")
 

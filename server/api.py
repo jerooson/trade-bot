@@ -19,8 +19,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -32,8 +34,18 @@ log = logging.getLogger("server.api")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT_ROOT / "logs"
+
+# Live-signal channel (structured PLAN/TRIGGER/PROFIT).
 HISTORY_PATH = LOG_DIR / "history.jsonl"
 LIVE_PATH = LOG_DIR / "signals.jsonl"
+
+# Trade-plan channel (free-form swing-trade write-ups).
+PLAN_HISTORY_PATH = LOG_DIR / "plans_history.jsonl"
+PLAN_LIVE_PATH = LOG_DIR / "plans.jsonl"
+
+# Swing-trade execution channel (structured trade actions).
+SWING_HISTORY_PATH = LOG_DIR / "swings_history.jsonl"
+SWING_LIVE_PATH = LOG_DIR / "swings.jsonl"
 
 
 app = FastAPI(title="trade-bot dashboard", version="0.1.0")
@@ -65,9 +77,9 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-def _load_all_signals() -> list[dict[str, Any]]:
+def _load_dedup_sorted(history_path: Path, live_path: Path) -> list[dict[str, Any]]:
     """Load history + live, dedupe by Discord message_id, sort newest first."""
-    combined = _read_jsonl(HISTORY_PATH) + _read_jsonl(LIVE_PATH)
+    combined = _read_jsonl(history_path) + _read_jsonl(live_path)
 
     seen: set[int] = set()
     deduped: list[dict[str, Any]] = []
@@ -75,7 +87,6 @@ def _load_all_signals() -> list[dict[str, Any]]:
         mid = r.get("discord", {}).get("message_id")
         if mid is None or mid in seen:
             if mid is None:
-                # Records without a message_id: keep them, but they can't be deduped.
                 deduped.append(r)
             continue
         seen.add(mid)
@@ -88,16 +99,200 @@ def _load_all_signals() -> list[dict[str, Any]]:
     return deduped
 
 
+def _load_all_signals() -> list[dict[str, Any]]:
+    return _load_dedup_sorted(HISTORY_PATH, LIVE_PATH)
+
+
+def _load_all_plans() -> list[dict[str, Any]]:
+    return _load_dedup_sorted(PLAN_HISTORY_PATH, PLAN_LIVE_PATH)
+
+
+def _load_all_swings() -> list[dict[str, Any]]:
+    return _load_dedup_sorted(SWING_HISTORY_PATH, SWING_LIVE_PATH)
+
+
+# -- Swing-trade position folding -------------------------------------------
+
+# Action kinds that change the "open positions" book.
+_OPENING_KINDS = {"ENTRY", "ADD"}
+_CLOSING_KINDS = {"CLOSE", "STOP_TRIGGER"}
+
+
+def _action_ts(action: dict[str, Any]) -> str:
+    return action.get("discord", {}).get("created_at") or action.get("received_at") or ""
+
+
+_FRAC_RE = re.compile(r"^(\d+)/(\d+)$")
+
+
+def _size_to_fraction(value: str | None) -> Fraction | None:
+    """
+    Parse a position-size string into an exact Fraction.
+
+    Handles:
+      "1/3"             -> 1/3
+      "+1/4 -> 3/4"     -> 3/4   (right-hand side of arrow == new total)
+      "+1/4 → 3/4"      -> 3/4
+      "7/8 -> 3/4"      -> 3/4
+      "1/8"             -> 1/8   (used for delta_size on REDUCE)
+      ""/None/garbage   -> None
+    """
+    if not value:
+        return None
+    text = value.replace("→", "->").replace(" ", "")
+    if "->" in text:
+        text = text.rsplit("->", 1)[1]
+    text = text.lstrip("+-")
+    m = _FRAC_RE.match(text)
+    if not m:
+        return None
+    num, den = int(m.group(1)), int(m.group(2))
+    if den == 0:
+        return None
+    return Fraction(num, den)
+
+
+def _format_fraction(f: Fraction) -> str:
+    """Format a Fraction as a clean 'p/q' string."""
+    return f"{f.numerator}/{f.denominator}"
+
+
+def _derive_open_positions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Walk actions in chronological (oldest -> newest) order and produce the
+    current set of open positions.
+
+    Algorithm:
+      - On ENTRY:    create/replace the position with size, avg_cost, side, stop.
+      - On ADD:      update size + avg_cost (we trust the message; the channel
+                     emits the new totals).
+      - On REDUCE:   update size if the new size is included; otherwise keep.
+      - On CLOSE:    drop the position entirely.
+      - On STOP_TRIGGER: drop the position (stop hit -> exited).
+      - On STOP_UPDATE: update the stop in-place if the position is open.
+      - On POSITION_UPDATE: refresh last_price and last_pnl_pct for the
+                            position (informational; doesn't open one if
+                            we never saw an entry).
+
+    The result is sorted by `last_pnl_pct` desc so winners float to the top.
+    """
+    by_ticker: dict[str, dict[str, Any]] = {}
+
+    chrono = sorted(actions, key=_action_ts)
+    for a in chrono:
+        ticker = (a.get("ticker") or "").upper()
+        if not ticker:
+            continue
+        kind = a.get("kind")
+        ts = _action_ts(a)
+
+        if kind == "ENTRY":
+            by_ticker[ticker] = {
+                "ticker": ticker,
+                "side": a.get("side"),
+                "avg_cost": a.get("price") or a.get("avg_cost"),
+                "position_size": a.get("position_size"),
+                "position_fraction": a.get("position_fraction"),
+                "stop_loss": a.get("stop_loss"),
+                "stop_loss_label": a.get("stop_loss_label"),
+                "opened_at": ts,
+                "last_action_at": ts,
+                "last_action_kind": kind,
+                "last_price": a.get("price"),
+                "last_pnl_pct": None,
+            }
+        elif kind == "ADD":
+            pos = by_ticker.get(ticker)
+            if pos is None:
+                pos = by_ticker[ticker] = {
+                    "ticker": ticker,
+                    "side": a.get("side"),
+                    "opened_at": ts,
+                }
+            pos["avg_cost"] = a.get("avg_cost") or pos.get("avg_cost") or a.get("price")
+            pos["position_size"] = a.get("position_size") or pos.get("position_size")
+            pos["position_fraction"] = a.get("position_fraction") or pos.get("position_fraction")
+            pos["last_action_at"] = ts
+            pos["last_action_kind"] = kind
+            pos["last_price"] = a.get("price") or pos.get("last_price")
+        elif kind == "REDUCE":
+            # The channel posts the AMOUNT trimmed (delta_size, e.g. "1/8"),
+            # not the new total. Compute the new total by subtracting the
+            # delta from the running fraction. If we can't (delta missing,
+            # or current size unparseable) we leave size as-is so we don't
+            # silently lie.
+            pos = by_ticker.get(ticker)
+            if pos is not None:
+                delta = _size_to_fraction(a.get("delta_size"))
+                current = _size_to_fraction(pos.get("position_size"))
+                if delta is not None and current is not None:
+                    new_frac = current - delta
+                    if new_frac <= 0:
+                        # Trim crossed zero -> treat as fully closed.
+                        by_ticker.pop(ticker, None)
+                        continue
+                    pos["position_size"] = _format_fraction(new_frac)
+                    pos["position_fraction"] = float(new_frac)
+                pos["last_action_at"] = ts
+                pos["last_action_kind"] = kind
+                pos["last_pnl_pct"] = a.get("profit_pct")
+        elif kind in _CLOSING_KINDS:
+            by_ticker.pop(ticker, None)
+        elif kind == "STOP_UPDATE":
+            pos = by_ticker.get(ticker)
+            if pos is not None:
+                pos["stop_loss"] = a.get("stop_loss") or pos.get("stop_loss")
+                pos["stop_loss_label"] = a.get("stop_loss_label") or pos.get("stop_loss_label")
+                pos["last_action_at"] = ts
+                pos["last_action_kind"] = kind
+        elif kind == "POSITION_UPDATE":
+            pos = by_ticker.get(ticker)
+            if pos is not None:
+                if a.get("price") is not None:
+                    pos["last_price"] = a.get("price")
+                if a.get("avg_cost") is not None:
+                    pos["avg_cost"] = a.get("avg_cost")
+                if a.get("profit_pct") is not None:
+                    pos["last_pnl_pct"] = a.get("profit_pct")
+                pos["last_action_at"] = ts
+                pos["last_action_kind"] = kind
+
+    positions = list(by_ticker.values())
+    positions.sort(
+        key=lambda p: (p.get("last_pnl_pct") if p.get("last_pnl_pct") is not None else -1e9),
+        reverse=True,
+    )
+    return positions
+
+
 # -- Endpoints ---------------------------------------------------------------
+
+def _file_size(path: Path) -> int:
+    return path.stat().st_size if path.exists() else 0
+
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
         "ok": True,
-        "history_exists": HISTORY_PATH.exists(),
-        "live_exists": LIVE_PATH.exists(),
-        "history_size_bytes": HISTORY_PATH.stat().st_size if HISTORY_PATH.exists() else 0,
-        "live_size_bytes": LIVE_PATH.stat().st_size if LIVE_PATH.exists() else 0,
+        "signals": {
+            "history_exists": HISTORY_PATH.exists(),
+            "live_exists": LIVE_PATH.exists(),
+            "history_size_bytes": _file_size(HISTORY_PATH),
+            "live_size_bytes": _file_size(LIVE_PATH),
+        },
+        "plans": {
+            "history_exists": PLAN_HISTORY_PATH.exists(),
+            "live_exists": PLAN_LIVE_PATH.exists(),
+            "history_size_bytes": _file_size(PLAN_HISTORY_PATH),
+            "live_size_bytes": _file_size(PLAN_LIVE_PATH),
+        },
+        "swings": {
+            "history_exists": SWING_HISTORY_PATH.exists(),
+            "live_exists": SWING_LIVE_PATH.exists(),
+            "history_size_bytes": _file_size(SWING_HISTORY_PATH),
+            "live_size_bytes": _file_size(SWING_LIVE_PATH),
+        },
     }
 
 
@@ -114,6 +309,46 @@ def list_signals(
         t = ticker.upper()
         rows = [r for r in rows if r.get("ticker", "").upper() == t]
     return {"count": len(rows), "signals": rows[:limit]}
+
+
+@app.get("/api/plans")
+def list_plans(
+    limit: int = Query(default=500, ge=1, le=10_000),
+    ticker: str | None = Query(default=None, description="Filter by ticker (case-insensitive)"),
+) -> dict[str, Any]:
+    rows = _load_all_plans()
+    if ticker:
+        t = ticker.upper()
+        rows = [r for r in rows if (r.get("ticker") or "").upper() == t]
+    return {"count": len(rows), "plans": rows[:limit]}
+
+
+@app.get("/api/swings")
+def list_swings(
+    limit: int = Query(default=1000, ge=1, le=10_000),
+    kind: str | None = Query(default=None, description="ENTRY/ADD/REDUCE/CLOSE/STOP_TRIGGER/STOP_UPDATE/POSITION_UPDATE"),
+    ticker: str | None = Query(default=None, description="Filter by ticker (case-insensitive)"),
+    actionable_only: bool = Query(default=False, description="Drop POSITION_UPDATE/STOP_UPDATE rows"),
+) -> dict[str, Any]:
+    rows = _load_all_swings()
+    if kind:
+        rows = [r for r in rows if r.get("kind") == kind.upper()]
+    if ticker:
+        t = ticker.upper()
+        rows = [r for r in rows if (r.get("ticker") or "").upper() == t]
+    if actionable_only:
+        rows = [r for r in rows if r.get("kind") not in ("POSITION_UPDATE", "STOP_UPDATE")]
+
+    # Open-positions snapshot is derived from the FULL history regardless of
+    # filter, so the "current book" reflects reality even while the user
+    # filters the action feed.
+    positions = _derive_open_positions(_load_all_swings())
+
+    return {
+        "count": len(rows),
+        "actions": rows[:limit],
+        "open_positions": positions,
+    }
 
 
 @app.get("/api/stats")
@@ -191,31 +426,31 @@ def stats() -> dict[str, Any]:
     }
 
 
-# -- Live stream (SSE over a tail of signals.jsonl) ---------------------------
+# -- Live stream (SSE over a tailed JSONL file) -------------------------------
 
-async def _tail_signals(poll_interval: float = 0.5) -> AsyncIterator[dict[str, Any]]:
+async def _tail_jsonl(path: Path, poll_interval: float = 0.5) -> AsyncIterator[dict[str, Any]]:
     """
-    Yield each new JSON record appended to signals.jsonl.
+    Yield each new JSON record appended to `path`.
 
     Implementation: track byte offset, on each tick read from offset to EOF,
     parse complete lines, yield. Robust to file rotation (offset reset to 0
     when file shrinks). No external dependencies.
     """
-    offset = LIVE_PATH.stat().st_size if LIVE_PATH.exists() else 0
+    offset = path.stat().st_size if path.exists() else 0
     buf = ""
     while True:
         await asyncio.sleep(poll_interval)
-        if not LIVE_PATH.exists():
+        if not path.exists():
             offset = 0
             continue
-        size = LIVE_PATH.stat().st_size
+        size = path.stat().st_size
         if size < offset:
             # File was truncated/rotated -- start over.
             offset = 0
             buf = ""
         if size == offset:
             continue
-        with LIVE_PATH.open("r", encoding="utf-8") as fh:
+        with path.open("r", encoding="utf-8") as fh:
             fh.seek(offset)
             chunk = fh.read()
             offset = fh.tell()
@@ -241,20 +476,20 @@ def _sse_event(data: dict[str, Any], event: str | None = None) -> bytes:
     return ("\n".join(parts) + "\n").encode("utf-8")
 
 
-@app.get("/api/stream")
-async def stream() -> StreamingResponse:
+def _sse_response(path: Path, event_name: str) -> StreamingResponse:
     async def event_source() -> AsyncIterator[bytes]:
-        # Initial hello so the client knows the connection is alive.
         yield _sse_event(
-            {"connected_at": datetime.now(timezone.utc).isoformat()},
+            {"connected_at": datetime.now(timezone.utc).isoformat(), "source": str(path.name)},
             event="hello",
         )
         last_heartbeat = asyncio.get_event_loop().time()
-        async for record in _tail_signals():
-            yield _sse_event(record, event="signal")
+        async for record in _tail_jsonl(path):
+            yield _sse_event(record, event=event_name)
             now = asyncio.get_event_loop().time()
             if now - last_heartbeat > 15:
-                yield _sse_event({"ts": datetime.now(timezone.utc).isoformat()}, event="heartbeat")
+                yield _sse_event(
+                    {"ts": datetime.now(timezone.utc).isoformat()}, event="heartbeat"
+                )
                 last_heartbeat = now
 
     return StreamingResponse(
@@ -262,17 +497,45 @@ async def stream() -> StreamingResponse:
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",  # disable buffering on nginx-style proxies
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
 
 
+@app.get("/api/stream")
+async def stream_signals() -> StreamingResponse:
+    """SSE feed for new live signals (signals.jsonl)."""
+    return _sse_response(LIVE_PATH, event_name="signal")
+
+
+@app.get("/api/plans/stream")
+async def stream_plans() -> StreamingResponse:
+    """SSE feed for new trade plans (plans.jsonl)."""
+    return _sse_response(PLAN_LIVE_PATH, event_name="plan")
+
+
+@app.get("/api/swings/stream")
+async def stream_swings() -> StreamingResponse:
+    """SSE feed for new swing-trade actions (swings.jsonl)."""
+    return _sse_response(SWING_LIVE_PATH, event_name="swing")
+
+
 def main() -> None:
-    """Convenience runner: `python -m server.api`."""
+    """Convenience runner: `python -m server.api`.
+
+    `reload=True` auto-restarts the API when any file under server/ changes,
+    so backend edits show up without restarting the whole dashboard.
+    """
     import uvicorn
 
-    uvicorn.run("server.api:app", host="127.0.0.1", port=8787, reload=False)
+    uvicorn.run(
+        "server.api:app",
+        host="127.0.0.1",
+        port=8787,
+        reload=True,
+        reload_dirs=[str(PROJECT_ROOT / "server")],
+    )
 
 
 if __name__ == "__main__":
