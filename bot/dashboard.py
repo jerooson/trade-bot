@@ -1,17 +1,19 @@
 """
 Convenience launcher: start the FastAPI backend, the Vite dev server,
-and the Discord listener together.
+the Discord listener, and the trade executor together.
 
 Run:
-    python -m bot.dashboard                # all three
-    python -m bot.dashboard --no-listener  # just dashboard (api + vite)
+    python -m bot.dashboard                 # everything
+    python -m bot.dashboard --no-listener   # dashboard only (api + vite)
+    python -m bot.dashboard --no-executor   # listener + dashboard, no executor
 
 Then open http://localhost:5173 in your browser.
 
 All processes share the parent terminal. Ctrl-C stops all of them.
 
-If the listener crashes (e.g. bad token, expired session), the dashboard
-keeps running so you can still inspect historical data.
+If the listener or executor crashes (e.g. bad token, expired session, parser
+exception), the dashboard keeps running so you can still inspect historical
+data — you'll see a warning in this terminal.
 """
 
 from __future__ import annotations
@@ -52,6 +54,11 @@ def main() -> None:
         action="store_true",
         help="Do not auto-start the Discord listener (just run the dashboard).",
     )
+    parser.add_argument(
+        "--no-executor",
+        action="store_true",
+        help="Do not auto-start the trade executor (DRY_RUN mode).",
+    )
     args = parser.parse_args()
 
     if not WEB_DIR.exists():
@@ -71,9 +78,13 @@ def main() -> None:
         print("[dashboard] Re-run with `python -m bot.dashboard` after creating .env.")
         start_listener = False
 
+    start_executor = not args.no_executor
+
     pieces = ["FastAPI on :8787", "Vite on :5173"]
     if start_listener:
         pieces.append("Discord listener")
+    if start_executor:
+        pieces.append("Executor (DRY_RUN)")
     print(f"[dashboard] starting {', '.join(pieces)} ...")
     print("[dashboard] open http://localhost:5173 in your browser.")
     print("[dashboard] Ctrl-C to stop everything.")
@@ -91,9 +102,20 @@ def main() -> None:
             cwd=ROOT,
         )
 
-    # Critical: a listener crash should NOT take down the dashboard.
+    executor: subprocess.Popen | None = None
+    if start_executor:
+        executor = subprocess.Popen(
+            [PY, "-u", "-m", "bot.executor"],
+            cwd=ROOT,
+        )
+
+    # Critical: a listener or executor crash should NOT take down the dashboard.
     critical = [("backend", backend), ("frontend", frontend)]
-    optional = [("listener", listener)] if listener is not None else []
+    optional: list[tuple[str, subprocess.Popen]] = []
+    if listener is not None:
+        optional.append(("listener", listener))
+    if executor is not None:
+        optional.append(("executor", executor))
 
     def _shutdown(*_a) -> None:
         for _, p in critical + optional:
@@ -108,7 +130,7 @@ def main() -> None:
         signal.signal(signal.SIGTERM, _shutdown)
 
     try:
-        listener_warned = False
+        warned: set[str] = set()
         while True:
             for name, p in critical:
                 rc = p.poll()
@@ -121,14 +143,18 @@ def main() -> None:
                 if p is None:
                     continue
                 rc = p.poll()
-                if rc is not None and not listener_warned:
+                if rc is not None and name not in warned:
                     print(
                         f"[dashboard] WARNING: {name} exited with code {rc}. "
-                        "Dashboard will keep running, but new signals will NOT be captured."
+                        "Dashboard will keep running."
                     )
-                    print("[dashboard] Common causes: invalid token, network blip, Discord rate limit.")
-                    print("[dashboard] Run `python -m bot.listener` in a fresh terminal to retry.")
-                    listener_warned = True
+                    if name == "listener":
+                        print("[dashboard] Listener common causes: invalid token, network blip, Discord rate limit.")
+                        print("[dashboard] New signals will NOT be captured. Run `python -m bot.listener` to retry.")
+                    elif name == "executor":
+                        print("[dashboard] Executor stopped: no new trade decisions will be made.")
+                        print("[dashboard] Run `python -m bot.executor` to retry, after fixing the cause.")
+                    warned.add(name)
 
             time.sleep(0.5)
     finally:

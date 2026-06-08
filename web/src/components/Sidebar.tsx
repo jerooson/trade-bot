@@ -1,6 +1,6 @@
 import clsx from "clsx";
 
-export type ViewId = "signals" | "watchlist" | "swings";
+export type ViewId = "signals" | "watchlist" | "swings" | "executor";
 
 interface NavItem {
   id: ViewId;
@@ -19,6 +19,8 @@ interface Props {
   swingCount: number;
   openPositionsCount: number;
   pinnedCount: number;
+  executorOpenCount: number;
+  executorDecisionsCount: number;
 }
 
 export function Sidebar({
@@ -29,15 +31,18 @@ export function Sidebar({
   swingCount,
   openPositionsCount,
   pinnedCount,
+  executorOpenCount,
+  executorDecisionsCount,
 }: Props) {
   const items: NavItem[] = [
     { id: "signals",   num: "00", label: "signal terminal", sublabel: "live PLAN/TRIGGER/PROFIT", badge: signalCount },
     { id: "watchlist", num: "01", label: "watchlist",       sublabel: "swing-trade plans",        badge: planCount },
     { id: "swings",    num: "02", label: "execution",       sublabel: "live entries / exits",     badge: swingCount, highlight: true },
+    { id: "executor",  num: "03", label: "executor",        sublabel: "auto-trader · dry run",    badge: executorOpenCount, highlight: executorOpenCount > 0 },
   ];
 
   return (
-    <aside className="sticky top-0 hidden h-screen w-[220px] shrink-0 flex-col border-r border-ink-500/40 bg-ink-900/50 px-4 py-6 lg:flex">
+    <aside className="sticky top-0 hidden h-screen w-[220px] shrink-0 flex-col border-r border-ink-500/40 bg-ink-900/50 px-4 py-6 md:flex">
       <div className="text-[10px] uppercase tracking-[0.32em] text-bone-500">
         section index
       </div>
@@ -111,6 +116,7 @@ export function Sidebar({
         <Row label="actions" value={swingCount.toLocaleString()} />
         <Row label="open" value={openPositionsCount.toLocaleString()} highlight={openPositionsCount > 0} />
         <Row label="pinned" value={pinnedCount.toLocaleString()} highlight={pinnedCount > 0} />
+        <Row label="decisions" value={executorDecisionsCount.toLocaleString()} highlight={executorDecisionsCount > 0} />
       </div>
     </aside>
   );

@@ -2,12 +2,14 @@ import { useMemo, useState } from "react";
 import { useDashboardData } from "./hooks/useDashboardData";
 import { usePlanData } from "./hooks/usePlanData";
 import { useSwingData } from "./hooks/useSwingData";
+import { useExecutorData } from "./hooks/useExecutorData";
 import { usePinnedPlans } from "./hooks/usePinnedPlans";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ViewId } from "./components/Sidebar";
 import { SignalsView } from "./components/SignalsView";
 import { WatchlistView } from "./components/WatchlistView";
 import { SwingView } from "./components/SwingView";
+import { ExecutorView } from "./components/ExecutorView";
 import { Footer } from "./components/Footer";
 
 export default function App() {
@@ -16,6 +18,7 @@ export default function App() {
   const dash = useDashboardData();
   const planData = usePlanData();
   const swingData = useSwingData();
+  const executorData = useExecutorData();
   const pin = usePinnedPlans();
 
   // The status bar reflects whichever view is active.
@@ -36,13 +39,21 @@ export default function App() {
         totalLabel: "plans on file",
       };
     }
+    if (view === "swings") {
+      return {
+        conn: swingData.conn,
+        lastEventAt: swingData.lastEventAt,
+        total: swingData.actions.length,
+        totalLabel: "actions on file",
+      };
+    }
     return {
-      conn: swingData.conn,
-      lastEventAt: swingData.lastEventAt,
-      total: swingData.actions.length,
-      totalLabel: "actions on file",
+      conn: executorData.conn,
+      lastEventAt: executorData.lastEventAt,
+      total: executorData.orders.length,
+      totalLabel: "decisions on file",
     };
-  }, [view, dash, planData, swingData]);
+  }, [view, dash, planData, swingData, executorData]);
 
   return (
     <div className="relative min-h-screen">
@@ -62,6 +73,10 @@ export default function App() {
           swingCount={swingData.actions.length}
           openPositionsCount={swingData.openPositions.length}
           pinnedCount={pin.count}
+          executorOpenCount={
+            executorData.book?.summary?.open_tickers ?? 0
+          }
+          executorDecisionsCount={executorData.orders.length}
         />
 
         <div className="min-w-0 flex-1">
@@ -82,6 +97,14 @@ export default function App() {
               openPositions={swingData.openPositions}
               loading={swingData.loading}
               error={swingData.error}
+            />
+          )}
+          {view === "executor" && (
+            <ExecutorView
+              book={executorData.book}
+              orders={executorData.orders}
+              loading={executorData.loading}
+              error={executorData.error}
             />
           )}
         </div>

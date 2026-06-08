@@ -47,6 +47,10 @@ PLAN_LIVE_PATH = LOG_DIR / "plans.jsonl"
 SWING_HISTORY_PATH = LOG_DIR / "swings_history.jsonl"
 SWING_LIVE_PATH = LOG_DIR / "swings.jsonl"
 
+# Executor (DRY_RUN): virtual book snapshot + append-only decision log.
+EXECUTOR_BOOK_PATH = LOG_DIR / "virtual_book.json"
+EXECUTOR_ORDERS_PATH = LOG_DIR / "proposed_orders.jsonl"
+
 
 app = FastAPI(title="trade-bot dashboard", version="0.1.0")
 
@@ -519,6 +523,55 @@ async def stream_plans() -> StreamingResponse:
 async def stream_swings() -> StreamingResponse:
     """SSE feed for new swing-trade actions (swings.jsonl)."""
     return _sse_response(SWING_LIVE_PATH, event_name="swing")
+
+
+# -- Executor endpoints ------------------------------------------------------
+
+@app.get("/api/executor/book")
+def executor_book() -> dict[str, Any]:
+    """Current virtual book snapshot written by `bot.executor`.
+
+    If the executor hasn't run yet, returns a stub indicating "no book".
+    """
+    if not EXECUTOR_BOOK_PATH.exists():
+        return {
+            "present": False,
+            "reason": "executor has not run yet — start it with `python -m bot.executor`",
+        }
+    try:
+        text = EXECUTOR_BOOK_PATH.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except (OSError, json.JSONDecodeError) as e:
+        return {"present": False, "reason": f"failed to read book: {e}"}
+    data["present"] = True
+    return data
+
+
+@app.get("/api/executor/orders")
+def executor_orders(
+    limit: int = Query(default=500, ge=1, le=10_000),
+    action: str | None = Query(
+        default=None,
+        description="Filter by action: BUY / SELL / REJECT",
+    ),
+    ticker: str | None = Query(default=None, description="Filter by ticker (case-insensitive)"),
+) -> dict[str, Any]:
+    """List proposed orders, newest first."""
+    rows = _read_jsonl(EXECUTOR_ORDERS_PATH)
+    rows.sort(key=lambda r: r.get("decided_at") or "", reverse=True)
+    if action:
+        a = action.upper()
+        rows = [r for r in rows if (r.get("action") or "").upper() == a]
+    if ticker:
+        t = ticker.upper()
+        rows = [r for r in rows if (r.get("ticker") or "").upper() == t]
+    return {"count": len(rows), "orders": rows[:limit]}
+
+
+@app.get("/api/executor/orders/stream")
+async def stream_executor_orders() -> StreamingResponse:
+    """SSE feed for new proposed orders (proposed_orders.jsonl)."""
+    return _sse_response(EXECUTOR_ORDERS_PATH, event_name="order")
 
 
 def main() -> None:

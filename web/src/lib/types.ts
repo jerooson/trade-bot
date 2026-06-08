@@ -95,6 +95,78 @@ export interface OpenPosition {
   last_pnl_pct: number | null;
 }
 
+// -- Executor types -----------------------------------------------------------
+
+export interface VirtualPosition {
+  ticker: string;
+  side: "LONG";
+  shares: number;
+  deployed_usd: number;
+  budget_usd: number;
+  avg_price: number | null;
+  stop_loss: number | null;
+  stop_loss_label: string | null;
+  last_signal_fraction: number | null;
+  last_signal_size: string | null;
+  first_entry_at: string;
+  last_action_at: string;
+  actions_count: number;
+}
+
+export interface VirtualBook {
+  present: boolean;
+  reason?: string;
+  mode?: string;
+  budget_per_ticker?: number;
+  max_open_tickers?: number;
+  started_at?: string;
+  last_processed_at?: string | null;
+  last_decision_at?: string | null;
+  decisions_total?: number;
+  positions?: Record<string, VirtualPosition>;
+  summary?: {
+    open_tickers: number;
+    max_tickers: number;
+    total_deployed_usd: number;
+    account_budget_usd: number;
+    available_usd: number;
+  };
+}
+
+export type DecisionAction = "BUY" | "SELL" | "REJECT";
+
+export interface ProposedOrder {
+  id: string;
+  decided_at: string;
+  mode: string;
+  signal_kind: string;
+  ticker: string;
+  action: DecisionAction;
+  usd_amount: number | null;
+  shares_estimate: number | null;
+  signal_price: number | null;
+  rationale: string;
+  book_before: Record<string, unknown>;
+  book_after: Record<string, unknown>;
+  signal: {
+    kind?: string;
+    ticker?: string;
+    side?: string | null;
+    price?: number | null;
+    stop_loss?: number | null;
+    stop_loss_label?: string | null;
+    position_size?: string | null;
+    position_fraction?: number | null;
+    delta_size?: string | null;
+    action_text?: string | null;
+    received_at?: string;
+    posted_by?: string | null;
+    message_id?: number;
+    channel_id?: number;
+    created_at?: string;
+  };
+}
+
 export interface Stats {
   total: number;
   by_kind: Record<string, number>;

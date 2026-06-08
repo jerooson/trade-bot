@@ -1,4 +1,12 @@
-import type { OpenPosition, Signal, Stats, TradeAction, TradePlan } from "./types";
+import type {
+  OpenPosition,
+  ProposedOrder,
+  Signal,
+  Stats,
+  TradeAction,
+  TradePlan,
+  VirtualBook,
+} from "./types";
 
 export async function fetchSignals(params: {
   limit?: number;
@@ -125,6 +133,53 @@ export function openSwingStream(handlers: SwingStreamHandlers): () => void {
   });
   es.addEventListener("swing", (e) => {
     handlers.onSwing?.(JSON.parse((e as MessageEvent).data));
+  });
+  es.addEventListener("heartbeat", (e) => {
+    handlers.onHeartbeat?.(JSON.parse((e as MessageEvent).data));
+  });
+  es.addEventListener("error", (e) => handlers.onError?.(e));
+  return () => es.close();
+}
+
+// -- Executor -----------------------------------------------------------------
+
+export async function fetchExecutorBook(): Promise<VirtualBook> {
+  const r = await fetch("/api/executor/book");
+  if (!r.ok) throw new Error(`executor/book: ${r.status}`);
+  return r.json();
+}
+
+export async function fetchExecutorOrders(params: {
+  limit?: number;
+  action?: string;
+  ticker?: string;
+} = {}): Promise<{ count: number; orders: ProposedOrder[] }> {
+  const qs = new URLSearchParams();
+  if (params.limit) qs.set("limit", String(params.limit));
+  if (params.action) qs.set("action", params.action);
+  if (params.ticker) qs.set("ticker", params.ticker);
+  const r = await fetch(`/api/executor/orders?${qs.toString()}`);
+  if (!r.ok) throw new Error(`executor/orders: ${r.status}`);
+  return r.json();
+}
+
+export interface OrderStreamHandlers {
+  onHello?: (data: { connected_at: string }) => void;
+  onOrder?: (order: ProposedOrder) => void;
+  onHeartbeat?: (data: { ts: string }) => void;
+  onError?: (err: Event) => void;
+  onOpen?: () => void;
+}
+
+/** Open the executor orders SSE stream. Returns a cleanup function. */
+export function openOrderStream(handlers: OrderStreamHandlers): () => void {
+  const es = new EventSource("/api/executor/orders/stream");
+  es.addEventListener("open", () => handlers.onOpen?.());
+  es.addEventListener("hello", (e) => {
+    handlers.onHello?.(JSON.parse((e as MessageEvent).data));
+  });
+  es.addEventListener("order", (e) => {
+    handlers.onOrder?.(JSON.parse((e as MessageEvent).data));
   });
   es.addEventListener("heartbeat", (e) => {
     handlers.onHeartbeat?.(JSON.parse((e as MessageEvent).data));
