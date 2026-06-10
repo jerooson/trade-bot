@@ -64,7 +64,7 @@ export default function App() {
         totalLabel={status.totalLabel}
       />
 
-      <div className="relative z-10 mx-auto flex max-w-[1600px]">
+      <div className="relative z-10 mx-auto flex max-w-[1680px]">
         <Sidebar
           current={view}
           onChange={setView}
@@ -79,7 +79,7 @@ export default function App() {
           executorDecisionsCount={executorData.orders.length}
         />
 
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 pb-20 md:pb-0">
           {view === "signals" && <SignalsView dash={dash} />}
           {view === "watchlist" && (
             <WatchlistView

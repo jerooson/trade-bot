@@ -56,7 +56,7 @@ export function MetricsStrip({ stats, range }: Props) {
   ];
 
   return (
-    <div className="grid grid-cols-2 gap-px bg-ink-500/40 sm:grid-cols-3 lg:grid-cols-6">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
       {tiles.map((t) => (
         <Tile key={t.label} {...t} />
       ))}
@@ -87,7 +87,7 @@ function Tile({
             : "text-bone-50";
 
   return (
-    <div className="relative overflow-hidden bg-ink-900 px-5 py-5">
+    <div className="relative overflow-hidden rounded-xl border border-ink-500/35 bg-ink-900/60 px-4 py-4 shadow-lg shadow-black/10">
       <div className="flex items-baseline justify-between">
         <span className="text-[10px] uppercase tracking-[0.32em] text-bone-500">{label}</span>
         {tone && (
@@ -104,7 +104,7 @@ function Tile({
           />
         )}
       </div>
-      <div className={`tabular mt-3 text-4xl font-medium leading-none ${valueColor}`}>{value}</div>
+      <div className={`tabular mt-3 text-3xl font-semibold leading-none tracking-tight ${valueColor}`}>{value}</div>
       {sub && (
         <div className="mt-2 text-[11px] uppercase tracking-[0.18em] text-bone-500">{sub}</div>
       )}

@@ -2,157 +2,90 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ----------------------------------------------------------------------------
-   Global aesthetic: terminal/CRT, dense, monospace, with editorial italics.
-   Layered backgrounds: solid ink + grain + extremely subtle scanlines + a
-   single drifting horizontal sweep. The sweep is the one bit of motion that
-   sells the "live instrument" feel without being annoying.
----------------------------------------------------------------------------- */
-
 :root {
-  --grain-opacity: 0.025;
-  --scan-opacity: 0.04;
-  --rule-opacity: 0.08;
+  color-scheme: dark;
+  --rule-opacity: 0.12;
 }
 
 * {
+  box-sizing: border-box;
   -webkit-font-smoothing: antialiased;
-  font-feature-settings: "ss01" 1, "ss02" 1, "calt" 1, "zero" 1, "tnum" 1;
+  font-feature-settings: "ss01" 1, "calt" 1, "zero" 1, "tnum" 1;
 }
 
 body {
-  background-color: #08080a;
-  color: #e8e8ea;
-  position: relative;
+  margin: 0;
+  background:
+    radial-gradient(circle at 78% -15%, rgba(42, 113, 176, 0.18), transparent 35rem),
+    radial-gradient(circle at 5% 20%, rgba(24, 104, 91, 0.12), transparent 30rem),
+    #070b14;
+  color: #e9eef7;
+  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
   overflow-x: hidden;
 }
 
-/* Global SVG noise grain --------------------------------------------------- */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 1;
-  opacity: var(--grain-opacity);
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.7 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
-  mix-blend-mode: screen;
-}
-
-/* Global horizontal scanline texture --------------------------------------- */
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 1;
-  opacity: var(--scan-opacity);
-  background-image: repeating-linear-gradient(
-    to bottom,
-    rgba(255, 184, 0, 0.45) 0px,
-    rgba(255, 184, 0, 0.45) 1px,
-    transparent 1px,
-    transparent 3px
-  );
-}
-
-/* Crisp dotted vertical/horizontal rules used as section dividers. */
 .rule-x {
-  background-image: linear-gradient(
-    to right,
-    rgba(232, 232, 234, var(--rule-opacity)) 0,
-    rgba(232, 232, 234, var(--rule-opacity)) 4px,
-    transparent 4px,
-    transparent 10px
-  );
-  background-repeat: repeat-x;
-  background-size: 10px 1px;
-  background-position: 0 50%;
   height: 1px;
+  background: rgba(169, 183, 203, var(--rule-opacity));
 }
 
 .rule-y {
-  background-image: linear-gradient(
-    to bottom,
-    rgba(232, 232, 234, var(--rule-opacity)) 0,
-    rgba(232, 232, 234, var(--rule-opacity)) 4px,
-    transparent 4px,
-    transparent 10px
-  );
-  background-repeat: repeat-y;
-  background-size: 1px 10px;
-  background-position: 50% 0;
   width: 1px;
+  background: rgba(169, 183, 203, var(--rule-opacity));
 }
 
-/* Header bracket marks for section labels */
-.bracket::before {
-  content: "[";
-  margin-right: 0.4em;
-  color: rgba(255, 184, 0, 0.55);
-}
-.bracket::after {
-  content: "]";
-  margin-left: 0.4em;
-  color: rgba(255, 184, 0, 0.55);
-}
-
-/* Tabular nums everywhere we show prices/counts */
 .tabular {
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.01em;
 }
 
-/* "Drifting" horizontal sweep (subtle CRT raster line) */
-.sweep {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  pointer-events: none;
-}
-.sweep::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 60%;
-  background: linear-gradient(
-    180deg,
-    transparent 0%,
-    rgba(255, 184, 0, 0.05) 45%,
-    rgba(255, 184, 0, 0.08) 50%,
-    rgba(255, 184, 0, 0.05) 55%,
-    transparent 100%
-  );
-  animation: sweep 14s linear infinite;
-}
-@keyframes sweep {
-  0% {
-    transform: translateY(-100%);
-  }
-  100% {
-    transform: translateY(220%);
-  }
+button,
+input {
+  font: inherit;
 }
 
-/* Selection */
 ::selection {
-  background: rgba(255, 184, 0, 0.35);
-  color: #08080a;
+  background: rgba(101, 184, 255, 0.35);
+  color: #f7f9fc;
 }
 
-/* Scrollbar */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
+
 ::-webkit-scrollbar-track {
-  background: #0a0a0b;
+  background: #0b1120;
 }
+
 ::-webkit-scrollbar-thumb {
-  background: #1a1a1f;
-  border: 1px solid #26262c;
+  background: #2b3b58;
+  border-radius: 999px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
-  background: #26262c;
+  background: #425574;
+}
+
+@layer components {
+  .font-editorial {
+    font-style: normal !important;
+    font-weight: 600;
+    letter-spacing: -0.035em;
+  }
+
+  button,
+  input,
+  article,
+  section.border,
+  div.border {
+    border-radius: 0.65rem;
+  }
+
+  button:focus-visible,
+  input:focus-visible,
+  a:focus-visible {
+    outline: 2px solid #65b8ff;
+    outline-offset: 2px;
+  }
 }

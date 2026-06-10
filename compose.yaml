@@ -1,0 +1,55 @@
+services:
+  listener:
+    build: .
+    command: ["python", "-u", "-m", "bot.listener"]
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+
+  executor:
+    build: .
+    command: ["python", "-u", "-m", "bot.executor"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      EXECUTOR_MODE: DRY_RUN
+    volumes:
+      - ./logs:/app/logs
+
+  api:
+    build: .
+    command:
+      [
+        "uvicorn",
+        "server.api:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8787",
+        "--no-access-log",
+      ]
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  web:
+    build: ./web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"

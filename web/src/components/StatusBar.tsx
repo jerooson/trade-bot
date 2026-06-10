@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import type { ConnectionState } from "../hooks/useDashboardData";
-import { fmtTime, relativeTime } from "../lib/format";
 import clsx from "clsx";
+import { Bot, Clock3, Database } from "lucide-react";
+import type { ConnectionState } from "../hooks/useDashboardData";
+import { relativeTime } from "../lib/format";
 
 interface Props {
   conn: ConnectionState;
@@ -18,81 +19,39 @@ export function StatusBar({ conn, lastEventAt, total, totalLabel = "signals on f
     return () => clearInterval(id);
   }, []);
 
-  const dotClass = clsx("inline-block h-2 w-2 rounded-full", {
-    "bg-crt-long animate-pulseDot": conn === "connected",
-    "bg-crt-amber animate-pulseDot": conn === "connecting",
-    "bg-crt-short": conn === "disconnected",
-  });
-
-  const stateLabel = conn === "connected" ? "ONLINE" : conn === "connecting" ? "LINKING" : "OFFLINE";
+  const stateLabel = conn === "connected" ? "Connected" : conn === "connecting" ? "Connecting" : "Offline";
 
   return (
-    <header className="relative border-b border-ink-500/60 bg-ink-900/80 backdrop-blur-sm">
-      <div className="sweep" />
-      <div className="relative z-10 mx-auto flex max-w-[1600px] items-stretch px-6">
-        {/* Left: brand */}
-        <div className="flex flex-col justify-center py-4 pr-10">
-          <div className="text-[11px] uppercase tracking-[0.32em] text-bone-400">
-            Will-the-Rocket
+    <header className="sticky top-0 z-40 border-b border-ink-500/30 bg-ink-950/75 backdrop-blur-xl">
+      <div className="mx-auto flex max-w-[1680px] items-center gap-5 px-4 py-3 sm:px-6">
+        <div className="flex min-w-0 items-center gap-3 md:w-[228px]">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-crt-info/25 to-crt-long/15 text-crt-info ring-1 ring-crt-info/30">
+            <Bot className="h-5 w-5" />
           </div>
-          <div className="mt-0.5 flex items-baseline gap-3">
-            <h1 className="text-2xl font-medium tracking-tight text-bone-50">
-              SIGNAL <span className="font-editorial italic text-crt-amber">terminal</span>
-            </h1>
-            <span className="text-[11px] uppercase tracking-[0.18em] text-bone-500">
-              v0.1.0
-            </span>
+          <div className="min-w-0">
+            <h1 className="truncate text-sm font-semibold text-bone-50">Trade Operator</h1>
+            <div className="truncate text-[11px] text-bone-500">Discord to broker console</div>
           </div>
         </div>
 
-        {/* Vertical rule */}
-        <div className="rule-y my-3" />
-
-        {/* Center: status */}
-        <div className="flex items-center gap-8 px-10 py-4">
+        <div className="hidden items-center gap-8 border-l border-ink-500/30 pl-6 sm:flex">
           <Stat
-            label="link"
+            label="Listener"
             value={
-              <span className="flex items-center gap-2">
-                <span className={dotClass} />
-                <span
-                  className={clsx({
-                    "text-crt-long": conn === "connected",
-                    "text-crt-amber": conn === "connecting",
-                    "text-crt-short": conn === "disconnected",
-                  })}
-                >
-                  {stateLabel}
-                </span>
+              <span className={clsx("flex items-center gap-2 font-medium", conn === "connected" ? "text-crt-long" : conn === "connecting" ? "text-crt-amber" : "text-crt-short")}>
+                <span className={clsx("h-2 w-2 rounded-full", conn === "connected" ? "animate-pulseDot bg-crt-long" : conn === "connecting" ? "bg-crt-amber" : "bg-crt-short")} />
+                {stateLabel}
               </span>
             }
           />
-          <Stat
-            label="last event"
-            value={
-              <span className="text-bone-100">
-                {lastEventAt ? relativeTime(lastEventAt) : "—"}
-              </span>
-            }
-          />
-          <Stat
-            label={totalLabel}
-            value={<span className="tabular text-bone-100">{total.toLocaleString()}</span>}
-          />
+          <Stat label="Last event" value={lastEventAt ? relativeTime(lastEventAt) : "No events"} />
+          <Stat label={totalLabel} value={total.toLocaleString()} icon />
         </div>
 
-        {/* Vertical rule */}
-        <div className="rule-y my-3" />
-
-        {/* Right: clock */}
-        <div className="ml-auto flex flex-col justify-center py-4 pl-10 text-right">
-          <div className="text-[11px] uppercase tracking-[0.32em] text-bone-400">
-            {now
-              .toLocaleDateString("en-US", { weekday: "short", month: "short", day: "2-digit" })
-              .toUpperCase()}
-          </div>
-          <div className="tabular text-2xl font-medium text-bone-50">
-            {fmtTime(now.toISOString())}
+        <div className="ml-auto flex items-center gap-2 rounded-full border border-ink-500/40 bg-ink-900/70 px-3 py-1.5">
+          <Clock3 className="h-3.5 w-3.5 text-bone-500" />
+          <div className="tabular text-xs font-medium text-bone-200">
+            {now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
           </div>
         </div>
       </div>
@@ -100,11 +59,14 @@ export function StatusBar({ conn, lastEventAt, total, totalLabel = "signals on f
   );
 }
 
-function Stat({ label, value }: { label: string; value: React.ReactNode }) {
+function Stat({ label, value, icon }: { label: string; value: React.ReactNode; icon?: boolean }) {
   return (
-    <div className="flex flex-col">
-      <div className="text-[10px] uppercase tracking-[0.32em] text-bone-500">{label}</div>
-      <div className="mt-0.5 text-sm">{value}</div>
+    <div className="flex items-center gap-2">
+      {icon && <Database className="h-3.5 w-3.5 text-bone-500" />}
+      <div>
+        <div className="text-[9px] font-semibold uppercase tracking-[0.16em] text-bone-500">{label}</div>
+        <div className="mt-0.5 text-xs text-bone-200">{value}</div>
+      </div>
     </div>
   );
 }

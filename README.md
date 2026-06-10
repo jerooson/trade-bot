@@ -1,8 +1,19 @@
 # Trade Bot
 
-Reads trading signals from a Discord channel and (eventually) places orders on a broker (IBKR / IBKR Gateway TBD).
+Reads trading signals from a Discord channel, produces risk-sized proposed
+orders, and provides a dashboard for reviewing them.
 
 ## Status
+
+The executor is currently **DRY_RUN only**. Connecting Robinhood Trading MCP to
+Codex allows an active Codex session to access a dedicated Robinhood Agentic
+account, but it does not let the unattended Python executor call Codex tools.
+See [docs/robinhood-mcp.md](docs/robinhood-mcp.md) before attempting any live
+trade workflow.
+
+For a Docker Compose deployment on a small VPS, see
+[docs/vps-deployment.md](docs/vps-deployment.md). The VPS configuration forces
+the executor to remain in `DRY_RUN`.
 
 - Phase 1: Discord message parser (pure functions, fully tested without Discord)
 - Phase 2: Discord listener (selfbot via `discord.py-self`) — wires real messages into the parser
@@ -165,4 +176,3 @@ python -m bot.history --limit 500       # last 500 messages per channel
 python -m bot.history --since 2026-04-15
 python -m bot.stats logs/history.jsonl  # quick CLI stats
 ```
-

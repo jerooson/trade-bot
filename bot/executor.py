@@ -1,14 +1,19 @@
 """
-Discord-signal executor (Phase 1: DRY_RUN only).
+Discord-signal executor (DRY_RUN only).
 
 Watches `logs/swings.jsonl` (and the historical `logs/swings_history.jsonl`)
 for trade actions parsed by `bot/swing_parser.py`. For each ACTIONABLE action,
 applies sizing rules and records a "proposed order" — what we WOULD place if
 running in LIVE mode.
 
-In DRY_RUN mode (the only mode supported in Phase 1) no real broker calls are
+In DRY_RUN mode (the only mode supported) no real broker calls are
 made. Proposed orders are written to `logs/proposed_orders.jsonl` and pushed
 to your phone via `bot/notifier.py`.
+
+Connecting Robinhood Trading MCP to Codex lets an active Codex session place
+orders in a dedicated Robinhood Agentic account. It does not make the MCP
+available as a callable API inside this long-running Python process. See
+`docs/robinhood-mcp.md` before attempting live execution.
 
 Sizing rules
 ------------
@@ -75,7 +80,7 @@ class ExecutorConfig:
 
     budget_per_ticker: float
     max_open_tickers: int
-    mode: str  # "DRY_RUN" only for now; "LIVE" reserved for Phase 3
+    mode: str  # "DRY_RUN" only; LIVE is intentionally rejected
     book_path: Path
     orders_path: Path
     poll_interval_s: float
@@ -729,7 +734,9 @@ def _setup_logging() -> None:
 def run(config: ExecutorConfig) -> None:
     if not config.is_dry_run:
         log.error(
-            "EXECUTOR_MODE=%s is not implemented yet; only DRY_RUN works in Phase 1. Exiting.",
+            "EXECUTOR_MODE=%s is not supported. This process cannot call Codex's "
+            "Robinhood MCP connection, so only DRY_RUN is allowed. Follow "
+            "docs/robinhood-mcp.md before attempting live execution. Exiting.",
             config.mode,
         )
         sys.exit(2)
