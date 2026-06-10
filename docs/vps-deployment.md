@@ -3,6 +3,9 @@
 This deployment runs the Discord listener, dry-run executor, API, and dashboard
 with Docker Compose. It intentionally cannot place real broker orders.
 
+For everyday commands, updates, recovery, and backups after initial setup, use
+[VPS Operations Runbook](vps-operations-runbook.md).
+
 ## Safety Model
 
 - `EXECUTOR_MODE=DRY_RUN` is forced in `compose.yaml`.

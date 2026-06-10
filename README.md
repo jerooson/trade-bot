@@ -13,7 +13,8 @@ trade workflow.
 
 For a Docker Compose deployment on a small VPS, see
 [docs/vps-deployment.md](docs/vps-deployment.md). The VPS configuration forces
-the executor to remain in `DRY_RUN`.
+the executor to remain in `DRY_RUN`. For everyday VPS operation, use
+[docs/vps-operations-runbook.md](docs/vps-operations-runbook.md).
 
 - Phase 1: Discord message parser (pure functions, fully tested without Discord)
 - Phase 2: Discord listener (selfbot via `discord.py-self`) — wires real messages into the parser
