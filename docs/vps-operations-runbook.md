@@ -14,6 +14,9 @@ The VPS runs four Docker containers:
 | `api` | Reads logs and serves dashboard data |
 | `web` | Serves the private dashboard |
 
+The optional host-side `trade-bot-shadow-review` systemd service watches fresh
+proposed orders and invokes Codex/Robinhood for non-trading order reviews.
+
 The VPS keeps running when the local PC is off. The dashboard is private and
 only becomes accessible locally while an SSH tunnel is open.
 
@@ -248,6 +251,19 @@ View the virtual executor book:
 cat logs/virtual_book.json
 ```
 
+View recent Codex/Robinhood shadow reviews:
+
+```bash
+tail -n 20 logs/robinhood_shadow_reviews.jsonl
+```
+
+Check the host-side shadow reviewer:
+
+```bash
+systemctl status trade-bot-shadow-review --no-pager
+journalctl -u trade-bot-shadow-review -n 100 --no-pager
+```
+
 ## Back Up Runtime Data
 
 Create a compressed backup on the VPS:
@@ -325,4 +341,3 @@ Before considering any future broker integration:
 - Replace the Discord selfbot with an official bot or webhook when possible.
 - Implement broker reconciliation, idempotency, order-status tracking, a kill
   switch, and daily loss limits.
-

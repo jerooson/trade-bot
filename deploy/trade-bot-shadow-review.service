@@ -1,0 +1,18 @@
+[Unit]
+Description=Trade Bot Robinhood Shadow Reviewer
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/trade-bot
+Environment=HOME=/home/deploy
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/deploy/trade-bot/.venv/bin/python -u -m bot.shadow_reviewer
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

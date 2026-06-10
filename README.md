@@ -16,6 +16,9 @@ For a Docker Compose deployment on a small VPS, see
 the executor to remain in `DRY_RUN`. For everyday VPS operation, use
 [docs/vps-operations-runbook.md](docs/vps-operations-runbook.md).
 
+To review fresh ENTRY and REDUCE proposals through Robinhood without placing
+orders, see [docs/robinhood-shadow-review.md](docs/robinhood-shadow-review.md).
+
 - Phase 1: Discord message parser (pure functions, fully tested without Discord)
 - Phase 2: Discord listener (selfbot via `discord.py-self`) — wires real messages into the parser
 - Phase 3: Broker order placement (IBKR — `ib_async` or Client Portal Web API)

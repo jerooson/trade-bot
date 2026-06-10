@@ -50,6 +50,7 @@ SWING_LIVE_PATH = LOG_DIR / "swings.jsonl"
 # Executor (DRY_RUN): virtual book snapshot + append-only decision log.
 EXECUTOR_BOOK_PATH = LOG_DIR / "virtual_book.json"
 EXECUTOR_ORDERS_PATH = LOG_DIR / "proposed_orders.jsonl"
+SHADOW_REVIEWS_PATH = LOG_DIR / "robinhood_shadow_reviews.jsonl"
 
 
 app = FastAPI(title="trade-bot dashboard", version="0.1.0")
@@ -572,6 +573,30 @@ def executor_orders(
 async def stream_executor_orders() -> StreamingResponse:
     """SSE feed for new proposed orders (proposed_orders.jsonl)."""
     return _sse_response(EXECUTOR_ORDERS_PATH, event_name="order")
+
+
+@app.get("/api/executor/shadow-reviews")
+def executor_shadow_reviews(
+    limit: int = Query(default=500, ge=1, le=10_000),
+    status: str | None = Query(default=None, description="REVIEWED / SKIPPED / FAILED"),
+    ticker: str | None = Query(default=None, description="Filter by ticker (case-insensitive)"),
+) -> dict[str, Any]:
+    """List Robinhood shadow-review records, newest first."""
+    rows = _read_jsonl(SHADOW_REVIEWS_PATH)
+    rows.sort(key=lambda r: r.get("reviewed_at") or "", reverse=True)
+    if status:
+        s = status.upper()
+        rows = [r for r in rows if (r.get("status") or "").upper() == s]
+    if ticker:
+        t = ticker.upper()
+        rows = [r for r in rows if (r.get("ticker") or "").upper() == t]
+    return {"count": len(rows), "reviews": rows[:limit]}
+
+
+@app.get("/api/executor/shadow-reviews/stream")
+async def stream_executor_shadow_reviews() -> StreamingResponse:
+    """SSE feed for new Robinhood shadow reviews."""
+    return _sse_response(SHADOW_REVIEWS_PATH, event_name="shadow-review")
 
 
 def main() -> None:
