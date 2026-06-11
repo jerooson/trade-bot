@@ -14,14 +14,14 @@ The VPS runs four Docker containers:
 | `api` | Reads logs and serves dashboard data |
 | `web` | Serves the private dashboard |
 
-The optional host-side `trade-bot-shadow-review` systemd service watches fresh
-proposed orders and invokes Codex/Robinhood for non-trading order reviews.
+The host-side `trade-bot-shadow-review` systemd service watches fresh proposed
+orders and invokes Codex/Robinhood to place real Agentic-account orders.
 
 The VPS keeps running when the local PC is off. The dashboard is private and
 only becomes accessible locally while an SSH tunnel is open.
 
-The VPS does **not** place real Robinhood orders. The executor is forced to
-`DRY_RUN` in `compose.yaml`.
+The Docker executor remains in `DRY_RUN` for virtual-book sizing. Real orders
+are placed by the host-side auto-trader via Codex `place_equity_order`.
 
 ## Important Locations
 
@@ -332,12 +332,10 @@ the project `logs/` directory.
 
 ## Safety Checklist
 
-Before considering any future broker integration:
-
-- Keep the VPS executor in `DRY_RUN`.
-- Confirm every container is healthy.
+- Keep the Docker executor in `DRY_RUN` (virtual book only).
+- Confirm `place_equity_order` is in the VPS Codex allowlist only when auto-trade
+  should be active; set `SHADOW_REVIEW_PLACE_ORDERS=false` to pause placement.
+- Confirm every container and `trade-bot-shadow-review` are healthy.
 - Maintain off-VPS backups of `logs/`.
-- Add monitoring for listener failures.
+- Add monitoring for listener and auto-trader failures.
 - Replace the Discord selfbot with an official bot or webhook when possible.
-- Implement broker reconciliation, idempotency, order-status tracking, a kill
-  switch, and daily loss limits.

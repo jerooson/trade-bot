@@ -73,24 +73,25 @@ broker adapter needs, at minimum:
 
 Until those controls exist, `DRY_RUN` is the correct mode.
 
-## VPS shadow-review workflow
+## VPS auto-trade workflow
 
 `bot.shadow_reviewer` is an event-triggered VPS host process. It watches fresh
-DRY_RUN proposals and invokes Codex CLI only for:
+DRY_RUN proposals and invokes Codex CLI for:
 
 - accepted `ENTRY` buys for new tickers
 - accepted `REDUCE` sells for existing virtual positions
 
 Before invoking Codex, it independently verifies the executor's proportional
-sizing against the `$20` per-ticker budget. Codex may call Robinhood read-only
-tools and `review_equity_order`, but the order-placement tool remains hidden.
+sizing against the `$20` per-ticker budget. Codex verifies the Agentic account
+with read-only tools, then calls `place_equity_order` (review is skipped).
 Results are appended to:
 
 ```text
 logs/robinhood_shadow_reviews.jsonl
 ```
 
-The shadow reviewer never places or cancels an order.
+Set `SHADOW_REVIEW_PLACE_ORDERS=false` to pause live placement. See
+`deploy/codex-robinhood-live.toml` for the required Codex MCP allowlist.
 
 ## Official documentation
 

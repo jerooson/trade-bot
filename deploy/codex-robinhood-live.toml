@@ -1,0 +1,26 @@
+# Merge into ~/.codex/config.toml on the VPS deploy user.
+# Enables unattended auto-trade via bot.shadow_reviewer + Codex CLI.
+
+# Profile used for live placement invocations.
+# approval_policy=never auto-approves ALL tool calls without interactive
+# prompts — including place_equity_order.  Per-tool approval_mode entries
+# are intentionally absent; they override the profile policy and would
+# re-introduce the confirmation pause that blocks unattended execution.
+# sandbox_mode=read-only restricts shell commands and filesystem writes while
+# still allowing MCP calls.
+[profiles.trade-bot]
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+[mcp_servers.robinhood-trading]
+url = "https://agent.robinhood.com/mcp/trading"
+enabled = true
+required = true
+enabled_tools = [
+  "get_accounts",
+  "get_portfolio",
+  "get_equity_positions",
+  "get_equity_tradability",
+  "get_equity_orders",
+  "place_equity_order",
+]

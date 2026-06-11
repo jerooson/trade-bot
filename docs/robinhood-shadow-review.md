@@ -1,7 +1,7 @@
-# Robinhood Shadow Review
+# Robinhood Auto-Trade
 
-The shadow reviewer proves the complete Discord-to-Robinhood review path without
-placing real orders.
+The host-side auto-trader turns fresh DRY_RUN executor proposals into real
+Robinhood Agentic-account orders via Codex CLI.
 
 ## Behavior
 
@@ -12,7 +12,7 @@ credentials belong to the `deploy` user. It tails:
 logs/proposed_orders.jsonl
 ```
 
-It reviews only:
+It trades only:
 
 - fresh accepted `ENTRY` + `BUY` proposals
 - fresh accepted `REDUCE` + `SELL` proposals
@@ -28,8 +28,8 @@ Before Codex is invoked, the worker independently verifies:
 - `REDUCE` has a positive share quantity
 
 Codex then checks the Agentic account, actual positions, buying power, ticker
-tradability, and calls `review_equity_order`. The prompt explicitly forbids
-placing or cancelling orders.
+tradability, and calls `place_equity_order` (review is skipped). Each proposal
+gets a stable `ref_id` UUID for idempotent retries.
 
 Every result is appended to:
 
@@ -37,41 +37,27 @@ Every result is appended to:
 logs/robinhood_shadow_reviews.jsonl
 ```
 
+Set `SHADOW_REVIEW_PLACE_ORDERS=false` to pause live placement without stopping
+the watcher.
+
 ## Codex MCP Configuration
 
-Keep order-placement and cancellation tools hidden. Add only the non-trading
-review tool to the existing allowlist:
+Add `place_equity_order` to the Robinhood MCP allowlist. Do not add
+`review_equity_order` unless you want manual review again.
+
+See `deploy/codex-robinhood-live.toml` for the full VPS config snippet.
 
 ```toml
-[mcp_servers.robinhood-trading]
-url = "https://agent.robinhood.com/mcp/trading"
-enabled = true
-required = true
 enabled_tools = [
   "get_accounts",
   "get_portfolio",
   "get_equity_positions",
   "get_equity_tradability",
-  "review_equity_order",
+  "place_equity_order",
 ]
-
-[mcp_servers.robinhood-trading.tools.get_accounts]
-approval_mode = "approve"
-
-[mcp_servers.robinhood-trading.tools.get_portfolio]
-approval_mode = "approve"
-
-[mcp_servers.robinhood-trading.tools.get_equity_positions]
-approval_mode = "approve"
-
-[mcp_servers.robinhood-trading.tools.get_equity_tradability]
-approval_mode = "approve"
-
-[mcp_servers.robinhood-trading.tools.review_equity_order]
-approval_mode = "approve"
 ```
 
-Do not add `place_equity_order` or `cancel_equity_order`.
+`cancel_equity_order` remains excluded by default.
 
 ## Install on the VPS
 
@@ -90,6 +76,8 @@ python3 -m venv .venv
 .venv/bin/pip install .
 ```
 
+Merge `deploy/codex-robinhood-live.toml` into `~/.codex/config.toml`.
+
 As `root`, install and start the systemd service:
 
 ```bash
@@ -105,7 +93,13 @@ systemctl status trade-bot-shadow-review --no-pager
 journalctl -u trade-bot-shadow-review -n 100 --no-pager
 ```
 
-## Review Logs
+Expected fresh log lines include:
+
+```text
+auto-trader watching logs/proposed_orders.jsonl (live auto-trade)
+```
+
+## Trade Logs
 
 ```bash
 cd ~/trade-bot
