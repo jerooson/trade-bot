@@ -244,7 +244,7 @@ def place_order(
         positions_data = session.call(
             "get_equity_positions", account_number=account_number
         )
-        positions = positions_data.get("data", {}).get("equity_positions", [])
+        positions = positions_data.get("data", {}).get("positions", [])
         position = next((p for p in positions if p.get("symbol") == ticker), None)
         actual_shares = float(position.get("quantity", 0)) if position else 0.0
         if actual_shares <= 0:
