@@ -42,6 +42,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from bot.executor import TailReader, _fraction_of
+from bot import robinhood_mcp_client
 
 log = logging.getLogger("bot.shadow_reviewer")
 
@@ -394,15 +395,46 @@ def review_one(
     if not eligible or expected is None:
         return ShadowRecord(status="SKIPPED", rationale=reason, **base)
 
-    # Write PENDING to the ledger before invoking Codex.  If the process
-    # crashes after Robinhood accepts but before the final record is written,
-    # the PENDING entry prevents a re-attempt on restart.
+    # Write PENDING to the ledger before placement.  If the process crashes
+    # after Robinhood accepts but before the final record is written, the
+    # PENDING entry prevents a re-attempt on restart.
     if _append_pending:
+        backend = "direct-mcp" if config.place_orders else "codex-review"
         _append_record(
-            ShadowRecord(status="PENDING", rationale="invoking Codex", **base),
+            ShadowRecord(status="PENDING", rationale=f"invoking {backend}", **base),
             config.ledger_path,
         )
 
+    if config.place_orders:
+        # Use the direct Python MCP client to bypass Codex CLI.
+        # Codex 0.139.0 uses MCP protocol 2025-06-18 with the elicitation
+        # capability, which causes the Robinhood server to require interactive
+        # user consent — auto-cancelled in unattended mode.  The direct client
+        # uses protocol 2025-03-26 (no elicitation) and avoids this entirely.
+        try:
+            broker_order_id, order_state = robinhood_mcp_client.place_order(
+                proposal, expected
+            )
+        except robinhood_mcp_client.RobinhoodMCPError as exc:
+            return ShadowRecord(
+                status="FAILED",
+                rationale=f"direct MCP error: {exc}",
+                **base,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ShadowRecord(
+                status="FAILED",
+                rationale=f"direct MCP unexpected error: {exc}",
+                **base,
+            )
+        return ShadowRecord(
+            status="PLACED",
+            rationale=f"broker order {broker_order_id} state={order_state}",
+            broker_order_id=broker_order_id,
+            **base,
+        )
+
+    # Review-only path: use Codex CLI (read-only, no placement).
     try:
         result = invoke_codex(proposal, expected, config)
     except subprocess.TimeoutExpired as exc:
@@ -430,30 +462,10 @@ def review_one(
             **base,
         )
 
-    if config.place_orders:
-        broker_order_id = _extract_broker_order_id(result.stdout)
-        if broker_order_id:
-            status = "PLACED"
-            rationale = f"broker order {broker_order_id}"
-        else:
-            # Codex exited 0 but emitted no BROKER_ORDER_ID= tag.  This means
-            # either the order was not placed (e.g. REDUCE with zero position)
-            # or Codex failed to follow the output format.  Operator must
-            # inspect stdout and confirm broker state before assuming success.
-            status = "UNVERIFIED"
-            rationale = (
-                "Codex exited 0 but no BROKER_ORDER_ID= tag found in output; "
-                "inspect stdout and verify broker order state manually"
-            )
-    else:
-        status = "REVIEWED"
-        rationale = reason
-        broker_order_id = None
-
     return ShadowRecord(
-        status=status,
-        rationale=rationale,
-        broker_order_id=broker_order_id if config.place_orders else None,
+        status="REVIEWED",
+        rationale=reason,
+        broker_order_id=None,
         codex_exit_code=result.returncode,
         codex_stdout=result.stdout.strip() or None,
         codex_stderr=result.stderr.strip() or None,
