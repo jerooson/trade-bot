@@ -208,9 +208,21 @@ def place_order(
     results = tradability_data.get("data", {}).get("results", [])
     if results:
         item = results[0]
-        if not item.get("is_tradable", True):
-            reason = item.get("reason", "unknown")
-            raise RobinhoodMCPError(f"{ticker} is not tradable: {reason}")
+        if not item.get("tradeable", True):
+            reason = item.get("state", "unknown")
+            raise RobinhoodMCPError(f"{ticker} is not tradable: state={reason}")
+        # Dollar-amount (fractional) orders require fractional support.
+        # For ENTRY (BUY with dollar_amount), reject non-fractional stocks
+        # because we cannot reliably determine share count without a quote API.
+        if kind == "ENTRY":
+            frac = item.get("fractional_tradability", "tradable")
+            if frac == "untradable":
+                raise RobinhoodMCPError(
+                    f"{ticker} does not support fractional/dollar-amount orders "
+                    f"(fractional_tradability={frac!r}). "
+                    "Increase the per-ticker budget to cover at least 1 whole share, "
+                    "or exclude this ticker from agentic trading."
+                )
 
     # Step 3: Check for existing open orders.
     existing_data = session.call(
