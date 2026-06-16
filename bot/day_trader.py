@@ -368,7 +368,14 @@ def _place_limit_sell(session: _MCPSession, account_number: str, ticker: str, qt
         )
         return resp.get("data", {}).get("order", {}).get("id") or resp.get("id")
     except RobinhoodMCPError as exc:
-        log.error("Failed to place limit sell for %s at %.2f: %s", ticker, limit_price, exc)
+        msg = str(exc)
+        if "fractional" in msg.lower():
+            log.info(
+                "Broker limit sell not available for fractional %s — bot will manage target internally at %.4f",
+                ticker, limit_price,
+            )
+        else:
+            log.error("Failed to place limit sell for %s at %.2f: %s", ticker, limit_price, exc)
         return None
     except Exception as exc:
         log.error("Failed to place limit sell for %s at %.2f: %s", ticker, limit_price, exc)
@@ -575,7 +582,30 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
                 changed = True
                 continue
 
-            # Check if target limit order filled (poll order state)
+            # Bot-managed target check: sell when price hits Will's target.
+            # (Robinhood rejects limit orders on fractional qty, so we monitor
+            # the target via price polling and market-sell when hit.)
+            if pos.target_price and price >= pos.target_price:
+                log.info(
+                    "Target hit for %s: price=%.4f >= target=%.4f — market selling",
+                    pos.ticker, price, pos.target_price,
+                )
+                if pos.stop_order_id:
+                    _cancel_order(session, account_number, pos.stop_order_id)
+                if pos.limit_order_id:
+                    _cancel_order(session, account_number, pos.limit_order_id)
+                if pos.fill_qty:
+                    _market_sell_all(session, account_number, pos.ticker, pos.fill_qty)
+                pos.status = "closed"
+                pos.exit_reason = "target"
+                pos.exit_price = price
+                pos.realized_pnl = round((price - pos.fill_price) * (pos.fill_qty or 0), 2)
+                pos.realized_pnl_pct = round((price - pos.fill_price) / pos.fill_price * 100, 3)
+                pos.closed_at = datetime.now(timezone.utc).isoformat()
+                changed = True
+                continue
+
+            # Also poll broker limit order if one was placed (for whole-share positions)
             if pos.limit_order_id:
                 try:
                     od = session.call("get_equity_orders", account_number=account_number, symbol=pos.ticker)
@@ -583,7 +613,7 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
                     tgt_order = next((o for o in orders if o.get("id") == pos.limit_order_id), None)
                     if tgt_order and tgt_order.get("state") == "filled":
                         fill_p = float(tgt_order.get("average_price") or price)
-                        log.info("Target filled for %s at %.4f", pos.ticker, fill_p)
+                        log.info("Limit order filled for %s at %.4f", pos.ticker, fill_p)
                         if pos.stop_order_id:
                             _cancel_order(session, account_number, pos.stop_order_id)
                         pos.status = "closed"
