@@ -315,7 +315,13 @@ def _place_market_buy(session: _MCPSession, account_number: str, ticker: str, us
 
 
 def _place_stop_order(session: _MCPSession, account_number: str, ticker: str, qty: float, stop_price: float) -> str | None:
-    """Place a stop-market sell order. Returns order_id or None."""
+    """
+    Attempt a stop_market sell order. Returns order_id or None.
+
+    Robinhood does not support stop orders on fractional positions — in that
+    case we return None and rely on the bot's 60-second price check to
+    trigger a market-sell when the stop level is breached.
+    """
     ref_id = str(uuid.uuid5(uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), f"daystop:{ticker}:{stop_price}"))
     try:
         resp = session.call(
@@ -323,13 +329,23 @@ def _place_stop_order(session: _MCPSession, account_number: str, ticker: str, qt
             account_number=account_number,
             symbol=ticker,
             side="sell",
-            type="stop",
+            type="stop_market",
             stop_price=str(round(stop_price, 2)),
             quantity=str(round(qty, 6)),
             time_in_force="gfd",
             ref_id=ref_id,
         )
         return resp.get("data", {}).get("order", {}).get("id") or resp.get("id")
+    except RobinhoodMCPError as exc:
+        msg = str(exc)
+        if "fractional" in msg.lower() or "trigger" in msg.lower():
+            log.info(
+                "Broker stop not available for fractional %s — bot will manage stop internally at %.4f",
+                ticker, stop_price,
+            )
+        else:
+            log.error("Failed to place stop order for %s at %.2f: %s", ticker, stop_price, exc)
+        return None
     except Exception as exc:
         log.error("Failed to place stop order for %s at %.2f: %s", ticker, stop_price, exc)
         return None
@@ -351,6 +367,9 @@ def _place_limit_sell(session: _MCPSession, account_number: str, ticker: str, qt
             ref_id=ref_id,
         )
         return resp.get("data", {}).get("order", {}).get("id") or resp.get("id")
+    except RobinhoodMCPError as exc:
+        log.error("Failed to place limit sell for %s at %.2f: %s", ticker, limit_price, exc)
+        return None
     except Exception as exc:
         log.error("Failed to place limit sell for %s at %.2f: %s", ticker, limit_price, exc)
         return None
