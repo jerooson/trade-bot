@@ -677,6 +677,7 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
 
 
 PID_FILE = Path("logs/day_trader.pid")
+HEARTBEAT_FILE = Path("logs/day_trader.heartbeat")
 
 
 def main() -> None:
@@ -701,6 +702,11 @@ def main() -> None:
             run_once(positions, seen_plan_ids)
         except Exception as exc:
             log.exception("run_once error: %s", exc)
+        # Heartbeat: touch file so the API can detect we're alive
+        try:
+            HEARTBEAT_FILE.touch()
+        except Exception:
+            pass
         time.sleep(POLL_INTERVAL_S)
 
 

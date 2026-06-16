@@ -641,18 +641,22 @@ def get_daytrader_state() -> dict[str, Any]:
     """Return all day-trade positions (watching/open/closed) and P&L summary."""
     import os
 
-    # Check if day_trader service is running via PID file.
+    # Check if day_trader service is running.
+    # The day_trader writes a heartbeat timestamp to day_trader.heartbeat every
+    # poll cycle. If the heartbeat is < 5 min old the service is considered live.
+    # Fall back to PID file existence if heartbeat is absent.
+    import time as _time
+    HEARTBEAT_PATH = DAY_TRADE_POSITIONS_PATH.parent / "day_trader.heartbeat"
     service_running = False
-    if DAY_TRADER_PID_PATH.exists():
+    if HEARTBEAT_PATH.exists():
         try:
-            pid = int(DAY_TRADER_PID_PATH.read_text().strip())
-            try:
-                os.kill(pid, 0)
-                service_running = True
-            except OSError:
-                service_running = False
+            age_s = _time.time() - HEARTBEAT_PATH.stat().st_mtime
+            service_running = age_s < 300  # alive if touched within 5 min
         except Exception:
             pass
+    elif DAY_TRADER_PID_PATH.exists():
+        # Heartbeat not written yet (first startup); trust PID file existence
+        service_running = True
 
     positions: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
