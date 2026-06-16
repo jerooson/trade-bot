@@ -32,7 +32,7 @@ OPEN_STATES = {
 }
 
 _BUY_KINDS = {"ENTRY", "ADD"}
-_SELL_KINDS = {"REDUCE", "CLOSE"}
+_SELL_KINDS = {"REDUCE", "CLOSE", "STOP_TRIGGER"}
 
 # Poll this many times (×2s each) waiting for a market order to fill.
 _FILL_POLL_ATTEMPTS = 10
@@ -271,7 +271,7 @@ def place_order(
                 f"{kind} for {ticker} but actual position is 0 shares"
             )
         virtual_est = float(proposal.get("shares_estimate", 0))
-        if kind == "CLOSE":
+        if kind in ("CLOSE", "STOP_TRIGGER"):
             # Sell all actual shares — ignore virtual book estimate.
             quantity = actual_shares
         else:

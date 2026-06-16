@@ -51,7 +51,7 @@ REF_ID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 # Signal kinds that result in buy orders.
 _BUY_KINDS = {"ENTRY", "ADD"}
 # Signal kinds that result in sell orders.
-_SELL_KINDS = {"REDUCE", "CLOSE"}
+_SELL_KINDS = {"REDUCE", "CLOSE", "STOP_TRIGGER"}
 
 # Only match the explicit BROKER_ORDER_ID=<uuid> tag emitted by the live
 # prompt.  Any other UUID in the Codex output (session IDs, MCP correlation
