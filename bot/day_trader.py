@@ -276,7 +276,7 @@ def _place_market_buy(session: _MCPSession, account_number: str, ticker: str, us
         "side": "buy",
         "type": "market",
         "time_in_force": "gfd",
-        "dollar_amount": usd,
+        "dollar_amount": str(usd),   # API requires string, not number
         "ref_id": ref_id,
     }
     resp = session.call("place_equity_order", **order_kwargs)
