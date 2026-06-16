@@ -237,11 +237,22 @@ def _load_new_plans(seen_ids: set[str]) -> list[Signal]:
 def _get_price(session: _MCPSession, ticker: str) -> float | None:
     """Return latest last-trade price for ticker, or None on error."""
     try:
-        data = session.call("get_equity_latest_trading_info", symbols=[ticker])
+        data = session.call("get_equity_quotes", symbols=[ticker])
         results = data.get("data", {}).get("results", [])
         if results:
-            p = results[0].get("last_trade_price") or results[0].get("bid_price")
-            return float(p) if p is not None else None
+            # Quote data is nested: results[0]["quote"][field]
+            q = results[0].get("quote") or results[0]
+            ltp = q.get("last_trade_price")
+            if ltp is not None:
+                return float(ltp)
+            ask = q.get("ask_price")
+            bid = q.get("bid_price")
+            if ask is not None and bid is not None:
+                return (float(ask) + float(bid)) / 2
+            if ask is not None:
+                return float(ask)
+            if bid is not None:
+                return float(bid)
     except Exception as exc:
         log.warning("Price fetch failed for %s: %s", ticker, exc)
     return None
