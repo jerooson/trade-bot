@@ -209,7 +209,7 @@ def _expected_usd(proposal: dict[str, Any], budget: float) -> float | None:
         if fraction is None or not isinstance(deployed, (int, float)):
             return None
         return min(round(budget * fraction, 4), float(deployed))
-    if kind == "CLOSE":
+    if kind in ("CLOSE", "STOP_TRIGGER"):
         # Full exit — validate against the proposal's own usd_amount.
         # The real quantity guard is in the MCP client (uses actual broker shares).
         usd = proposal.get("usd_amount")
@@ -512,7 +512,7 @@ def run(config: ShadowConfig) -> None:
     mode = "live auto-trade" if config.place_orders else "review-only (placement disabled)"
     log.info("auto-trader watching %s (%s)", config.orders_path, mode)
     log.info("trade ledger -> %s", config.ledger_path)
-    log.info("eligible actions: BUY (ENTRY/ADD) and SELL (REDUCE/CLOSE)")
+    log.info("eligible actions: BUY (ENTRY/ADD) and SELL (REDUCE/CLOSE/STOP_TRIGGER)")
 
     while True:
         for proposal in tail.read_new_records():
