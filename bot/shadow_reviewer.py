@@ -48,6 +48,11 @@ log = logging.getLogger("bot.shadow_reviewer")
 
 REF_ID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
+# Signal kinds that result in buy orders.
+_BUY_KINDS = {"ENTRY", "ADD"}
+# Signal kinds that result in sell orders.
+_SELL_KINDS = {"REDUCE", "CLOSE"}
+
 # Only match the explicit BROKER_ORDER_ID=<uuid> tag emitted by the live
 # prompt.  Any other UUID in the Codex output (session IDs, MCP correlation
 # IDs, account IDs) is ignored, preventing false PLACED status.
@@ -188,7 +193,7 @@ def _append_record(record: ShadowRecord, path: Path) -> None:
 def _expected_usd(proposal: dict[str, Any], budget: float) -> float | None:
     signal = proposal.get("signal") or {}
     kind = proposal.get("signal_kind")
-    if kind == "ENTRY":
+    if kind in _BUY_KINDS:  # ENTRY or ADD
         fraction = signal.get("position_fraction")
         if not isinstance(fraction, (int, float)) or fraction <= 0:
             return None
@@ -200,6 +205,11 @@ def _expected_usd(proposal: dict[str, Any], budget: float) -> float | None:
         if fraction is None or not isinstance(deployed, (int, float)):
             return None
         return min(round(budget * fraction, 4), float(deployed))
+    if kind == "CLOSE":
+        # Full exit — validate against the proposal's own usd_amount.
+        # The real quantity guard is in the MCP client (uses actual broker shares).
+        usd = proposal.get("usd_amount")
+        return float(usd) if isinstance(usd, (int, float)) else None
     return None
 
 
@@ -213,8 +223,12 @@ def validate_proposal(
     action = proposal.get("action")
     signal = proposal.get("signal") or {}
 
-    if (kind, action) not in {("ENTRY", "BUY"), ("REDUCE", "SELL")}:
-        return False, "only accepted ENTRY buys and REDUCE sells are reviewed", None
+    if kind in _BUY_KINDS and action != "BUY":
+        return False, f"{kind} proposal action must be BUY", None
+    if kind in _SELL_KINDS and action != "SELL":
+        return False, f"{kind} proposal action must be SELL", None
+    if kind not in _BUY_KINDS | _SELL_KINDS:
+        return False, "only BUY (ENTRY/ADD) and SELL (REDUCE/CLOSE) signals are reviewed", None
     if signal.get("side") == "SHORT":
         return False, "SHORT proposals are not supported", None
     if not proposal.get("ticker"):
@@ -240,10 +254,10 @@ def validate_proposal(
     if actual <= 0.01 or actual > config.budget_per_ticker + 0.01:
         return False, f"proposal USD amount ${actual:.4f} is outside limits", expected
 
-    if kind == "REDUCE":
+    if kind in _SELL_KINDS:  # REDUCE or CLOSE
         quantity = proposal.get("shares_estimate")
         if not isinstance(quantity, (int, float)) or quantity <= 0:
-            return False, "REDUCE has no usable share quantity", expected
+            return False, f"{kind} has no usable share quantity", expected
 
     return True, "eligible", expected
 
@@ -480,7 +494,7 @@ def run(config: ShadowConfig) -> None:
     mode = "live auto-trade" if config.place_orders else "review-only (placement disabled)"
     log.info("auto-trader watching %s (%s)", config.orders_path, mode)
     log.info("trade ledger -> %s", config.ledger_path)
-    log.info("eligible actions: fresh ENTRY buys and REDUCE sells only")
+    log.info("eligible actions: BUY (ENTRY/ADD) and SELL (REDUCE/CLOSE)")
 
     while True:
         for proposal in tail.read_new_records():

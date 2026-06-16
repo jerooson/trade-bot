@@ -30,6 +30,9 @@ OPEN_STATES = {
     "new", "queued", "confirmed", "unconfirmed", "partially_filled"
 }
 
+_BUY_KINDS = {"ENTRY", "ADD"}
+_SELL_KINDS = {"REDUCE", "CLOSE"}
+
 
 class RobinhoodMCPError(Exception):
     pass
@@ -212,9 +215,8 @@ def place_order(
             reason = item.get("state", "unknown")
             raise RobinhoodMCPError(f"{ticker} is not tradable: state={reason}")
         # Dollar-amount (fractional) orders require fractional support.
-        # For ENTRY (BUY with dollar_amount), reject non-fractional stocks
-        # because we cannot reliably determine share count without a quote API.
-        if kind == "ENTRY":
+        # ENTRY and ADD both submit dollar_amount orders, so both need this check.
+        if kind in _BUY_KINDS:
             frac = item.get("fractional_tradability", "tradable")
             if frac == "untradable":
                 raise RobinhoodMCPError(
@@ -238,9 +240,11 @@ def place_order(
             f"Existing open order for {ticker}: {oid} — skipping to avoid duplicate"
         )
 
-    # Step 4: For REDUCE, determine actual position to cap the sell quantity.
+    # Step 4: For REDUCE/CLOSE, fetch actual broker position to determine sell quantity.
+    # REDUCE caps at min(virtual_estimate, actual_shares).
+    # CLOSE sells all actual shares held (ignores the virtual estimate entirely).
     quantity: float | None = None
-    if kind == "REDUCE":
+    if kind in _SELL_KINDS:
         positions_data = session.call(
             "get_equity_positions", account_number=account_number
         )
@@ -249,12 +253,18 @@ def place_order(
         actual_shares = float(position.get("quantity", 0)) if position else 0.0
         if actual_shares <= 0:
             raise RobinhoodMCPError(
-                f"REDUCE for {ticker} but actual position is 0 shares"
+                f"{kind} for {ticker} but actual position is 0 shares"
             )
         virtual_est = float(proposal.get("shares_estimate", 0))
-        quantity = min(virtual_est, actual_shares)
+        if kind == "CLOSE":
+            # Sell all actual shares — ignore virtual book estimate.
+            quantity = actual_shares
+        else:
+            # REDUCE: cap at actual shares to avoid overselling.
+            quantity = min(virtual_est, actual_shares)
         log.info(
-            "REDUCE %s: virtual_est=%.6f actual=%.6f → sell=%.6f",
+            "%s %s: virtual_est=%.6f actual=%.6f → sell=%.6f",
+            kind,
             ticker,
             virtual_est,
             actual_shares,
@@ -265,15 +275,15 @@ def place_order(
     order_kwargs: dict[str, Any] = {
         "account_number": account_number,
         "symbol": ticker,
-        "side": "buy" if kind == "ENTRY" else "sell",
+        "side": "buy" if kind in _BUY_KINDS else "sell",
         "type": "market",
         "time_in_force": "gfd",
         "market_hours": "regular_hours",
         "ref_id": ref_id,
     }
-    if kind == "ENTRY":
+    if kind in _BUY_KINDS:  # ENTRY or ADD: dollar-amount market order
         order_kwargs["dollar_amount"] = f"{amount:.2f}"
-    else:
+    else:  # REDUCE or CLOSE: quantity-based market order
         order_kwargs["quantity"] = f"{quantity:.6f}"
 
     log.info("Placing order: %s", {k: v for k, v in order_kwargs.items() if k != "account_number"})
