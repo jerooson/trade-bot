@@ -167,6 +167,52 @@ export interface ProposedOrder {
   };
 }
 
+// -- Day trade types ----------------------------------------------------------
+
+export type DayTradeStatus = "watching" | "open" | "closed" | "expired";
+
+export interface DayTradePosition {
+  id: string;
+  ticker: string;
+  status: DayTradeStatus;
+  trigger_price: number | null;
+  target_price: number | null;
+  setup: string | null;
+  plan_received_at: string;
+  entered_at: string | null;
+  fill_price: number | null;
+  stop_price: number | null;
+  stop_order_id: string | null;
+  limit_order_id: string | null;
+  high_water_mark: number | null;
+  current_price: number | null;
+  exit_price: number | null;
+  exit_reason: string | null;    // "stop", "target", "eod", "manual"
+  realized_pnl: number | null;
+  realized_pnl_pct: number | null;
+  closed_at: string | null;
+}
+
+export interface DayTradePnlRecord {
+  id: string;
+  ticker: string;
+  setup: string | null;
+  fill_price: number | null;
+  exit_price: number | null;
+  realized_pnl: number | null;
+  realized_pnl_pct: number | null;
+  exit_reason: string | null;
+  closed_at: string;
+}
+
+export interface DayTradePnl {
+  total_realized_pnl: number;
+  wins: number;
+  losses: number;
+  trades_today: number;
+  records: DayTradePnlRecord[];
+}
+
 // -- P&L types ----------------------------------------------------------------
 
 export type TradeKind = "ENTRY" | "ADD" | "REDUCE" | "CLOSE";

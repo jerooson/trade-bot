@@ -1,4 +1,6 @@
 import type {
+  DayTradePnl,
+  DayTradePosition,
   OpenPosition,
   PnlSummary,
   ProposedOrder,
@@ -176,6 +178,20 @@ export async function fetchPnl(): Promise<PnlSummary> {
   const r = await fetch("/api/pnl");
   if (!r.ok) throw new Error(`pnl: ${r.status}`);
   return r.json();
+}
+
+// -- Day trader ---------------------------------------------------------------
+
+export interface DayTradeState {
+  positions: DayTradePosition[];
+  pnl: DayTradePnl | null;
+  service_running: boolean;
+}
+
+export async function fetchDayTradeState(): Promise<DayTradeState> {
+  const res = await fetch("/api/daytrader");
+  if (!res.ok) throw new Error(`daytrader: ${res.status}`);
+  return res.json();
 }
 
 /** Open the executor orders SSE stream. Returns a cleanup function. */

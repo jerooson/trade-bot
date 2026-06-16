@@ -55,6 +55,11 @@ SHADOW_REVIEWS_PATH = LOG_DIR / "robinhood_shadow_reviews.jsonl"
 # P&L ledger written by pnl_tracker after each live Robinhood order fill.
 PNL_PATH = LOG_DIR / "trade_pnl.jsonl"
 
+# Day trader state (written by bot/day_trader.py).
+DAY_TRADE_POSITIONS_PATH = LOG_DIR / "day_trade_positions.jsonl"
+# Service PID file written by the day_trader process.
+DAY_TRADER_PID_PATH = LOG_DIR / "day_trader.pid"
+
 
 app = FastAPI(title="trade-bot dashboard", version="0.1.0")
 
@@ -628,6 +633,88 @@ def list_pnl() -> dict[str, Any]:
         "wins": len(wins),
         "losses": len(losses),
         "records": records,
+    }
+
+
+@app.get("/api/daytrader")
+def get_daytrader_state() -> dict[str, Any]:
+    """Return all day-trade positions (watching/open/closed) and P&L summary."""
+    import os
+
+    # Check if day_trader service is running via PID file.
+    service_running = False
+    if DAY_TRADER_PID_PATH.exists():
+        try:
+            pid = int(DAY_TRADER_PID_PATH.read_text().strip())
+            try:
+                os.kill(pid, 0)
+                service_running = True
+            except OSError:
+                service_running = False
+        except Exception:
+            pass
+
+    positions: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    if DAY_TRADE_POSITIONS_PATH.exists():
+        with DAY_TRADE_POSITIONS_PATH.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    seen_ids.discard(rec.get("id", ""))
+                    seen_ids.add(rec.get("id", ""))
+                except json.JSONDecodeError:
+                    continue
+        # Replay to get last state per id
+        all_recs: dict[str, dict] = {}
+        with DAY_TRADE_POSITIONS_PATH.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    all_recs[rec["id"]] = rec
+                except Exception:
+                    continue
+        positions = list(all_recs.values())
+
+    # Build P&L summary from closed positions
+    closed = [p for p in positions if p.get("status") == "closed" and p.get("realized_pnl") is not None]
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    closed_today = [p for p in closed if (p.get("closed_at") or "").startswith(today_str)]
+    total_pnl = sum(p.get("realized_pnl") or 0 for p in closed_today)
+    wins = len([p for p in closed_today if (p.get("realized_pnl") or 0) > 0])
+    losses = len([p for p in closed_today if (p.get("realized_pnl") or 0) < 0])
+
+    pnl_records = [
+        {
+            "id": p.get("id"),
+            "ticker": p.get("ticker"),
+            "setup": p.get("setup"),
+            "fill_price": p.get("fill_price"),
+            "exit_price": p.get("exit_price"),
+            "realized_pnl": p.get("realized_pnl"),
+            "realized_pnl_pct": p.get("realized_pnl_pct"),
+            "exit_reason": p.get("exit_reason"),
+            "closed_at": p.get("closed_at"),
+        }
+        for p in sorted(closed, key=lambda x: x.get("closed_at") or "", reverse=True)
+    ]
+
+    return {
+        "positions": positions,
+        "pnl": {
+            "total_realized_pnl": round(total_pnl, 4),
+            "wins": wins,
+            "losses": losses,
+            "trades_today": len(closed_today),
+            "records": pnl_records,
+        },
+        "service_running": service_running,
     }
 
 

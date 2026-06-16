@@ -5,15 +5,16 @@ import { useSwingData } from "./hooks/useSwingData";
 import { useExecutorData } from "./hooks/useExecutorData";
 import { usePinnedPlans } from "./hooks/usePinnedPlans";
 import { usePnlData } from "./hooks/usePnlData";
+import { useDayTradeData } from "./hooks/useDayTradeData";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ViewId } from "./components/Sidebar";
-import { SignalsView } from "./components/SignalsView";
+import { DayTradeView } from "./components/DayTradeView";
 import { WatchlistView } from "./components/WatchlistView";
 import { SwingTradeView } from "./components/SwingTradeView";
 import { Footer } from "./components/Footer";
 
 export default function App() {
-  const [view, setView] = useState<ViewId>("signals");
+  const [view, setView] = useState<ViewId>("daytrade");
 
   const dash = useDashboardData();
   const planData = usePlanData();
@@ -21,15 +22,15 @@ export default function App() {
   const executorData = useExecutorData();
   const pin = usePinnedPlans();
   const pnlData = usePnlData();
+  const dayTradeData = useDayTradeData();
 
-  // The status bar reflects whichever view is active.
   const status = useMemo(() => {
-    if (view === "signals") {
+    if (view === "daytrade") {
       return {
         conn: dash.conn,
         lastEventAt: dash.lastEventAt,
-        total: dash.signals.length,
-        totalLabel: "signals on file",
+        total: dayTradeData.positions.filter(p => p.status === "open").length,
+        totalLabel: "day trades open",
       };
     }
     if (view === "watchlist") {
@@ -46,7 +47,10 @@ export default function App() {
       total: swingData.openPositions.length,
       totalLabel: "open swing positions",
     };
-  }, [view, dash, planData, swingData, pnlData]);
+  }, [view, dash, planData, swingData, dayTradeData]);
+
+  const activeDayTradesCount =
+    dayTradeData.positions.filter(p => p.status === "open" || p.status === "watching").length;
 
   return (
     <div className="relative min-h-screen">
@@ -65,10 +69,18 @@ export default function App() {
           planCount={planData.plans.length}
           openPositionsCount={swingData.openPositions.length}
           pnlTradeCount={pnlData.summary?.count ?? 0}
+          activeDayTradesCount={activeDayTradesCount}
         />
 
         <div className="min-w-0 flex-1 pb-20 md:pb-0">
-          {view === "signals" && <SignalsView dash={dash} />}
+          {view === "daytrade" && (
+            <DayTradeView
+              dash={dash}
+              positions={dayTradeData.positions}
+              pnl={dayTradeData.pnl}
+              serviceRunning={dayTradeData.serviceRunning}
+            />
+          )}
           {view === "watchlist" && (
             <WatchlistView
               plans={planData.plans}

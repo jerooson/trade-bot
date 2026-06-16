@@ -10,7 +10,7 @@ import { DateRangeBar } from "./DateRangeBar";
 import { filterByRange, isSingleDay, type DateRange } from "../lib/filters";
 import { deriveStats } from "../lib/derive";
 
-interface DashLike {
+export interface DashLike {
   signals: Signal[];
   conn: ConnectionState;
   lastEventAt: string | null;

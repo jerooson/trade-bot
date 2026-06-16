@@ -1,7 +1,7 @@
 import clsx from "clsx";
-import { Activity, ListTodo, Radio, type LucideIcon } from "lucide-react";
+import { Activity, ListTodo, Zap, type LucideIcon } from "lucide-react";
 
-export type ViewId = "signals" | "watchlist" | "swing";
+export type ViewId = "daytrade" | "watchlist" | "swing";
 
 interface NavItem {
   id: ViewId;
@@ -19,6 +19,7 @@ interface Props {
   planCount: number;
   openPositionsCount: number;
   pnlTradeCount: number;
+  activeDayTradesCount: number;
 }
 
 export function Sidebar({
@@ -28,10 +29,11 @@ export function Sidebar({
   planCount,
   openPositionsCount,
   pnlTradeCount,
+  activeDayTradesCount,
 }: Props) {
   const items: NavItem[] = [
-    { id: "signals",   label: "Signals",      sublabel: "Day trade signals",          badge: signalCount,        icon: Radio },
-    { id: "watchlist", label: "Watchlist",     sublabel: "Day trade plans",            badge: planCount,          icon: ListTodo },
+    { id: "daytrade",  label: "Day Trade",     sublabel: "Plans · Active · P&L",       badge: activeDayTradesCount, highlight: activeDayTradesCount > 0, icon: Zap },
+    { id: "watchlist", label: "Watchlist",     sublabel: "Swing trade plans",          badge: planCount,          icon: ListTodo },
     { id: "swing",     label: "Swing",         sublabel: "Positions · P&L · Book",     badge: openPositionsCount, highlight: openPositionsCount > 0 || pnlTradeCount > 0, icon: Activity },
   ];
 
@@ -83,10 +85,10 @@ export function Sidebar({
           System summary
         </div>
         <div className="mt-3 flex flex-col gap-2.5 rounded-xl border border-ink-500/30 bg-ink-950/40 p-3 text-[11px] text-bone-400">
-          <Row label="signals" value={signalCount.toLocaleString()} />
-          <Row label="plans" value={planCount.toLocaleString()} />
-          <Row label="open positions" value={openPositionsCount.toLocaleString()} highlight={openPositionsCount > 0} />
-          <Row label="trades filed" value={pnlTradeCount.toLocaleString()} highlight={pnlTradeCount > 0} />
+          <Row label="day signals" value={signalCount.toLocaleString()} />
+          <Row label="day active" value={activeDayTradesCount.toLocaleString()} highlight={activeDayTradesCount > 0} />
+          <Row label="swing open" value={openPositionsCount.toLocaleString()} highlight={openPositionsCount > 0} />
+          <Row label="swing P&L trades" value={pnlTradeCount.toLocaleString()} highlight={pnlTradeCount > 0} />
         </div>
       </aside>
 
