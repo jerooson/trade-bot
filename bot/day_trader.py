@@ -484,7 +484,9 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
             continue
 
         if price is not None:
-            pos.current_price = price
+            if pos.current_price != price:
+                pos.current_price = price
+                changed = True
             if pos.status == "watching":
                 log.info(
                     "Poll %s price=%.4f trigger=%.4f gap=%.2f%%",
