@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,20 @@ OPEN_STATES = {
 
 _BUY_KINDS = {"ENTRY", "ADD"}
 _SELL_KINDS = {"REDUCE", "CLOSE"}
+
+# Poll this many times (×2s each) waiting for a market order to fill.
+_FILL_POLL_ATTEMPTS = 10
+_FILL_POLL_INTERVAL_S = 2.0
+
+
+@dataclass
+class OrderResult:
+    """Result of a placed order, including fill details when available."""
+    order_id: str
+    state: str
+    fill_price: float | None = None    # average fill price (None if not yet filled)
+    fill_qty: float | None = None      # cumulative filled quantity
+    fill_usd: float | None = None      # fill_price × fill_qty
 
 
 class RobinhoodMCPError(Exception):
@@ -299,15 +314,46 @@ def place_order(
         )
     log.info("Order placed: id=%s state=%s", broker_order_id, order_state)
 
-    # Step 6: Confirm via get_equity_orders.
-    confirm_data = session.call(
-        "get_equity_orders",
-        account_number=account_number,
-        order_id=broker_order_id,
-    )
-    confirm_orders = confirm_data.get("data", {}).get("orders", [])
-    if confirm_orders:
-        order_state = confirm_orders[0].get("state", order_state)
-    log.info("Order confirmed: id=%s final_state=%s", broker_order_id, order_state)
+    # Step 6: Poll for fill — market orders typically fill within seconds.
+    fill_price: float | None = None
+    fill_qty: float | None = None
+    fill_usd: float | None = None
 
-    return broker_order_id, order_state
+    for attempt in range(_FILL_POLL_ATTEMPTS):
+        time.sleep(_FILL_POLL_INTERVAL_S)
+        confirm_data = session.call(
+            "get_equity_orders",
+            account_number=account_number,
+            order_id=broker_order_id,
+        )
+        confirm_orders = confirm_data.get("data", {}).get("orders", [])
+        if confirm_orders:
+            o = confirm_orders[0]
+            order_state = o.get("state", order_state)
+            if order_state in ("filled", "partially_filled"):
+                raw_price = o.get("average_price")
+                raw_qty = o.get("cumulative_quantity")
+                if raw_price:
+                    fill_price = float(raw_price)
+                if raw_qty:
+                    fill_qty = float(raw_qty)
+                if fill_price and fill_qty:
+                    fill_usd = round(fill_price * fill_qty, 4)
+                log.info(
+                    "Order filled: id=%s price=%.4f qty=%.6f usd=%.4f (attempt %d)",
+                    broker_order_id, fill_price or 0, fill_qty or 0, fill_usd or 0, attempt + 1,
+                )
+                break
+        if attempt == 0:
+            log.info("Order confirmed: id=%s state=%s (polling for fill...)", broker_order_id, order_state)
+
+    if fill_price is None:
+        log.warning("Order %s not filled within poll window (state=%s); fill price unavailable", broker_order_id, order_state)
+
+    return OrderResult(
+        order_id=broker_order_id,
+        state=order_state,
+        fill_price=fill_price,
+        fill_qty=fill_qty,
+        fill_usd=fill_usd,
+    )

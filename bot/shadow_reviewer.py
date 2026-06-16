@@ -42,7 +42,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from bot.executor import TailReader, _fraction_of
-from bot import robinhood_mcp_client
+from bot import robinhood_mcp_client, pnl_tracker
 
 log = logging.getLogger("bot.shadow_reviewer")
 
@@ -68,6 +68,7 @@ _BROKER_ORDER_TAG_RE = re.compile(
 class ShadowConfig:
     orders_path: Path
     ledger_path: Path
+    pnl_path: Path
     codex_command: str
     budget_per_ticker: float
     max_age_s: float
@@ -112,6 +113,9 @@ def load_config() -> ShadowConfig:
                 "SHADOW_REVIEW_LEDGER_PATH",
                 "./logs/robinhood_shadow_reviews.jsonl",
             )
+        ),
+        pnl_path=Path(
+            os.environ.get("SHADOW_REVIEW_PNL_PATH", "./logs/trade_pnl.jsonl")
         ),
         codex_command=os.environ.get("SHADOW_REVIEW_CODEX_COMMAND", "codex"),
         budget_per_ticker=float(
@@ -426,9 +430,7 @@ def review_one(
         # user consent — auto-cancelled in unattended mode.  The direct client
         # uses protocol 2025-03-26 (no elicitation) and avoids this entirely.
         try:
-            broker_order_id, order_state = robinhood_mcp_client.place_order(
-                proposal, expected
-            )
+            result = robinhood_mcp_client.place_order(proposal, expected)
         except robinhood_mcp_client.RobinhoodMCPError as exc:
             return ShadowRecord(
                 status="FAILED",
@@ -441,10 +443,26 @@ def review_one(
                 rationale=f"direct MCP unexpected error: {exc}",
                 **base,
             )
+
+        # Record fill details and P&L.
+        signal = proposal.get("signal") or {}
+        pnl_tracker.record_trade(
+            ticker=str(proposal.get("ticker") or ""),
+            kind=str(proposal.get("signal_kind") or ""),
+            action=str(proposal.get("action") or ""),
+            signal_price=signal.get("price"),
+            result=result,
+            pnl_path=config.pnl_path,
+        )
+
+        fill_note = (
+            f" fill=${result.fill_price:.4f}×{result.fill_qty:.6f}"
+            if result.fill_price else " (fill pending)"
+        )
         return ShadowRecord(
             status="PLACED",
-            rationale=f"broker order {broker_order_id} state={order_state}",
-            broker_order_id=broker_order_id,
+            rationale=f"broker order {result.order_id} state={result.state}{fill_note}",
+            broker_order_id=result.order_id,
             **base,
         )
 
