@@ -572,9 +572,13 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
             # detect this by polling the order status, but as a safety net
             # we also check price directly).
             if pos.stop_price and price <= pos.stop_price:
-                log.info("Stop triggered for %s price=%.4f stop=%.4f", pos.ticker, price, pos.stop_price)
+                log.info("Stop triggered for %s price=%.4f stop=%.4f — market selling", pos.ticker, price, pos.stop_price)
+                if pos.stop_order_id:
+                    _cancel_order(session, account_number, pos.stop_order_id)
                 if pos.limit_order_id:
                     _cancel_order(session, account_number, pos.limit_order_id)
+                if pos.fill_qty:
+                    _market_sell_all(session, account_number, pos.ticker, pos.fill_qty)
                 pos.status = "closed"
                 pos.exit_reason = "stop"
                 pos.exit_price = price
