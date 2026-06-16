@@ -181,7 +181,12 @@ def _load_new_plans(seen_ids: set[str]) -> list[Signal]:
         except Exception:
             continue
 
-        sig_id = d.get("id") or d.get("message_id", "")
+        sig_id = (
+            d.get("id")
+            or d.get("message_id")
+            or str(d.get("discord", {}).get("message_id", ""))
+            or ""
+        )
         if sig_id in seen_ids:
             continue
 
