@@ -459,6 +459,12 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
 
         if price is not None:
             pos.current_price = price
+            if pos.status == "watching":
+                log.info(
+                    "Poll %s price=%.4f trigger=%.4f gap=%.2f%%",
+                    pos.ticker, price, pos.trigger_price or 0,
+                    (price / pos.trigger_price - 1) * 100 if pos.trigger_price else 0,
+                )
 
         # --- Force close all open day trades at 3:50 pm ET ---
         if force_close and pos.status == "open" and pos.fill_qty:
