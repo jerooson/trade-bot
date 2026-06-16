@@ -9,9 +9,7 @@ import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ViewId } from "./components/Sidebar";
 import { SignalsView } from "./components/SignalsView";
 import { WatchlistView } from "./components/WatchlistView";
-import { SwingView } from "./components/SwingView";
-import { ExecutorView } from "./components/ExecutorView";
-import { PnlView } from "./components/PnlView";
+import { SwingTradeView } from "./components/SwingTradeView";
 import { Footer } from "./components/Footer";
 
 export default function App() {
@@ -42,29 +40,13 @@ export default function App() {
         totalLabel: "plans on file",
       };
     }
-    if (view === "swings") {
-      return {
-        conn: swingData.conn,
-        lastEventAt: swingData.lastEventAt,
-        total: swingData.actions.length,
-        totalLabel: "actions on file",
-      };
-    }
     return {
-      conn: executorData.conn,
-      lastEventAt: executorData.lastEventAt,
-      total: executorData.orders.length,
-      totalLabel: "decisions on file",
+      conn: swingData.conn,
+      lastEventAt: swingData.lastEventAt,
+      total: swingData.openPositions.length,
+      totalLabel: "open swing positions",
     };
-    if (view === "pnl") {
-      return {
-        conn: "connected" as const,
-        lastEventAt: null,
-        total: pnlData.summary?.count ?? 0,
-        totalLabel: "trades recorded",
-      };
-    }
-  }, [view, dash, planData, swingData, executorData, pnlData]);
+  }, [view, dash, planData, swingData, pnlData]);
 
   return (
     <div className="relative min-h-screen">
@@ -81,13 +63,7 @@ export default function App() {
           onChange={setView}
           signalCount={dash.signals.length}
           planCount={planData.plans.length}
-          swingCount={swingData.actions.length}
           openPositionsCount={swingData.openPositions.length}
-          pinnedCount={pin.count}
-          executorOpenCount={
-            executorData.book?.summary?.open_tickers ?? 0
-          }
-          executorDecisionsCount={executorData.orders.length}
           pnlTradeCount={pnlData.summary?.count ?? 0}
         />
 
@@ -103,28 +79,20 @@ export default function App() {
               pinnedCount={pin.count}
             />
           )}
-          {view === "swings" && (
-            <SwingView
+          {view === "swing" && (
+            <SwingTradeView
               actions={swingData.actions}
               openPositions={swingData.openPositions}
-              loading={swingData.loading}
-              error={swingData.error}
-            />
-          )}
-          {view === "executor" && (
-            <ExecutorView
+              swingLoading={swingData.loading}
+              swingError={swingData.error}
+              pnlSummary={pnlData.summary}
+              pnlLoading={pnlData.loading}
+              pnlError={pnlData.error}
+              onPnlRefresh={pnlData.refetch}
               book={executorData.book}
               orders={executorData.orders}
-              loading={executorData.loading}
-              error={executorData.error}
-            />
-          )}
-          {view === "pnl" && (
-            <PnlView
-              summary={pnlData.summary}
-              loading={pnlData.loading}
-              error={pnlData.error}
-              onRefresh={pnlData.refetch}
+              executorLoading={executorData.loading}
+              executorError={executorData.error}
             />
           )}
         </div>

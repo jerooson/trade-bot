@@ -1,7 +1,7 @@
 import clsx from "clsx";
-import { Activity, Bot, ListTodo, Radio, TrendingUp, type LucideIcon } from "lucide-react";
+import { Activity, ListTodo, Radio, type LucideIcon } from "lucide-react";
 
-export type ViewId = "signals" | "watchlist" | "swings" | "executor" | "pnl";
+export type ViewId = "signals" | "watchlist" | "swing";
 
 interface NavItem {
   id: ViewId;
@@ -17,11 +17,7 @@ interface Props {
   onChange: (id: ViewId) => void;
   signalCount: number;
   planCount: number;
-  swingCount: number;
   openPositionsCount: number;
-  pinnedCount: number;
-  executorOpenCount: number;
-  executorDecisionsCount: number;
   pnlTradeCount: number;
 }
 
@@ -30,19 +26,13 @@ export function Sidebar({
   onChange,
   signalCount,
   planCount,
-  swingCount,
   openPositionsCount,
-  pinnedCount,
-  executorOpenCount,
-  executorDecisionsCount,
   pnlTradeCount,
 }: Props) {
   const items: NavItem[] = [
-    { id: "signals", label: "Signals", sublabel: "Discord signal feed", badge: signalCount, icon: Radio },
-    { id: "watchlist", label: "Watchlist", sublabel: "Trade plans", badge: planCount, icon: ListTodo },
-    { id: "swings", label: "Positions", sublabel: "Entries and exits", badge: openPositionsCount, highlight: openPositionsCount > 0, icon: Activity },
-    { id: "executor", label: "Executor", sublabel: "Paper trader", badge: executorOpenCount, highlight: executorOpenCount > 0, icon: Bot },
-    { id: "pnl", label: "P&L", sublabel: "Fills & realized P&L", badge: pnlTradeCount, highlight: pnlTradeCount > 0, icon: TrendingUp },
+    { id: "signals",   label: "Signals",      sublabel: "Day trade signals",          badge: signalCount,        icon: Radio },
+    { id: "watchlist", label: "Watchlist",     sublabel: "Day trade plans",            badge: planCount,          icon: ListTodo },
+    { id: "swing",     label: "Swing",         sublabel: "Positions · P&L · Book",     badge: openPositionsCount, highlight: openPositionsCount > 0 || pnlTradeCount > 0, icon: Activity },
   ];
 
   return (
@@ -95,10 +85,8 @@ export function Sidebar({
         <div className="mt-3 flex flex-col gap-2.5 rounded-xl border border-ink-500/30 bg-ink-950/40 p-3 text-[11px] text-bone-400">
           <Row label="signals" value={signalCount.toLocaleString()} />
           <Row label="plans" value={planCount.toLocaleString()} />
-          <Row label="actions" value={swingCount.toLocaleString()} />
           <Row label="open positions" value={openPositionsCount.toLocaleString()} highlight={openPositionsCount > 0} />
-          <Row label="pinned" value={pinnedCount.toLocaleString()} highlight={pinnedCount > 0} />
-          <Row label="decisions" value={executorDecisionsCount.toLocaleString()} highlight={executorDecisionsCount > 0} />
+          <Row label="trades filed" value={pnlTradeCount.toLocaleString()} highlight={pnlTradeCount > 0} />
         </div>
       </aside>
 
