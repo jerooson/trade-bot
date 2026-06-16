@@ -4,12 +4,14 @@ import { usePlanData } from "./hooks/usePlanData";
 import { useSwingData } from "./hooks/useSwingData";
 import { useExecutorData } from "./hooks/useExecutorData";
 import { usePinnedPlans } from "./hooks/usePinnedPlans";
+import { usePnlData } from "./hooks/usePnlData";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar, type ViewId } from "./components/Sidebar";
 import { SignalsView } from "./components/SignalsView";
 import { WatchlistView } from "./components/WatchlistView";
 import { SwingView } from "./components/SwingView";
 import { ExecutorView } from "./components/ExecutorView";
+import { PnlView } from "./components/PnlView";
 import { Footer } from "./components/Footer";
 
 export default function App() {
@@ -20,6 +22,7 @@ export default function App() {
   const swingData = useSwingData();
   const executorData = useExecutorData();
   const pin = usePinnedPlans();
+  const pnlData = usePnlData();
 
   // The status bar reflects whichever view is active.
   const status = useMemo(() => {
@@ -53,7 +56,15 @@ export default function App() {
       total: executorData.orders.length,
       totalLabel: "decisions on file",
     };
-  }, [view, dash, planData, swingData, executorData]);
+    if (view === "pnl") {
+      return {
+        conn: "connected" as const,
+        lastEventAt: null,
+        total: pnlData.summary?.count ?? 0,
+        totalLabel: "trades recorded",
+      };
+    }
+  }, [view, dash, planData, swingData, executorData, pnlData]);
 
   return (
     <div className="relative min-h-screen">
@@ -77,6 +88,7 @@ export default function App() {
             executorData.book?.summary?.open_tickers ?? 0
           }
           executorDecisionsCount={executorData.orders.length}
+          pnlTradeCount={pnlData.summary?.count ?? 0}
         />
 
         <div className="min-w-0 flex-1 pb-20 md:pb-0">
@@ -105,6 +117,14 @@ export default function App() {
               orders={executorData.orders}
               loading={executorData.loading}
               error={executorData.error}
+            />
+          )}
+          {view === "pnl" && (
+            <PnlView
+              summary={pnlData.summary}
+              loading={pnlData.loading}
+              error={pnlData.error}
+              onRefresh={pnlData.refetch}
             />
           )}
         </div>

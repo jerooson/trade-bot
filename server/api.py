@@ -52,6 +52,9 @@ EXECUTOR_BOOK_PATH = LOG_DIR / "virtual_book.json"
 EXECUTOR_ORDERS_PATH = LOG_DIR / "proposed_orders.jsonl"
 SHADOW_REVIEWS_PATH = LOG_DIR / "robinhood_shadow_reviews.jsonl"
 
+# P&L ledger written by pnl_tracker after each live Robinhood order fill.
+PNL_PATH = LOG_DIR / "trade_pnl.jsonl"
+
 
 app = FastAPI(title="trade-bot dashboard", version="0.1.0")
 
@@ -597,6 +600,35 @@ def executor_shadow_reviews(
 async def stream_executor_shadow_reviews() -> StreamingResponse:
     """SSE feed for new Robinhood shadow reviews."""
     return _sse_response(SHADOW_REVIEWS_PATH, event_name="shadow-review")
+
+
+@app.get("/api/pnl")
+def list_pnl() -> dict[str, Any]:
+    """All P&L records from trade_pnl.jsonl, newest first."""
+    records: list[dict[str, Any]] = []
+    if PNL_PATH.exists():
+        with PNL_PATH.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    records.reverse()
+
+    total_realized = sum(r.get("realized_pnl") or 0.0 for r in records)
+    wins = [r for r in records if (r.get("realized_pnl") or 0) > 0]
+    losses = [r for r in records if (r.get("realized_pnl") or 0) < 0]
+
+    return {
+        "count": len(records),
+        "total_realized_pnl": round(total_realized, 4),
+        "wins": len(wins),
+        "losses": len(losses),
+        "records": records,
+    }
 
 
 def main() -> None:

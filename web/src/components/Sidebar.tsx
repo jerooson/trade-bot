@@ -1,7 +1,7 @@
 import clsx from "clsx";
-import { Activity, Bot, ListTodo, Radio, type LucideIcon } from "lucide-react";
+import { Activity, Bot, ListTodo, Radio, TrendingUp, type LucideIcon } from "lucide-react";
 
-export type ViewId = "signals" | "watchlist" | "swings" | "executor";
+export type ViewId = "signals" | "watchlist" | "swings" | "executor" | "pnl";
 
 interface NavItem {
   id: ViewId;
@@ -22,6 +22,7 @@ interface Props {
   pinnedCount: number;
   executorOpenCount: number;
   executorDecisionsCount: number;
+  pnlTradeCount: number;
 }
 
 export function Sidebar({
@@ -34,12 +35,14 @@ export function Sidebar({
   pinnedCount,
   executorOpenCount,
   executorDecisionsCount,
+  pnlTradeCount,
 }: Props) {
   const items: NavItem[] = [
     { id: "signals", label: "Signals", sublabel: "Discord signal feed", badge: signalCount, icon: Radio },
     { id: "watchlist", label: "Watchlist", sublabel: "Trade plans", badge: planCount, icon: ListTodo },
     { id: "swings", label: "Positions", sublabel: "Entries and exits", badge: openPositionsCount, highlight: openPositionsCount > 0, icon: Activity },
     { id: "executor", label: "Executor", sublabel: "Paper trader", badge: executorOpenCount, highlight: executorOpenCount > 0, icon: Bot },
+    { id: "pnl", label: "P&L", sublabel: "Fills & realized P&L", badge: pnlTradeCount, highlight: pnlTradeCount > 0, icon: TrendingUp },
   ];
 
   return (

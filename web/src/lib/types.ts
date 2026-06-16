@@ -167,6 +167,35 @@ export interface ProposedOrder {
   };
 }
 
+// -- P&L types ----------------------------------------------------------------
+
+export type TradeKind = "ENTRY" | "ADD" | "REDUCE" | "CLOSE";
+
+export interface PnlRecord {
+  timestamp: string;
+  ticker: string;
+  kind: TradeKind;
+  action: "BUY" | "SELL";
+  order_id: string;
+  signal_price: number | null;
+  fill_price: number | null;
+  fill_qty: number | null;
+  fill_usd: number | null;
+  avg_cost_before: number | null;
+  avg_cost_after: number | null;
+  position_qty_after: number | null;
+  realized_pnl: number | null;
+  realized_pnl_pct: number | null;
+}
+
+export interface PnlSummary {
+  count: number;
+  total_realized_pnl: number;
+  wins: number;
+  losses: number;
+  records: PnlRecord[];
+}
+
 export interface Stats {
   total: number;
   by_kind: Record<string, number>;

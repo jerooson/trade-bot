@@ -1,5 +1,6 @@
 import type {
   OpenPosition,
+  PnlSummary,
   ProposedOrder,
   Signal,
   Stats,
@@ -169,6 +170,12 @@ export interface OrderStreamHandlers {
   onHeartbeat?: (data: { ts: string }) => void;
   onError?: (err: Event) => void;
   onOpen?: () => void;
+}
+
+export async function fetchPnl(): Promise<PnlSummary> {
+  const r = await fetch("/api/pnl");
+  if (!r.ok) throw new Error(`pnl: ${r.status}`);
+  return r.json();
 }
 
 /** Open the executor orders SSE stream. Returns a cleanup function. */
