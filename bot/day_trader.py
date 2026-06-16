@@ -324,8 +324,8 @@ def _place_stop_order(session: _MCPSession, account_number: str, ticker: str, qt
             symbol=ticker,
             side="sell",
             type="stop",
-            stop_price=round(stop_price, 2),
-            quantity=round(qty, 6),
+            stop_price=str(round(stop_price, 2)),
+            quantity=str(round(qty, 6)),
             time_in_force="gfd",
             ref_id=ref_id,
         )
@@ -345,8 +345,8 @@ def _place_limit_sell(session: _MCPSession, account_number: str, ticker: str, qt
             symbol=ticker,
             side="sell",
             type="limit",
-            limit_price=round(limit_price, 2),
-            quantity=round(qty, 6),
+            limit_price=str(round(limit_price, 2)),
+            quantity=str(round(qty, 6)),
             time_in_force="gfd",
             ref_id=ref_id,
         )
@@ -373,7 +373,7 @@ def _market_sell_all(session: _MCPSession, account_number: str, ticker: str, qty
             symbol=ticker,
             side="sell",
             type="market",
-            quantity=round(qty, 6),
+            quantity=str(round(qty, 6)),
             time_in_force="gfd",
             ref_id=ref_id,
         )
