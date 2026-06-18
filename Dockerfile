@@ -3,9 +3,10 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Install Node.js (required for codex CLI which is mounted from the host)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    nodejs \
+# Install Node.js 18 (must match host version so codex native addons work)
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
