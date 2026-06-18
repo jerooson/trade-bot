@@ -768,12 +768,21 @@ async def chat_message(req: _ChatRequest) -> StreamingResponse:
         # Save assistant turn
         session.append({"role": "assistant", "content": full_text})
 
-        # Surface any structured tags
-        proposed_match = re.search(r"PROPOSED_ORDER=(\{[^\n]+\})", full_text)
+        # Surface any structured tags — only look at the assistant's reply (after
+        # the last "User:" echo in the codex output) to avoid matching the
+        # PROPOSED_ORDER example line inside the prompt template.
+        response_text = full_text
+        last_user = full_text.rfind("User: ")
+        if last_user != -1:
+            response_text = full_text[last_user:]
+
+        proposed_match = re.search(r"PROPOSED_ORDER=(\{[^\n]+\})", response_text)
         if proposed_match:
             try:
                 order = json.loads(proposed_match.group(1))
-                yield _sse_event({"type": "proposed_order", "order": order}, event="chat")
+                # Skip the placeholder example from the RULES section
+                if order.get("ticker") not in ("X", ""):
+                    yield _sse_event({"type": "proposed_order", "order": order}, event="chat")
             except Exception:
                 pass
 

@@ -381,8 +381,14 @@ function AgentText({ text, loading }: { text: string; loading: boolean }) {
     );
   }
 
-  // Split into lines and annotate tool-call lines
-  const lines = text.split("\n");
+  // Filter out noisy codex header/footer lines before displaying
+  const NOISE_RE =
+    /^(WARNING:|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:|tokens used|--------|\d{4}-\d{2}-\d{2}T.*ERROR|Reading additional input from stdin)/;
+
+  const lines = text
+    .split("\n")
+    .filter((l) => !NOISE_RE.test(l.trim()));
+
   return (
     <span className="whitespace-pre-wrap">
       {lines.map((line, i) => {
