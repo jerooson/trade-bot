@@ -405,6 +405,12 @@ function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
 
     if (NOISE_LINE_RE.test(trimmed)) continue;
 
+    // Skip everything after the "tokens used" marker (duplicate final answer)
+    if (phase === "after_tokens") continue;
+
+    // Skip standalone numeric token-count lines
+    if (/^\d{4,}$/.test(trimmed)) continue;
+
     // "user" alone marks start of the prompt echo — skip until next "codex"
     if (trimmed === "user" && phase === "before_prompt") {
       phase = "in_prompt";
@@ -417,7 +423,6 @@ function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
         phase = "in_response";
       }
       if (phase === "in_response" && cur !== null) {
-        // push previous block as a thinking step
         thinking.push(cur);
       }
       if (phase === "in_response") {
@@ -428,9 +433,8 @@ function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
 
     if (phase !== "in_response") continue;
 
-    // "tokens used" + next line = token count → marks end of real responses
+    // "tokens used" marks the end of real responses; current block = answer
     if (trimmed === "tokens used") {
-      // The current block IS the final answer
       if (cur) {
         answer = cur.narration.trim();
         cur = null;
@@ -438,10 +442,6 @@ function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
       phase = "after_tokens";
       continue;
     }
-
-    // Skip pure numeric lines (token counts appearing after "tokens used")
-    if (phase === "after_tokens") continue;
-    if (/^\d{4,}$/.test(trimmed)) continue;
 
     // MCP tool call lines
     if (trimmed.startsWith("mcp: ")) {
