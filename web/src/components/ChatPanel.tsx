@@ -431,6 +431,13 @@ function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
       continue;
     }
 
+    // MCP tool call lines can appear before the first "codex" marker when the
+    // model skips narration and goes straight to tool calls.
+    if (trimmed.startsWith("mcp: ") && phase !== "in_response") {
+      phase = "in_response";
+      cur = { narration: "", tools: [] };
+    }
+
     if (phase !== "in_response") continue;
 
     // "tokens used" marks the end of real responses; current block = answer
