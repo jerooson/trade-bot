@@ -294,14 +294,10 @@ export function ChatPanel() {
                       : "bg-ink-800/80 text-bone-200 rounded-tl-sm"
                   )}
                 >
-                  {msg.text || (msg.loading && (
-                    <span className="flex items-center gap-1.5 text-bone-500">
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                      thinking…
-                    </span>
-                  ))}
-                  {msg.loading && msg.text && (
-                    <span className="ml-1 inline-block h-2 w-0.5 animate-pulse bg-bone-400 align-middle" />
+                  {msg.role === "assistant" ? (
+                    <AgentText text={msg.text} loading={!!msg.loading} />
+                  ) : (
+                    msg.text
                   )}
                 </div>
 
@@ -368,6 +364,56 @@ export function ChatPanel() {
         />
       )}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Agent text renderer — highlights tool calls and shows cursor while streaming
+// ---------------------------------------------------------------------------
+
+function AgentText({ text, loading }: { text: string; loading: boolean }) {
+  if (!text && loading) {
+    return (
+      <span className="flex items-center gap-1.5 text-bone-500">
+        <Loader2 className="h-3 w-3 animate-spin" />
+        thinking…
+      </span>
+    );
+  }
+
+  // Split into lines and annotate tool-call lines
+  const lines = text.split("\n");
+  return (
+    <span className="whitespace-pre-wrap">
+      {lines.map((line, i) => {
+        const isToolCall =
+          /calling|tool:|get_equity|place_equity|get_account|get_portfolio|▶|→|✓|✗|\[tool\]|\bcall\b/i.test(line) &&
+          line.length < 120;
+        const isBroker = /BROKER_ORDER_ID|PROPOSED_ORDER/.test(line);
+        const isError = /error|failed|timeout/i.test(line) && line.length < 80;
+        return (
+          <span key={i}>
+            {isToolCall ? (
+              <span className="block rounded px-1.5 py-0.5 my-0.5 text-[11px] font-mono bg-crt-info/5 border-l-2 border-crt-info/40 text-crt-info/80">
+                {line}
+              </span>
+            ) : isBroker ? (
+              <span className="block rounded px-1.5 py-0.5 my-0.5 text-[11px] font-mono bg-crt-long/5 border-l-2 border-crt-long/40 text-crt-long">
+                {line}
+              </span>
+            ) : isError ? (
+              <span className="block text-crt-short/80">{line}</span>
+            ) : (
+              line
+            )}
+            {i < lines.length - 1 && !isToolCall && !isBroker ? "\n" : null}
+          </span>
+        );
+      })}
+      {loading && (
+        <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-bone-400 align-middle" />
+      )}
+    </span>
   );
 }
 

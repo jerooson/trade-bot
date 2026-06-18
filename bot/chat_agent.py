@@ -202,8 +202,9 @@ async def stream_codex_response(
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.DEVNULL,   # prevent codex from waiting on stdin
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,  # merge stderr so we see tool errors too
+        stderr=asyncio.subprocess.STDOUT,   # merge stderr so we see tool errors too
         env=env,
     )
 
