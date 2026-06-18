@@ -190,13 +190,22 @@ RULES:
 # Codex subprocess streamer
 # ---------------------------------------------------------------------------
 
+_CODEX_JS = "/usr/local/lib/node_modules/@openai/codex/bin/codex.js"
+
+
 async def stream_codex_response(
     prompt: str,
     codex_command: str = "codex",
     timeout: float = 120.0,
 ) -> AsyncIterator[str]:
     """Run `codex exec --ephemeral --profile trade-bot <prompt>` and yield stdout chunks."""
-    cmd = [codex_command, "exec", "--ephemeral", "--profile", "trade-bot", prompt]
+    # Prefer calling the JS file directly via node so Node.js resolves it as an
+    # ES module (finds package.json with "type":"module") — this avoids the
+    # symlink-mount issue inside the Docker API container.
+    if os.path.exists(_CODEX_JS):
+        cmd = ["node", _CODEX_JS, "exec", "--ephemeral", "--profile", "trade-bot", prompt]
+    else:
+        cmd = [codex_command, "exec", "--ephemeral", "--profile", "trade-bot", prompt]
 
     env = {**os.environ, "HOME": os.path.expanduser("~")}
 
