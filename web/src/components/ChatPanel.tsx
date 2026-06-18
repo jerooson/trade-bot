@@ -212,14 +212,15 @@ export function ChatPanel() {
       <button
         onClick={() => setOpen((o) => !o)}
         className={clsx(
-          "fixed bottom-6 right-6 z-50 flex h-12 w-12 items-center justify-center rounded-full shadow-lg transition-all duration-200 md:bottom-8 md:right-8",
+          "fixed bottom-6 right-6 z-50 flex items-center gap-2 rounded-full px-4 py-3 shadow-lg transition-all duration-200 md:bottom-8 md:right-8",
           open
             ? "bg-crt-info text-ink-950"
-            : "bg-ink-800 text-bone-200 hover:bg-ink-700 hover:text-bone-50 border border-ink-500/50"
+            : "border border-crt-info/40 bg-ink-900 text-crt-info hover:bg-crt-info/10 shadow-[0_0_16px_rgba(0,200,255,0.15)]"
         )}
         aria-label="Open agent chat"
       >
-        {open ? <X className="h-5 w-5" /> : <MessageSquare className="h-5 w-5" />}
+        {open ? <X className="h-4 w-4" /> : <MessageSquare className="h-4 w-4" />}
+        {!open && <span className="text-[11px] font-semibold uppercase tracking-[0.18em]">Agent</span>}
       </button>
 
       {/* Drawer overlay */}
