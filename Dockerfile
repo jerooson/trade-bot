@@ -4,7 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # Install Node.js 18 (must match host version so codex native addons work)
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+# expect provides `unbuffer` which forces line-buffered stdout from Node.js subprocesses
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates expect \
     && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*

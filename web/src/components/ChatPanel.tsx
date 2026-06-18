@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
-import { Bot, CheckCircle2, Loader2, MessageSquare, Send, Trash2, X, XCircle } from "lucide-react";
+import { Bot, CheckCircle2, ChevronDown, ChevronRight, Loader2, MessageSquare, Send, Trash2, X, XCircle } from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -368,58 +368,232 @@ export function ChatPanel() {
 }
 
 // ---------------------------------------------------------------------------
-// Agent text renderer — highlights tool calls and shows cursor while streaming
+// Codex output parser
+// ---------------------------------------------------------------------------
+
+interface ToolCall {
+  name: string;   // e.g. "robinhood-trading/get_accounts"
+  done: boolean;
+}
+
+interface ThinkingBlock {
+  narration: string;   // agent's reasoning text in this block
+  tools: ToolCall[];
+}
+
+interface ParsedCodex {
+  thinking: ThinkingBlock[];
+  answer: string;
+  stillThinking: boolean; // true while streaming before we see the final answer
+}
+
+const NOISE_LINE_RE =
+  /^(WARNING:|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:|tokens used|--------|\d{4}-\d{2}-\d{2}T.*|Reading additional input|warning: Codex|OpenAI Codex v)/;
+
+function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
+  const lines = raw.split("\n");
+  const thinking: ThinkingBlock[] = [];
+  let answer = "";
+
+  type Phase = "before_prompt" | "in_prompt" | "in_response" | "after_tokens";
+  let phase: Phase = "before_prompt";
+  let cur: ThinkingBlock | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (NOISE_LINE_RE.test(trimmed)) continue;
+
+    // "user" alone marks start of the prompt echo — skip until next "codex"
+    if (trimmed === "user" && phase === "before_prompt") {
+      phase = "in_prompt";
+      continue;
+    }
+
+    // "codex" alone marks start of an agent response section
+    if (trimmed === "codex") {
+      if (phase === "in_prompt" || phase === "before_prompt") {
+        phase = "in_response";
+      }
+      if (phase === "in_response" && cur !== null) {
+        // push previous block as a thinking step
+        thinking.push(cur);
+      }
+      if (phase === "in_response") {
+        cur = { narration: "", tools: [] };
+      }
+      continue;
+    }
+
+    if (phase !== "in_response") continue;
+
+    // "tokens used" + next line = token count → marks end of real responses
+    if (trimmed === "tokens used") {
+      // The current block IS the final answer
+      if (cur) {
+        answer = cur.narration.trim();
+        cur = null;
+      }
+      phase = "after_tokens";
+      continue;
+    }
+
+    // Skip pure numeric lines (token counts appearing after "tokens used")
+    if (phase === "after_tokens") continue;
+    if (/^\d{4,}$/.test(trimmed)) continue;
+
+    // MCP tool call lines
+    if (trimmed.startsWith("mcp: ")) {
+      const info = trimmed.slice(5);
+      const done = info.includes("(completed)") || info.includes("(failed)");
+      const name = info.replace(/ started| \(completed\)| \(failed\)/, "").trim();
+      if (cur) {
+        const existing = cur.tools.find((t) => t.name === name);
+        if (existing) {
+          existing.done = done || existing.done;
+        } else {
+          cur.tools.push({ name, done });
+        }
+      }
+      continue;
+    }
+
+    // Regular narration line
+    if (cur) {
+      cur.narration += (cur.narration ? "\n" : "") + line;
+    }
+  }
+
+  // If we never hit "tokens used" (still streaming), cur is the in-progress block
+  if (!answer && cur) {
+    // While streaming the final answer block, treat it as the live answer
+    answer = cur.narration.trim();
+    // Keep it as a thinking step too so the section count is right
+    if (cur.tools.length || cur.narration.trim()) {
+      // Don't add to thinking — it becomes the answer once done
+    }
+  }
+
+  return { thinking, answer, stillThinking: loading && !answer };
+}
+
+// ---------------------------------------------------------------------------
+// Agent text renderer
 // ---------------------------------------------------------------------------
 
 function AgentText({ text, loading }: { text: string; loading: boolean }) {
+  // Auto-collapse thinking when the answer arrives
+  const [open, setOpen] = useState(true);
+  const prevLoading = useRef(loading);
+  useEffect(() => {
+    if (prevLoading.current && !loading) {
+      // response just finished → collapse thinking
+      setOpen(false);
+    }
+    prevLoading.current = loading;
+  }, [loading]);
+
   if (!text && loading) {
     return (
-      <span className="flex items-center gap-1.5 text-bone-500">
-        <Loader2 className="h-3 w-3 animate-spin" />
+      <span className="flex items-center gap-1.5 text-bone-500 text-sm">
+        <Loader2 className="h-3 w-3 animate-spin shrink-0" />
         thinking…
       </span>
     );
   }
 
-  // Filter out noisy codex header/footer lines before displaying
-  const NOISE_RE =
-    /^(WARNING:|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:|tokens used|--------|\d{4}-\d{2}-\d{2}T.*ERROR|Reading additional input from stdin)/;
-
-  const lines = text
-    .split("\n")
-    .filter((l) => !NOISE_RE.test(l.trim()));
+  const { thinking, answer } = parseCodexOutput(text, loading);
+  const toolCount = thinking.reduce((n, b) => n + b.tools.length, 0);
+  const hasThinking = thinking.length > 0 || (loading && !answer);
 
   return (
-    <span className="whitespace-pre-wrap">
-      {lines.map((line, i) => {
-        const isToolCall =
-          /calling|tool:|get_equity|place_equity|get_account|get_portfolio|▶|→|✓|✗|\[tool\]|\bcall\b/i.test(line) &&
-          line.length < 120;
-        const isBroker = /BROKER_ORDER_ID|PROPOSED_ORDER/.test(line);
-        const isError = /error|failed|timeout/i.test(line) && line.length < 80;
-        return (
-          <span key={i}>
-            {isToolCall ? (
-              <span className="block rounded px-1.5 py-0.5 my-0.5 text-[11px] font-mono bg-crt-info/5 border-l-2 border-crt-info/40 text-crt-info/80">
-                {line}
-              </span>
-            ) : isBroker ? (
-              <span className="block rounded px-1.5 py-0.5 my-0.5 text-[11px] font-mono bg-crt-long/5 border-l-2 border-crt-long/40 text-crt-long">
-                {line}
-              </span>
-            ) : isError ? (
-              <span className="block text-crt-short/80">{line}</span>
+    <div className="flex flex-col gap-2">
+      {/* ── Thinking section ───────────────────────────────────── */}
+      {hasThinking && (
+        <div className="rounded-lg border border-ink-600/40 bg-ink-900/50 overflow-hidden">
+          <button
+            onClick={() => setOpen((o) => !o)}
+            className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-[11px] text-bone-500 hover:text-bone-300 transition-colors"
+          >
+            {open ? (
+              <ChevronDown className="h-3 w-3 shrink-0" />
             ) : (
-              line
+              <ChevronRight className="h-3 w-3 shrink-0" />
             )}
-            {i < lines.length - 1 && !isToolCall && !isBroker ? "\n" : null}
-          </span>
-        );
-      })}
-      {loading && (
-        <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-bone-400 align-middle" />
+            {loading && !answer ? (
+              <span className="flex items-center gap-1">
+                <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                thinking…
+              </span>
+            ) : (
+              <span>
+                {thinking.length} step{thinking.length !== 1 ? "s" : ""}
+                {toolCount > 0 && (
+                  <span className="ml-1 text-bone-600">· {toolCount} tool call{toolCount !== 1 ? "s" : ""}</span>
+                )}
+              </span>
+            )}
+          </button>
+
+          {open && (
+            <div className="px-2.5 pb-2 flex flex-col gap-1.5 border-t border-ink-600/30">
+              {thinking.map((block, bi) => (
+                <div key={bi} className="pt-1.5">
+                  {/* Tool calls as compact badges */}
+                  {block.tools.map((tool, ti) => (
+                    <div
+                      key={ti}
+                      className="flex items-center gap-1.5 text-[10px] font-mono py-0.5"
+                    >
+                      {tool.done ? (
+                        <span className="text-crt-long/70">✓</span>
+                      ) : (
+                        <Loader2 className="h-2.5 w-2.5 animate-spin text-bone-500" />
+                      )}
+                      <span className={tool.done ? "text-bone-500" : "text-bone-400"}>
+                        {tool.name.replace("robinhood-trading/", "")}
+                      </span>
+                    </div>
+                  ))}
+                  {/* Narration text — small, muted */}
+                  {block.narration.trim() && (
+                    <p className="text-[11px] text-bone-600 leading-relaxed mt-0.5 whitespace-pre-wrap">
+                      {block.narration.trim()}
+                    </p>
+                  )}
+                </div>
+              ))}
+              {/* Live block being streamed */}
+              {loading && !answer && (
+                <div className="pt-1 text-[11px] text-bone-600 italic">
+                  <Loader2 className="inline h-2.5 w-2.5 animate-spin mr-1" />
+                  working…
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       )}
-    </span>
+
+      {/* ── Final answer ────────────────────────────────────────── */}
+      {answer ? (
+        <div className="text-sm text-bone-100 leading-relaxed whitespace-pre-wrap">
+          {answer}
+          {loading && (
+            <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-bone-400 align-middle" />
+          )}
+        </div>
+      ) : !hasThinking && text ? (
+        /* Fallback: couldn't parse, show raw filtered text */
+        <div className="text-sm text-bone-100 leading-relaxed whitespace-pre-wrap">
+          {text
+            .split("\n")
+            .filter((l) => !NOISE_LINE_RE.test(l.trim()))
+            .join("\n")}
+        </div>
+      ) : null}
+    </div>
   );
 }
 

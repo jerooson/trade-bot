@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -199,26 +200,25 @@ async def stream_codex_response(
     timeout: float = 120.0,
 ) -> AsyncIterator[str]:
     """Run `codex exec --ephemeral --profile trade-bot <prompt>` and yield stdout chunks."""
-    # Prefer calling the JS file directly via node so Node.js resolves it as an
-    # ES module (finds package.json with "type":"module") — this avoids the
-    # symlink-mount issue inside the Docker API container.
-    # --skip-git-repo-check: API container has no git repo at /app
-    if os.path.exists(_CODEX_JS):
-        cmd = [
-            "node", _CODEX_JS,
-            "exec", "--ephemeral", "--profile", "trade-bot",
-            "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
-            prompt,
-        ]
+    # Build the core codex command. We call the JS file directly via node so
+    # Node.js resolves package.json with "type":"module" (avoids symlink issues
+    # in Docker). We also need --skip-git-repo-check (no git repo at /app) and
+    # --dangerously-bypass-approvals-and-sandbox (auto-approve MCP tool calls).
+    codex_args = [
+        "exec", "--ephemeral", "--profile", "trade-bot",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        prompt,
+    ]
+    node_cmd = ["node", _CODEX_JS] if os.path.exists(_CODEX_JS) else [codex_command]
+
+    # `unbuffer` (from the `expect` package) forces line-buffered stdout so
+    # chunks stream in real-time even though stdout is a pipe, not a TTY.
+    unbuffer = shutil.which("unbuffer")
+    if unbuffer:
+        cmd = [unbuffer, *node_cmd, *codex_args]
     else:
-        cmd = [
-            codex_command,
-            "exec", "--ephemeral", "--profile", "trade-bot",
-            "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
-            prompt,
-        ]
+        cmd = [*node_cmd, *codex_args]
 
     env = {**os.environ, "HOME": os.path.expanduser("~")}
 
