@@ -30,8 +30,12 @@ services:
         "--no-access-log",
       ]
     restart: unless-stopped
+    environment:
+      HOME: /home/deploy
     volumes:
       - ./logs:/app/logs:ro
+      - /usr/local/bin/codex:/usr/local/bin/codex:ro
+      - /home/deploy/.codex:/home/deploy/.codex:ro
     healthcheck:
       test:
         [
