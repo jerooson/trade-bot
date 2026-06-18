@@ -35,6 +35,7 @@ services:
     volumes:
       - ./logs:/app/logs:ro
       - /usr/local/bin/codex:/usr/local/bin/codex:ro
+      - /usr/bin/node:/usr/bin/node:ro
       - /home/deploy/.codex:/home/deploy/.codex:ro
     healthcheck:
       test:
