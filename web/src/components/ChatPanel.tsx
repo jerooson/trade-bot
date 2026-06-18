@@ -29,10 +29,21 @@ interface Message {
 
 const SESSION_KEY = "trade-bot-chat-session";
 
+function uuid(): string {
+  // crypto.randomUUID requires a secure context (HTTPS); use a fallback for HTTP
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
 function getSessionId(): string {
   let sid = sessionStorage.getItem(SESSION_KEY);
   if (!sid) {
-    sid = crypto.randomUUID();
+    sid = uuid();
     sessionStorage.setItem(SESSION_KEY, sid);
   }
   return sid;
@@ -59,8 +70,8 @@ export function ChatPanel() {
         if (d.messages.length > 0) {
           setMessages(
             d.messages.map((m) => ({
-              id: crypto.randomUUID(),
-              role: m.role as "user" | "assistant",
+        id: uuid(),
+        role: m.role as "user" | "assistant",
               text: m.content,
             }))
           );
@@ -88,8 +99,8 @@ export function ChatPanel() {
     async (text: string, confirmed = false) => {
       if (!text.trim() || loading) return;
 
-      const userMsg: Message = { id: crypto.randomUUID(), role: "user", text };
-      const assistantMsgId = crypto.randomUUID();
+      const userMsg: Message = { id: uuid(), role: "user", text };
+      const assistantMsgId = uuid();
       const assistantMsg: Message = {
         id: assistantMsgId,
         role: "assistant",
