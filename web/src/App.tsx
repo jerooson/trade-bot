@@ -11,6 +11,7 @@ import { Sidebar, type ViewId } from "./components/Sidebar";
 import { DayTradeView } from "./components/DayTradeView";
 import { WatchlistView } from "./components/WatchlistView";
 import { SwingTradeView } from "./components/SwingTradeView";
+import { ChatPanel } from "./components/ChatPanel";
 import { Footer } from "./components/Footer";
 
 export default function App() {
@@ -111,6 +112,7 @@ export default function App() {
       </div>
 
       <Footer />
+      <ChatPanel />
     </div>
   );
 }

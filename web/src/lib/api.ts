@@ -210,3 +210,20 @@ export function openOrderStream(handlers: OrderStreamHandlers): () => void {
   es.addEventListener("error", (e) => handlers.onError?.(e));
   return () => es.close();
 }
+
+// ---------------------------------------------------------------------------
+// Chat agent
+// ---------------------------------------------------------------------------
+
+export async function fetchChatHistory(
+  sessionId: string
+): Promise<{ role: string; content: string }[]> {
+  const r = await fetch(`/api/chat/history/${sessionId}`);
+  if (!r.ok) return [];
+  const d = await r.json();
+  return d.messages ?? [];
+}
+
+export async function clearChatHistory(sessionId: string): Promise<void> {
+  await fetch(`/api/chat/history/${sessionId}`, { method: "DELETE" });
+}

@@ -29,6 +29,7 @@ from typing import Any, AsyncIterator
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 log = logging.getLogger("server.api")
 
@@ -720,6 +721,88 @@ def get_daytrader_state() -> dict[str, Any]:
         },
         "service_running": service_running,
     }
+
+
+# ── Chat agent ────────────────────────────────────────────────────────────────
+
+# In-memory session store: session_id -> list of {role, content} dicts.
+# Lives in the API process; sessions are lost on API restart (acceptable for now).
+_CHAT_SESSIONS: dict[str, list[dict[str, str]]] = {}
+
+
+class _ChatRequest(BaseModel):
+    session_id: str
+    message: str
+    confirmed: bool = False
+
+
+@app.post("/api/chat/message")
+async def chat_message(req: _ChatRequest) -> StreamingResponse:
+    """Stream a Codex CLI response as SSE.
+
+    Each SSE event has ``event: chat`` and a JSON ``data`` payload with shape:
+      {"type": "chunk",         "text": "..."}  -- streamed text fragment
+      {"type": "proposed_order","order": {...}}  -- parsed PROPOSED_ORDER tag
+      {"type": "order_placed",  "order_id": "..."} -- parsed BROKER_ORDER_ID tag
+      {"type": "done"}                           -- stream finished
+    """
+    from bot.chat_agent import build_prompt, stream_codex_response  # lazy import
+
+    session = _CHAT_SESSIONS.setdefault(req.session_id, [])
+    # Append user turn to history before building prompt
+    session.append({"role": "user", "content": req.message})
+
+    prompt = build_prompt(req.message, session[:-1], confirmed=req.confirmed)
+
+    async def event_gen() -> AsyncIterator[bytes]:
+        full_chunks: list[str] = []
+
+        try:
+            async for chunk in stream_codex_response(prompt):
+                full_chunks.append(chunk)
+                yield _sse_event({"type": "chunk", "text": chunk}, event="chat")
+        except Exception as exc:
+            yield _sse_event({"type": "chunk", "text": f"\n[error: {exc}]"}, event="chat")
+
+        full_text = "".join(full_chunks)
+        # Save assistant turn
+        session.append({"role": "assistant", "content": full_text})
+
+        # Surface any structured tags
+        proposed_match = re.search(r"PROPOSED_ORDER=(\{[^\n]+\})", full_text)
+        if proposed_match:
+            try:
+                order = json.loads(proposed_match.group(1))
+                yield _sse_event({"type": "proposed_order", "order": order}, event="chat")
+            except Exception:
+                pass
+
+        broker_match = re.search(r"BROKER_ORDER_ID=([a-f0-9\-]{36})", full_text)
+        if broker_match:
+            yield _sse_event(
+                {"type": "order_placed", "order_id": broker_match.group(1)}, event="chat"
+            )
+
+        yield _sse_event({"type": "done"}, event="chat")
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/chat/history/{session_id}")
+async def chat_history(session_id: str) -> dict[str, Any]:
+    """Return the full message history for a session."""
+    return {"messages": _CHAT_SESSIONS.get(session_id, [])}
+
+
+@app.delete("/api/chat/history/{session_id}")
+async def chat_clear(session_id: str) -> dict[str, Any]:
+    """Clear a session's history."""
+    _CHAT_SESSIONS.pop(session_id, None)
+    return {"ok": True}
 
 
 def main() -> None:
