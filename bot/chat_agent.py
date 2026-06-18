@@ -202,10 +202,21 @@ async def stream_codex_response(
     # Prefer calling the JS file directly via node so Node.js resolves it as an
     # ES module (finds package.json with "type":"module") — this avoids the
     # symlink-mount issue inside the Docker API container.
+    # --skip-git-repo-check: API container has no git repo at /app
     if os.path.exists(_CODEX_JS):
-        cmd = ["node", _CODEX_JS, "exec", "--ephemeral", "--profile", "trade-bot", prompt]
+        cmd = [
+            "node", _CODEX_JS,
+            "exec", "--ephemeral", "--profile", "trade-bot",
+            "--skip-git-repo-check",
+            prompt,
+        ]
     else:
-        cmd = [codex_command, "exec", "--ephemeral", "--profile", "trade-bot", prompt]
+        cmd = [
+            codex_command,
+            "exec", "--ephemeral", "--profile", "trade-bot",
+            "--skip-git-repo-check",
+            prompt,
+        ]
 
     env = {**os.environ, "HOME": os.path.expanduser("~")}
 
