@@ -208,6 +208,7 @@ async def stream_codex_response(
             "node", _CODEX_JS,
             "exec", "--ephemeral", "--profile", "trade-bot",
             "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
             prompt,
         ]
     else:
@@ -215,6 +216,7 @@ async def stream_codex_response(
             codex_command,
             "exec", "--ephemeral", "--profile", "trade-bot",
             "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
             prompt,
         ]
 
