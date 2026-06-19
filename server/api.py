@@ -730,43 +730,24 @@ def get_daytrader_state() -> dict[str, Any]:
 _CHAT_SESSIONS: dict[str, list[dict[str, str]]] = {}
 
 
+_NOISE_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T|ERROR rmcp|\x1b\[|^tokens used$|^reading additional"
+)
+
+
 def _extract_clean_answer(raw: str) -> str:
     """Return only the final answer text from raw codex exec output.
 
-    Codex echoes the entire prompt, then streams thinking blocks, then emits:
+    With unbuffer codex outputs:
         codex
         <FINAL ANSWER>
         tokens used
         <count>
-        <FINAL ANSWER repeated>
+        [optional session-delete error line]
 
-    We extract the repeated answer after "tokens used / <count>" because that's
-    the cleanest copy — it excludes all narration/tool-call noise.
-    If the marker is absent (still streaming or unexpected format), we fall back
-    to the last "codex\\n" block stripped of noise.
+    We grab the last "codex\\n" section, cut at "tokens used", and strip noise.
     """
-    # Strategy 1: content after "tokens used\n<digits>\n"
-    tu_idx = raw.find("tokens used\n")
-    if tu_idx != -1:
-        after = raw[tu_idx + len("tokens used\n"):]
-        lines = after.split("\n")
-        # Skip the numeric token-count line(s) — format is "8,179" or "8179"
-        start = 0
-        for i, ln in enumerate(lines):
-            cleaned = ln.strip().replace(",", "")
-            if cleaned.isdigit() or cleaned == "":
-                start = i + 1
-            else:
-                break
-        answer = "\n".join(lines[start:])
-        # Strip the trailing session-delete error line
-        for noise in ("ERROR rmcp", "\x1b["):
-            idx = answer.find(noise)
-            if idx != -1:
-                answer = answer[:idx]
-        return answer.strip()
-
-    # Strategy 2: last "codex\n" block (before any "tokens used")
+    # Primary: last "\ncodex\n" block, cut before "tokens used"
     marker = "\ncodex\n"
     idx = raw.rfind(marker)
     if idx != -1:
@@ -774,9 +755,35 @@ def _extract_clean_answer(raw: str) -> str:
         tu = block.find("\ntokens used")
         if tu != -1:
             block = block[:tu]
-        return block.strip()
+        # Strip any trailing noise lines (timestamps, errors)
+        lines = [
+            ln for ln in block.split("\n")
+            if not _NOISE_LINE_RE.search(ln.strip())
+        ]
+        result = "\n".join(lines).strip()
+        if result:
+            return result
 
-    # Fallback: return everything (better than nothing)
+    # Fallback: everything after "tokens used\n<count>\n", minus noise
+    tu_idx = raw.find("tokens used\n")
+    if tu_idx != -1:
+        after = raw[tu_idx + len("tokens used\n"):]
+        lines = after.split("\n")
+        # Skip the digit token-count line(s) then collect clean content
+        past_count = False
+        clean: list[str] = []
+        for ln in lines:
+            cleaned = ln.strip().replace(",", "")
+            if not past_count and (cleaned.isdigit() or cleaned == ""):
+                continue
+            past_count = True
+            if _NOISE_LINE_RE.search(ln.strip()):
+                continue
+            clean.append(ln)
+        result = "\n".join(clean).strip()
+        if result:
+            return result
+
     return raw.strip()
 
 
