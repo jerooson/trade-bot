@@ -132,57 +132,70 @@ export function ChatPanel() {
         let buffer = "";
         let proposedOrder: ProposedOrder | undefined;
         let orderPlacedId: string | undefined;
+        // 90-second abort controller so the spinner never hangs indefinitely
+        const abortTimer = setTimeout(() => reader.cancel(), 90_000);
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() ?? "";
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
 
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              try {
-                const payload = JSON.parse(line.slice(6));
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                try {
+                  const payload = JSON.parse(line.slice(6));
 
-                if (payload.type === "chunk") {
-                  setMessages((prev) =>
-                    prev.map((m) =>
-                      m.id === assistantMsgId
-                        ? { ...m, text: m.text + payload.text, loading: true }
-                        : m
-                    )
-                  );
-                } else if (payload.type === "proposed_order") {
-                  proposedOrder = payload.order;
-                } else if (payload.type === "order_placed") {
-                  orderPlacedId = payload.order_id;
-                } else if (payload.type === "done") {
-                  setMessages((prev) =>
-                    prev.map((m) =>
-                      m.id === assistantMsgId
-                        ? {
-                            ...m,
-                            loading: false,
-                            proposedOrder,
-                            orderPlaced: orderPlacedId,
-                          }
-                        : m
-                    )
-                  );
+                  if (payload.type === "chunk") {
+                    setMessages((prev) =>
+                      prev.map((m) =>
+                        m.id === assistantMsgId
+                          ? { ...m, text: m.text + payload.text, loading: true }
+                          : m
+                      )
+                    );
+                  } else if (payload.type === "proposed_order") {
+                    proposedOrder = payload.order;
+                  } else if (payload.type === "order_placed") {
+                    orderPlacedId = payload.order_id;
+                  } else if (payload.type === "done") {
+                    setMessages((prev) =>
+                      prev.map((m) =>
+                        m.id === assistantMsgId
+                          ? {
+                              ...m,
+                              loading: false,
+                              proposedOrder,
+                              orderPlaced: orderPlacedId,
+                            }
+                          : m
+                      )
+                    );
+                  }
+                } catch {
+                  // malformed SSE line — skip
                 }
-              } catch {
-                // malformed SSE line — skip
               }
             }
           }
+        } finally {
+          clearTimeout(abortTimer);
+          // Always mark the message as done — handles the case where the stream
+          // closes without emitting a "done" SSE event (network drop, timeout).
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantMsgId ? { ...m, loading: false, proposedOrder, orderPlaced: orderPlacedId } : m
+            )
+          );
         }
       } catch (err) {
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMsgId
-              ? { ...m, text: `Error: ${String(err)}`, loading: false }
+              ? { ...m, text: m.text || `[Error: ${String(err)}]`, loading: false }
               : m
           )
         );
