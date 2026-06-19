@@ -750,10 +750,11 @@ def _extract_clean_answer(raw: str) -> str:
     if tu_idx != -1:
         after = raw[tu_idx + len("tokens used\n"):]
         lines = after.split("\n")
-        # Skip the numeric token-count line(s)
+        # Skip the numeric token-count line(s) — format is "8,179" or "8179"
         start = 0
         for i, ln in enumerate(lines):
-            if ln.strip().isdigit() or ln.strip() == "":
+            cleaned = ln.strip().replace(",", "")
+            if cleaned.isdigit() or cleaned == "":
                 start = i + 1
             else:
                 break
