@@ -730,6 +730,55 @@ def get_daytrader_state() -> dict[str, Any]:
 _CHAT_SESSIONS: dict[str, list[dict[str, str]]] = {}
 
 
+def _extract_clean_answer(raw: str) -> str:
+    """Return only the final answer text from raw codex exec output.
+
+    Codex echoes the entire prompt, then streams thinking blocks, then emits:
+        codex
+        <FINAL ANSWER>
+        tokens used
+        <count>
+        <FINAL ANSWER repeated>
+
+    We extract the repeated answer after "tokens used / <count>" because that's
+    the cleanest copy — it excludes all narration/tool-call noise.
+    If the marker is absent (still streaming or unexpected format), we fall back
+    to the last "codex\\n" block stripped of noise.
+    """
+    # Strategy 1: content after "tokens used\n<digits>\n"
+    tu_idx = raw.find("tokens used\n")
+    if tu_idx != -1:
+        after = raw[tu_idx + len("tokens used\n"):]
+        lines = after.split("\n")
+        # Skip the numeric token-count line(s)
+        start = 0
+        for i, ln in enumerate(lines):
+            if ln.strip().isdigit() or ln.strip() == "":
+                start = i + 1
+            else:
+                break
+        answer = "\n".join(lines[start:])
+        # Strip the trailing session-delete error line
+        for noise in ("ERROR rmcp", "\x1b["):
+            idx = answer.find(noise)
+            if idx != -1:
+                answer = answer[:idx]
+        return answer.strip()
+
+    # Strategy 2: last "codex\n" block (before any "tokens used")
+    marker = "\ncodex\n"
+    idx = raw.rfind(marker)
+    if idx != -1:
+        block = raw[idx + len(marker):]
+        tu = block.find("\ntokens used")
+        if tu != -1:
+            block = block[:tu]
+        return block.strip()
+
+    # Fallback: return everything (better than nothing)
+    return raw.strip()
+
+
 class _ChatRequest(BaseModel):
     session_id: str
     message: str
@@ -765,8 +814,10 @@ async def chat_message(req: _ChatRequest) -> StreamingResponse:
             yield _sse_event({"type": "chunk", "text": f"\n[error: {exc}]"}, event="chat")
 
         full_text = "".join(full_chunks)
-        # Save assistant turn
-        session.append({"role": "assistant", "content": full_text})
+        # Extract only the clean answer to save in history.  Saving the raw
+        # codex output (which includes the full prompt echo) would cause the
+        # conversation history to snowball exponentially with each turn.
+        session.append({"role": "assistant", "content": _extract_clean_answer(full_text)})
 
         # Surface any structured tags — only look at the assistant's reply (after
         # the last "User:" echo in the codex output) to avoid matching the
