@@ -3,6 +3,7 @@ services:
     build: .
     command: ["python", "-u", "-m", "bot.listener"]
     restart: unless-stopped
+    user: "1000:1000"
     env_file: .env
     volumes:
       - ./logs:/app/logs
@@ -11,6 +12,7 @@ services:
     build: .
     command: ["python", "-u", "-m", "bot.executor"]
     restart: unless-stopped
+    user: "1000:1000"
     env_file: .env
     environment:
       EXECUTOR_MODE: DRY_RUN
