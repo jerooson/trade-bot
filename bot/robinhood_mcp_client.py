@@ -15,6 +15,7 @@ import json
 import logging
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -53,8 +54,60 @@ class RobinhoodMCPError(Exception):
     pass
 
 
+_ROBINHOOD_TOKEN_URL = "https://api.robinhood.com/oauth2/token/"
+# Refresh when less than 30 minutes remain (gives time to retry on failure).
+_TOKEN_REFRESH_THRESHOLD_S = 30 * 60
+
+
+def _refresh_token(cred: dict, creds: dict, rh_key: str) -> str:
+    """Use the OAuth refresh_token to obtain a new access_token silently."""
+    refresh_token = cred.get("refresh_token")
+    client_id = cred.get("client_id")
+    if not refresh_token or not client_id:
+        raise RobinhoodMCPError(
+            "No refresh_token/client_id available — run 'codex mcp login robinhood-trading'."
+        )
+
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }).encode()
+    req = urllib.request.Request(
+        _ROBINHOOD_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise RobinhoodMCPError(f"Token refresh HTTP {exc.code}: {exc.read().decode()[:200]}")
+    except Exception as exc:
+        raise RobinhoodMCPError(f"Token refresh failed: {exc}")
+
+    new_access = data.get("access_token")
+    if not new_access:
+        raise RobinhoodMCPError(f"Token refresh returned no access_token: {list(data.keys())}")
+
+    # Update credentials in memory and persist.
+    expires_in = data.get("expires_in", 0)
+    cred["access_token"] = new_access
+    cred["expires_at"] = int((time.time() + expires_in) * 1000)
+    if data.get("refresh_token"):
+        cred["refresh_token"] = data["refresh_token"]
+    creds[rh_key] = cred
+    try:
+        CREDS_PATH.write_text(json.dumps(creds, indent=2))
+        log.info("Robinhood token auto-refreshed — new expiry in %dh", expires_in // 3600)
+    except Exception as exc:
+        log.warning("Token refreshed in memory but could not persist: %s", exc)
+
+    return new_access
+
+
 def _load_token() -> str:
-    """Return a valid Robinhood access token from Codex credentials."""
+    """Return a valid Robinhood access token, auto-refreshing if near expiry."""
     try:
         creds = json.loads(CREDS_PATH.read_text())
     except (FileNotFoundError, json.JSONDecodeError) as exc:
@@ -66,12 +119,10 @@ def _load_token() -> str:
 
     cred = creds[rh_key]
     expires_at_s = cred.get("expires_at", 0) / 1000
-    if time.time() > expires_at_s - 60:
-        raise RobinhoodMCPError(
-            f"Robinhood access token expires at {expires_at_s:.0f} "
-            "(within 60s or already expired). "
-            "Run 'codex mcp login robinhood-trading' to refresh it."
-        )
+    if time.time() > expires_at_s - _TOKEN_REFRESH_THRESHOLD_S:
+        log.info("Robinhood token expiring soon (or expired) — attempting auto-refresh...")
+        return _refresh_token(cred, creds, rh_key)
+
     return cred["access_token"]
 
 
