@@ -18,6 +18,6 @@ COPY server ./server
 
 RUN pip install --no-cache-dir .
 
-RUN mkdir -p /app/logs
+RUN mkdir -p /app/logs && chown -R 1000:1000 /app
 
 CMD ["python", "-m", "bot.executor"]
