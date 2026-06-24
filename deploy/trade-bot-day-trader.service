@@ -2,6 +2,7 @@
 Description=Trade Bot Day Trader
 After=network-online.target docker.service
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,7 +14,6 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/deploy/trade-bot/.venv/bin/python -u -m bot.day_trader
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
