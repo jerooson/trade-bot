@@ -434,8 +434,11 @@ def decide(action: dict[str, Any], book: VirtualBook, config: ExecutorConfig) ->
         frac = _fraction_of(delta_size_str)
         if frac is None or frac <= 0:
             return _reject(f"REDUCE with no usable delta fraction ({delta_size_str!r})")
+        # REDUCE signals from Discord don't carry a price; fall back to avg_price.
         if signal_price is None or signal_price <= 0:
-            return _reject("REDUCE signal has no usable price")
+            signal_price = pos.avg_price if pos.avg_price and pos.avg_price > 0 else None
+        if signal_price is None:
+            return _reject("REDUCE signal has no usable price and position has no avg_price")
         wanted_usd = round(config.budget_per_ticker * frac, 4)
         usd = min(wanted_usd, pos.deployed_usd)  # never sell more than we hold
         if usd <= 0.01:
