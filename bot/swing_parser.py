@@ -82,6 +82,11 @@ _FIELD_RE = re.compile(
     re.MULTILINE,
 )
 
+# Will's Discord bot labels Alphabet as "GOOGL" but he trades Class C (GOOG).
+_TICKER_ALIASES: dict[str, str] = {
+    "GOOGL": "GOOG",
+}
+
 # English- and Chinese-style label aliases mapped onto canonical field names.
 _LABEL_ALIASES: dict[str, str] = {
     # Ticker
@@ -257,6 +262,7 @@ def parse_swing(text: str) -> TradeAction | None:
     ticker = (fields.get("ticker") or "").upper().strip()
     if not ticker:
         return None
+    ticker = _TICKER_ALIASES.get(ticker, ticker)
 
     # Side: most messages have "Trade Type: LONG" or "操作: 🟢 买入..." etc.
     side: Side | None = None

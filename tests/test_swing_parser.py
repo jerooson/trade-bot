@@ -155,6 +155,13 @@ def test_noise_rejected():
     assert parse_swing("") is None
 
 
+def test_googl_maps_to_goog_class_c():
+    text = f.ENTRY.replace("LITE", "GOOGL")
+    a = parse_swing(text)
+    assert a is not None
+    assert a.ticker == "GOOG"
+
+
 def test_to_dict_is_json_safe():
     a = parse_swing(f.ENTRY)
     d = a.to_dict()
