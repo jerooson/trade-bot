@@ -215,7 +215,12 @@ ACTIONABLE_KINDS: set[str] = {
     ActionKind.REDUCE.value,
     ActionKind.CLOSE.value,
     ActionKind.STOP_TRIGGER.value,
+    ActionKind.STOP_UPDATE.value,
 }
+
+# Labels that mean "stop at my average cost" (breakeven).
+_BREAKEVEN_LABELS = ("保本", "均价", "breakeven", "avg cost", "average")
+
 
 
 @dataclass
@@ -444,6 +449,10 @@ def decide(action: dict[str, Any], book: VirtualBook, config: ExecutorConfig) ->
         if usd <= 0.01:
             return _reject(f"REDUCE amount ${usd:.2f} too small")
         shares = _shares_estimate(usd, signal_price)
+        # Clear stop so the old level doesn't trigger between this REDUCE
+        # and the STOP_UPDATE Will always posts shortly after.
+        pos.stop_loss = None
+        pos.stop_loss_label = None
         # Shave shares + deployed proportionally; avg_price unchanged.
         if pos.deployed_usd > 0:
             sell_ratio = usd / pos.deployed_usd
@@ -473,6 +482,47 @@ def decide(action: dict[str, Any], book: VirtualBook, config: ExecutorConfig) ->
             shares_estimate=shares,
             signal_price=signal_price,
             rationale=rationale,
+            book_before=book_before,
+            book_after=_book_snapshot(book, ticker),
+            signal=_compact_signal(action),
+        )
+
+    # --- STOP_UPDATE -------------------------------------------------------
+    if kind == ActionKind.STOP_UPDATE.value:
+        pos = book.positions.get(ticker)
+        if pos is None:
+            return _reject(f"STOP_UPDATE for {ticker} but we don't hold it")
+
+        numeric_stop = action.get("stop_loss")
+        label = (action.get("stop_loss_label") or "").strip()
+
+        if isinstance(numeric_stop, (int, float)) and numeric_stop > 0:
+            new_stop = float(numeric_stop)
+        elif any(kw in label for kw in _BREAKEVEN_LABELS):
+            # "保本 (均价)" → stop at our average cost (breakeven)
+            new_stop = pos.avg_price if pos.avg_price else None
+        else:
+            return _reject(f"STOP_UPDATE for {ticker}: cannot derive stop price from {label!r}")
+
+        if new_stop is None:
+            return _reject(f"STOP_UPDATE for {ticker}: position has no avg_price for breakeven")
+
+        pos.stop_loss = new_stop
+        pos.stop_loss_label = label
+        pos.last_action_at = received_at
+        pos.actions_count += 1
+
+        return Decision(
+            id=_new_decision_id(kind, ticker),
+            decided_at=datetime.now(timezone.utc).isoformat(),
+            mode=config.mode,
+            signal_kind=kind,
+            ticker=ticker,
+            action="STOP_UPDATE",
+            usd_amount=None,
+            shares_estimate=None,
+            signal_price=None,
+            rationale=f"STOP_UPDATE {ticker}: stop set to ${new_stop:.4f} ({label!r})",
             book_before=book_before,
             book_after=_book_snapshot(book, ticker),
             signal=_compact_signal(action),

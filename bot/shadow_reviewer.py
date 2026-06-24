@@ -69,12 +69,15 @@ class ShadowConfig:
     orders_path: Path
     ledger_path: Path
     pnl_path: Path
+    swings_path: Path
+    book_path: Path
     codex_command: str
     budget_per_ticker: float
     max_age_s: float
     poll_interval_s: float
     codex_timeout_s: float
     place_orders: bool
+    stop_check_interval_s: float  # how often to poll swing stop-losses
 
 
 @dataclass
@@ -117,6 +120,12 @@ def load_config() -> ShadowConfig:
         pnl_path=Path(
             os.environ.get("SHADOW_REVIEW_PNL_PATH", "./logs/trade_pnl.jsonl")
         ),
+        swings_path=Path(
+            os.environ.get("EXECUTOR_SWING_LIVE_PATH", "./logs/swings.jsonl")
+        ),
+        book_path=Path(
+            os.environ.get("EXECUTOR_BOOK_PATH", "./logs/virtual_book.json")
+        ),
         codex_command=os.environ.get("SHADOW_REVIEW_CODEX_COMMAND", "codex"),
         budget_per_ticker=float(
             os.environ.get("EXECUTOR_BUDGET_PER_TICKER", "20")
@@ -125,6 +134,9 @@ def load_config() -> ShadowConfig:
         poll_interval_s=float(os.environ.get("SHADOW_REVIEW_POLL_INTERVAL_S", "1")),
         codex_timeout_s=float(os.environ.get("SHADOW_REVIEW_CODEX_TIMEOUT_S", "120")),
         place_orders=place_orders,
+        stop_check_interval_s=float(
+            os.environ.get("SHADOW_REVIEW_STOP_CHECK_INTERVAL_S", "60")
+        ),
     )
 
 
@@ -505,6 +517,144 @@ def review_one(
     )
 
 
+def _is_market_open() -> bool:
+    """Return True if US equities market is currently open (Mon-Fri 9:30-16:00 ET)."""
+    from zoneinfo import ZoneInfo  # Python 3.9+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    open_t  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_t = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_t <= now_et < close_t
+
+
+def _monitor_swing_stops(config: ShadowConfig) -> None:
+    """Check each open swing position's stop_loss against current price.
+
+    If price ≤ stop_loss:
+    1. Place a market sell of the full remaining position via direct MCP.
+    2. Append a STOP_TRIGGER entry to swings.jsonl so the executor removes
+       the position from the virtual_book on its next read.
+    """
+    if not config.place_orders:
+        return  # review-only mode — don't act autonomously
+    if not _is_market_open():
+        return
+
+    try:
+        book_data = json.loads(config.book_path.read_text())
+    except Exception:
+        return
+
+    positions = book_data.get("positions", {})
+    stops = {
+        t: p for t, p in positions.items()
+        if isinstance(p.get("stop_loss"), (int, float)) and p["stop_loss"] > 0
+    }
+    if not stops:
+        return
+
+    try:
+        token = robinhood_mcp_client._load_token()
+        session = robinhood_mcp_client._MCPSession(token)
+    except Exception as exc:
+        log.warning("stop monitor: cannot open MCP session: %s", exc)
+        return
+
+    for ticker, pos in stops.items():
+        stop_price: float = pos["stop_loss"]
+        shares: float = pos.get("shares") or 0.0
+        avg_price: float = pos.get("avg_price") or 0.0
+        deployed: float = pos.get("deployed_usd") or 0.0
+
+        try:
+            data = session.call("get_equity_quotes", symbols=[ticker])
+            results = data.get("data", {}).get("results", [])
+            if not results:
+                continue
+            q = results[0].get("quote") or results[0]
+            ltp = q.get("last_trade_price")
+            current_price = float(ltp) if ltp is not None else None
+        except Exception as exc:
+            log.warning("stop monitor: price fetch failed for %s: %s", ticker, exc)
+            continue
+
+        if current_price is None:
+            continue
+
+        if current_price > stop_price:
+            log.debug(
+                "stop monitor: %s price=%.4f stop=%.4f — OK",
+                ticker, current_price, stop_price,
+            )
+            continue
+
+        log.warning(
+            "STOP TRIGGERED: %s price=%.4f <= stop=%.4f — selling %.6f shares",
+            ticker, current_price, stop_price, shares,
+        )
+
+        # Place market sell for the full remaining position.
+        try:
+            accounts_data = session.call("get_accounts")
+            accounts = accounts_data.get("data", {}).get("accounts", [])
+            agentic = [a for a in accounts if a.get("agentic_allowed")]
+            if not agentic:
+                log.error("stop monitor: no agentic account found for %s sell", ticker)
+                continue
+            acct = agentic[0]["account_number"]
+
+            order_result = session.call(
+                "place_equity_order",
+                account_number=acct,
+                symbol=ticker,
+                side="sell",
+                type="market",
+                quantity=str(round(shares, 6)),
+                time_in_force="gfd",
+            )
+            order_id = (
+                order_result.get("data", {}).get("order", {}).get("id", "unknown")
+            )
+            order_state = (
+                order_result.get("data", {}).get("order", {}).get("state", "unknown")
+            )
+            log.info(
+                "stop monitor: sell placed for %s order=%s state=%s",
+                ticker, order_id, order_state,
+            )
+        except Exception as exc:
+            log.error("stop monitor: sell FAILED for %s: %s", ticker, exc)
+            continue
+
+        # Append STOP_TRIGGER to swings.jsonl so executor removes the position.
+        trigger_entry = {
+            "kind": "STOP_TRIGGER",
+            "ticker": ticker,
+            "side": None,
+            "price": current_price,
+            "avg_cost": avg_price,
+            "stop_loss": stop_price,
+            "profit_pct": round((current_price / avg_price - 1) * 100, 2) if avg_price else None,
+            "position_size": None,
+            "position_fraction": None,
+            "delta_size": None,
+            "action_text": "🛑 止损触发 (bot-managed stop)",
+            "stop_loss_label": pos.get("stop_loss_label"),
+            "stop_type": None,
+            "posted_by": "bot-stop-monitor",
+            "raw_text": f"[Auto stop-trigger: {ticker} price={current_price} <= stop={stop_price}]",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "discord": {"message_id": None},
+        }
+        try:
+            with config.swings_path.open("a") as f:
+                f.write(json.dumps(trigger_entry, ensure_ascii=False) + "\n")
+            log.info("stop monitor: STOP_TRIGGER written to swings.jsonl for %s", ticker)
+        except Exception as exc:
+            log.error("stop monitor: failed to write STOP_TRIGGER for %s: %s", ticker, exc)
+
+
 def run(config: ShadowConfig) -> None:
     _warn_stale_pending(config.ledger_path)
     seen = _load_seen(config.ledger_path)
@@ -513,6 +663,9 @@ def run(config: ShadowConfig) -> None:
     log.info("auto-trader watching %s (%s)", config.orders_path, mode)
     log.info("trade ledger -> %s", config.ledger_path)
     log.info("eligible actions: BUY (ENTRY/ADD) and SELL (REDUCE/CLOSE/STOP_TRIGGER)")
+    log.info("swing stop monitor: every %.0fs", config.stop_check_interval_s)
+
+    last_stop_check = 0.0
 
     while True:
         for proposal in tail.read_new_records():
@@ -531,6 +684,16 @@ def run(config: ShadowConfig) -> None:
                 record.proposal_usd,
                 record.rationale,
             )
+
+        # Periodically check swing position stop-losses.
+        now_ts = time.monotonic()
+        if now_ts - last_stop_check >= config.stop_check_interval_s:
+            last_stop_check = now_ts
+            try:
+                _monitor_swing_stops(config)
+            except Exception as exc:
+                log.error("stop monitor error: %s", exc)
+
         time.sleep(config.poll_interval_s)
 
 
