@@ -176,28 +176,43 @@ def test_entry_rejects_with_no_price(book, config):
 def test_add_at_quarter_buys_five_dollars(book, config):
     """The headline rule: 'will says +1/4 → we buy $5'."""
     decide(_entry("HOOD", price=100.0, fraction=0.5, size="1/2"), book, config)
-    # After ENTRY 1/2 we've deployed $10 of $20.
-    d = decide(_add("HOOD", fraction=0.25, size="+1/4", price=100.0), book, config)
+    # After ENTRY 1/2 ($10 deployed). ADD with new-total 3/4 → delta = 1/4 → $5.
+    d = decide(_add("HOOD", fraction=0.75, size="+1/4 → 3/4", price=100.0), book, config)
     assert d.action == "BUY"
     assert d.usd_amount == pytest.approx(5.0)
     pos = book.positions["HOOD"]
     assert pos.deployed_usd == pytest.approx(15.0)
 
 
+def test_add_arrow_format_uses_delta_not_total(book, config):
+    """IREN bug: '+1/8 → 1/2' with 3/8 already held should buy 1/8 ($2.50), not 1/2 ($10)."""
+    # Start at 1/4 ($5)
+    decide(_entry("IREN", price=47.0, fraction=0.25, size="1/4"), book, config)
+    # ADD +1/8 → 3/8: new total 3/8, already have 1/4 → delta = 1/8 → $2.50
+    d = decide(_add("IREN", fraction=0.375, size="+1/8 → 3/8", price=49.0), book, config)
+    assert d.action == "BUY"
+    assert d.usd_amount == pytest.approx(2.5, abs=0.01)
+    # Now at 3/8. ADD +1/8 → 1/2: delta = 1/8 → $2.50
+    d2 = decide(_add("IREN", fraction=0.5, size="+1/8 → 1/2", price=41.0), book, config)
+    assert d2.action == "BUY"
+    assert d2.usd_amount == pytest.approx(2.5, abs=0.01)
+    pos = book.positions["IREN"]
+    assert pos.deployed_usd == pytest.approx(10.0, abs=0.01)
+
+
 def test_add_caps_at_remaining_budget(book, config):
     decide(_entry("HOOD", price=100.0, fraction=0.75, size="3/4"), book, config)
-    # Deployed $15 of $20; ADD 1/2 wants $10 but only $5 of room → capped.
-    d = decide(_add("HOOD", fraction=0.5, size="+1/2"), book, config)
+    # Deployed $15 of $20; ADD new-total 1/1 wants $5 of delta → fits exactly.
+    d = decide(_add("HOOD", fraction=1.0, size="+1/4 → 1/1"), book, config)
     assert d.action == "BUY"
     assert d.usd_amount == pytest.approx(5.0)
-    assert "capped" in d.rationale
 
 
 def test_add_rejected_when_at_cap(book, config):
     decide(_entry("HOOD", price=100.0, fraction=1.0, size="1/1"), book, config)
-    d = decide(_add("HOOD", fraction=0.25, size="+1/4"), book, config)
+    # Already at 1/1. ADD with new-total 1/1 → delta=0 → reject.
+    d = decide(_add("HOOD", fraction=1.0, size="+1/4 → 1/1"), book, config)
     assert d.action == "REJECT"
-    assert "budget cap" in d.rationale
 
 
 def test_add_rejected_when_not_held(book, config):
@@ -209,8 +224,8 @@ def test_add_rejected_when_not_held(book, config):
 def test_add_updates_avg_price(book, config):
     decide(_entry("HOOD", price=100.0, fraction=0.5, size="1/2"), book, config)
     # ENTRY: $10 at $100/sh = 0.1 sh, avg = $100
-    decide(_add("HOOD", fraction=0.25, size="+1/4", price=120.0), book, config)
-    # ADD: $5 at $120/sh ≈ 0.0417 sh → new total ≈ 0.1417 sh
+    # ADD new-total 3/4: delta = 1/4 → $5 at $120/sh ≈ 0.0417 sh
+    decide(_add("HOOD", fraction=0.75, size="+1/4 → 3/4", price=120.0), book, config)
     # New avg ≈ ($100 × 0.1 + $120 × 0.0417) / 0.1417 ≈ $105.88
     pos = book.positions["HOOD"]
     assert pos.avg_price == pytest.approx(105.88, abs=0.05)

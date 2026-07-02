@@ -383,7 +383,18 @@ def decide(action: dict[str, Any], book: VirtualBook, config: ExecutorConfig) ->
         frac = fraction or 0.0
         if frac <= 0:
             return _reject(f"ADD with non-positive fraction {pos_size_str!r}")
-        wanted_usd = round(config.budget_per_ticker * frac, 4)
+        # `fraction` is the NEW TOTAL size (right-hand side of "+1/8 → 3/8").
+        # The dollar delta we need to buy is (new_total - already_deployed).
+        # Without this correction "+1/8 → 3/8" with 1/4 already held would
+        # buy 3/8×$20=$7.50 instead of the correct 1/8×$20=$2.50.
+        already_frac = round(pos.deployed_usd / config.budget_per_ticker, 6)
+        delta_frac = round(frac - already_frac, 6)
+        if delta_frac <= 0:
+            return _reject(
+                f"ADD {pos_size_str!r}: new total {frac:.4f} ≤ already deployed "
+                f"{already_frac:.4f} — nothing to buy"
+            )
+        wanted_usd = round(config.budget_per_ticker * delta_frac, 4)
         room = round(pos.budget_usd - pos.deployed_usd, 4)
         if room <= 0.01:
             return _reject(
