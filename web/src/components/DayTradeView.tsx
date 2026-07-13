@@ -52,7 +52,11 @@ export function DayTradeView({ dash, positions, pnl, serviceRunning }: Props) {
 
       {/* Quick stats */}
       <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-4">
-        <StatTile label="Watching" value={(positions.filter(p => p.status === "watching").length).toString()} caption="plans queued" />
+        <StatTile
+          label="Watching"
+          value={(positions.filter(p => p.status === "watching" || p.status === "pending_entry").length).toString()}
+          caption="plans / limit orders"
+        />
         <StatTile label="Open Trades" value={openCount.toString()} caption="in market" highlight={openCount > 0} />
         <StatTile
           label="Realized P&L"
@@ -104,7 +108,7 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
     );
   }
 
-  const watching = positions.filter((p) => p.status === "watching");
+  const watching = positions.filter((p) => p.status === "watching" || p.status === "pending_entry");
   const open = positions.filter((p) => p.status === "open");
   const closed = positions.filter((p) => p.status === "closed");
 
@@ -117,13 +121,18 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
             {watching.map((p) => (
               <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
                 <div className="col-span-2 font-editorial text-xl italic text-bone-50">{p.ticker}</div>
-                <div className="col-span-2 tabular text-sm text-crt-amber">${p.trigger_price?.toFixed(2) ?? "—"}</div>
+                <div className="col-span-2 tabular text-sm text-crt-amber">
+                  ${p.trigger_price?.toFixed(2) ?? "—"}
+                  {p.status === "pending_entry" && p.entry_limit_price != null && (
+                    <span className="ml-1 text-[9px] text-bone-500">cap ${p.entry_limit_price.toFixed(2)}</span>
+                  )}
+                </div>
                 <div className="col-span-4 text-[11px] text-bone-400">{p.setup ?? "—"}</div>
                 <div className="col-span-2 tabular text-[11px] text-bone-500">{relativeTime(p.plan_received_at)}</div>
                 <div className="col-span-2">
                   <span className="inline-flex items-center gap-1 border border-crt-amber/50 bg-crt-amber/10 px-1.5 py-0.5 text-[9px] uppercase tracking-[0.18em] text-crt-amber">
                     <span className="h-1.5 w-1.5 animate-pulseDot rounded-full bg-crt-amber" />
-                    watching
+                    {p.status === "pending_entry" ? "limit pending" : "watching"}
                   </span>
                 </div>
               </div>

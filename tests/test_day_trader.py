@@ -4,7 +4,7 @@ Unit tests for bot/day_trader.py — dry-run with mocked MCP calls.
 Every test patches the network/IO layer so no real orders are placed.
 The primary contract verified in each test:
 
-  "If condition X is true, _market_sell_all / _place_market_buy /
+  "If condition X is true, _market_sell_all / _place_limit_buy /
    _cancel_order MUST be called with correct arguments and the position
    state MUST transition correctly."
 """
@@ -28,7 +28,14 @@ from bot.day_trader import (
     _CONFIRM_POLLS,
     _INITIAL_STOP_PCT,
     _TRAILING_MILESTONES,
+    ENTRY_LIMIT_OFFSET_PCT,
+    FAR_POLL_INTERVAL_S,
+    NEAR_POLL_INTERVAL_S,
+    DayTraderRuntime,
     DayPosition,
+    _get_prices,
+    _position_poll_interval,
+    _place_limit_buy,
     run_once,
 )
 from bot.robinhood_mcp_client import OrderResult
@@ -90,8 +97,8 @@ def _patch_env(now=ET_MARKET_OPEN, price=10.0, buy_result: OrderResult | None = 
         patch("bot.day_trader._load_token", return_value="fake-token"),
         patch("bot.day_trader._MCPSession", return_value=MagicMock()),
         patch("bot.day_trader._get_agentic_account", return_value="acct-001"),
-        patch("bot.day_trader._get_price", return_value=price),
-        patch("bot.day_trader._place_market_buy", return_value=buy_result),
+        patch("bot.day_trader._get_prices", return_value={"TEST": price}),
+        patch("bot.day_trader._place_limit_buy", return_value=buy_result),
         patch("bot.day_trader._place_stop_order", return_value="stop-001"),
         patch("bot.day_trader._place_limit_sell", return_value="limit-001"),
         patch("bot.day_trader._cancel_order"),
@@ -118,8 +125,8 @@ class _Base(unittest.TestCase):
              patch("bot.day_trader._load_token", return_value="tok") as m_tok, \
              patch("bot.day_trader._MCPSession", return_value=MagicMock()) as m_sess, \
              patch("bot.day_trader._get_agentic_account", return_value="acct") as m_acct, \
-             patch("bot.day_trader._get_price", return_value=price) as m_price, \
-             patch("bot.day_trader._place_market_buy", return_value=buy_result) as m_buy, \
+             patch("bot.day_trader._get_prices", return_value={"TEST": price}) as m_price, \
+             patch("bot.day_trader._place_limit_buy", return_value=buy_result) as m_buy, \
              patch("bot.day_trader._place_stop_order", return_value="stop-001") as m_stop, \
              patch("bot.day_trader._place_limit_sell", return_value="limit-001") as m_lim, \
              patch("bot.day_trader._cancel_order") as m_cancel, \
@@ -163,12 +170,35 @@ class TestEntry(_Base):
         self.assertEqual(pos.status, "open")
         m["buy"].assert_called_once()
 
-    def test_buy_placed_when_price_above_trigger(self):
-        """Price above trigger: buy IS placed."""
+    def test_buy_placed_when_price_above_trigger_but_within_cap(self):
+        """A small breakout within the configured cap places a limit buy."""
         pos = _watching_pos(trigger=10.0)
-        positions, m = self._run([pos], price=10.5)
+        positions, m = self._run([pos], price=10.01)
         self.assertEqual(pos.status, "open")
         m["buy"].assert_called_once()
+
+    def test_gap_above_entry_cap_is_skipped(self):
+        """A breakout already above the cap expires instead of chasing."""
+        pos = _watching_pos(trigger=10.0)
+        positions, m = self._run([pos], price=10.5)
+        self.assertEqual(pos.status, "expired")
+        self.assertEqual(pos.exit_reason, "entry_gap_above_limit")
+        self.assertEqual(pos.entry_limit_price, 10.02)
+        m["buy"].assert_not_called()
+
+    def test_limit_buy_uses_trigger_based_cap(self):
+        pos = _watching_pos(trigger=10.0)
+        positions, m = self._run([pos], price=10.0)
+        args = m["buy"].call_args[0]
+        self.assertEqual(args[4], round(10.0 * (1 + ENTRY_LIMIT_OFFSET_PCT / 100), 2))
+
+    def test_unfilled_limit_order_becomes_pending(self):
+        pos = _watching_pos(trigger=10.0)
+        result = OrderResult("b1", "queued", None, None, None)
+        positions, m = self._run([pos], price=10.0, buy_result=result)
+        self.assertEqual(pos.status, "pending_entry")
+        self.assertEqual(pos.buy_order_id, "b1")
+        m["stop"].assert_not_called()
 
     def test_initial_stop_set_at_minus_2pct(self):
         """After buy, stop is fill_price × 0.98."""
@@ -203,9 +233,9 @@ class TestEntry(_Base):
     def test_position_fill_price_recorded(self):
         """fill_price and fill_qty from OrderResult are stored on position."""
         pos = _watching_pos(trigger=10.0)
-        br = OrderResult("b1", "filled", 10.25, 1.95, 19.99)
-        positions, m = self._run([pos], price=10.25, buy_result=br)
-        self.assertEqual(pos.fill_price, 10.25)
+        br = OrderResult("b1", "filled", 10.01, 1.95, 19.5195)
+        positions, m = self._run([pos], price=10.01, buy_result=br)
+        self.assertEqual(pos.fill_price, 10.01)
         self.assertEqual(pos.fill_qty, 1.95)
 
     def test_duplicate_plan_ignored(self):
@@ -574,7 +604,7 @@ class TestResilience(_Base):
              patch("bot.day_trader._load_token", return_value="tok"), \
              patch("bot.day_trader._MCPSession", return_value=MagicMock()), \
              patch("bot.day_trader._get_agentic_account", return_value="acct"), \
-             patch("bot.day_trader._get_price", side_effect=Exception("network err")), \
+             patch("bot.day_trader._get_prices", side_effect=Exception("network err")), \
              patch("bot.day_trader._market_sell_all") as m_sell, \
              patch("bot.day_trader._flush_positions"), \
              patch("bot.day_trader._append_position"), \
@@ -592,8 +622,8 @@ class TestResilience(_Base):
              patch("bot.day_trader._load_token", return_value="tok"), \
              patch("bot.day_trader._MCPSession", return_value=MagicMock()), \
              patch("bot.day_trader._get_agentic_account", return_value="acct"), \
-             patch("bot.day_trader._get_price", return_value=10.5), \
-             patch("bot.day_trader._place_market_buy",
+             patch("bot.day_trader._get_prices", return_value={"TEST": 10.0}), \
+             patch("bot.day_trader._place_limit_buy",
                    side_effect=RobinhoodMCPError("order rejected")), \
              patch("bot.day_trader._flush_positions"), \
              patch("bot.day_trader._append_position"), \
@@ -601,6 +631,88 @@ class TestResilience(_Base):
             m_dt.now.return_value = ET_MARKET_OPEN
             run_once([pos], set())
         self.assertEqual(pos.status, "watching")
+
+
+class TestProtectedEntryAndPolling(unittest.TestCase):
+
+    def test_batch_quotes_use_one_request_for_multiple_tickers(self):
+        session = MagicMock()
+        session.call.return_value = {"data": {"results": [
+            {"symbol": "AAPL", "quote": {"last_trade_price": "317.30"}},
+            {"symbol": "NVDA", "quote": {"last_trade_price": "190.50"}},
+        ]}}
+        prices = _get_prices(session, ["AAPL", "NVDA"])
+        session.call.assert_called_once_with(
+            "get_equity_quotes", symbols=["AAPL", "NVDA"]
+        )
+        self.assertEqual(prices, {"AAPL": 317.30, "NVDA": 190.50})
+
+    def test_batch_quotes_fall_back_to_request_order_when_symbol_is_omitted(self):
+        session = MagicMock()
+        session.call.return_value = {"data": {"results": [
+            {"quote": {"last_trade_price": "317.30"}},
+            {"quote": {"last_trade_price": "190.50"}},
+        ]}}
+        self.assertEqual(
+            _get_prices(session, ["AAPL", "NVDA"]),
+            {"AAPL": 317.30, "NVDA": 190.50},
+        )
+
+    def test_runtime_schedules_each_ticker_independently(self):
+        runtime = DayTraderRuntime()
+        near = _watching_pos(trigger=10.0)
+        near.current_price = 9.96
+        far = _watching_pos(trigger=10.0)
+        far.current_price = 9.0
+        with patch("bot.day_trader.time.monotonic", return_value=100.0):
+            runtime.schedule(near)
+            runtime.schedule(far)
+        self.assertEqual(runtime.next_due[near.id], 100.0 + NEAR_POLL_INTERVAL_S)
+        self.assertEqual(runtime.next_due[far.id], 100.0 + FAR_POLL_INTERVAL_S)
+
+    def test_runtime_reuses_mcp_session_and_account(self):
+        runtime = DayTraderRuntime()
+        session = MagicMock()
+        with patch("bot.day_trader._load_token", return_value="tok") as load_token, \
+             patch("bot.day_trader._MCPSession", return_value=session) as make_session, \
+             patch("bot.day_trader._get_agentic_account", return_value="acct") as get_account:
+            first = runtime.connection()
+            second = runtime.connection()
+        self.assertEqual(first, second)
+        load_token.assert_called_once()
+        make_session.assert_called_once_with("tok")
+        get_account.assert_called_once_with(session)
+
+    def test_limit_buy_sends_no_market_order(self):
+        session = MagicMock()
+        session.call.side_effect = [
+            {"data": {"order": {"id": "order-1", "state": "queued"}}},
+            {"data": {"orders": [{
+                "id": "order-1",
+                "state": "filled",
+                "average_price": "10.01",
+                "cumulative_quantity": "1.998",
+            }]}},
+        ]
+        with patch("bot.day_trader.time.sleep"):
+            result = _place_limit_buy(session, "acct", "TEST", 20, 10.02)
+        kwargs = session.call.call_args_list[0].kwargs
+        self.assertEqual(kwargs["type"], "limit")
+        self.assertEqual(kwargs["limit_price"], "10.02")
+        self.assertEqual(result.fill_price, 10.01)
+
+    def test_far_watching_position_uses_slow_poll(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.current_price = 9.0
+        self.assertEqual(_position_poll_interval(pos), FAR_POLL_INTERVAL_S)
+
+    def test_near_watching_position_uses_fast_poll(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.current_price = 9.96
+        self.assertEqual(_position_poll_interval(pos), NEAR_POLL_INTERVAL_S)
+
+    def test_open_position_uses_fast_poll_for_risk_management(self):
+        self.assertEqual(_position_poll_interval(_open_pos()), NEAR_POLL_INTERVAL_S)
 
 
 if __name__ == "__main__":

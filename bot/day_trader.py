@@ -3,8 +3,9 @@ Day-trade engine — fully decoupled from swing trade logic.
 
 Strategy (all times US/Eastern):
   - Read PLAN signals from logs/signals.jsonl (kind == "PLAN").
-  - Every 60 s poll each ticker we're watching; buy $20 market order when
-    price crosses the trigger level.
+  - Poll adaptively (15 s normally, 5 s near a trigger/open position).
+  - When price crosses the trigger, buy with a protected limit order capped
+    slightly above the PLAN trigger; never chase a gap beyond that cap.
   - Stop-loss management after entry:
       * Initial stop: fill_price × 0.98  (-2 %)
       * Breakeven upgrade: when price holds ≥ fill × 1.03 for 2 consecutive
@@ -52,9 +53,14 @@ ET = ZoneInfo("America/New_York")
 # Constants
 # ------------------------------------------------------------------
 DAY_TRADE_BUDGET_USD = float(os.getenv("DAY_TRADE_BUDGET_USD", "20"))
-POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_POLL_INTERVAL_S", "60"))
+FAR_POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_FAR_POLL_INTERVAL_S", "15"))
+NEAR_POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_NEAR_POLL_INTERVAL_S", "5"))
+NEAR_TRIGGER_PCT = float(os.getenv("DAY_TRADE_NEAR_TRIGGER_PCT", "0.5"))
+ENTRY_LIMIT_OFFSET_PCT = float(os.getenv("DAY_TRADE_ENTRY_LIMIT_OFFSET_PCT", "0.2"))
+SCHEDULER_TICK_S = float(os.getenv("DAY_TRADE_SCHEDULER_TICK_S", "1"))
 SIGNALS_LOG = Path("logs/signals.jsonl")
 POSITIONS_LOG = Path("logs/day_trade_positions.jsonl")
+_RECONNECT_BACKOFF_S = (5, 10, 30)
 
 # Trailing-stop milestones: list of (threshold_pct, lock_in_pct) pairs.
 # "When price holds +threshold% for CONFIRM_POLLS, lock stop at +lock_in%."
@@ -83,7 +89,7 @@ _FORCE_CLOSE_MINUTE = 50
 class DayPosition:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     ticker: str = ""
-    status: str = "watching"          # watching | open | closed | expired
+    status: str = "watching"          # watching | pending_entry | open | closed | expired
 
     trigger_price: float | None = None
     target_price: float | None = None
@@ -93,6 +99,7 @@ class DayPosition:
 
     # Execution details
     buy_order_id: str | None = None
+    entry_limit_price: float | None = None
     fill_price: float | None = None
     fill_qty: float | None = None
     entered_at: str | None = None
@@ -124,6 +131,46 @@ class DayPosition:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "DayPosition":
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class DayTraderRuntime:
+    """Non-persistent connection and per-position scheduling state."""
+
+    session: _MCPSession | None = field(default=None, repr=False)
+    account_number: str | None = None
+    next_due: dict[str, float] = field(default_factory=dict)
+    consecutive_failures: int = 0
+    retry_not_before: float = 0.0
+
+    def connection(self) -> tuple[_MCPSession, str]:
+        if self.session is None or self.account_number is None:
+            self.session = _MCPSession(_load_token())
+            self.account_number = _get_agentic_account(self.session)
+        return self.session, self.account_number
+
+    def due_positions(self, positions: list[DayPosition]) -> list[DayPosition]:
+        now = time.monotonic()
+        return [p for p in positions if now >= self.next_due.get(p.id, 0.0)]
+
+    def schedule(self, pos: DayPosition) -> None:
+        self.next_due[pos.id] = time.monotonic() + _position_poll_interval(pos)
+
+    def can_request(self) -> bool:
+        return time.monotonic() >= self.retry_not_before
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+        self.retry_not_before = 0.0
+
+    def record_failure(self) -> float:
+        self.session = None
+        self.account_number = None
+        idx = min(self.consecutive_failures, len(_RECONNECT_BACKOFF_S) - 1)
+        delay = float(_RECONNECT_BACKOFF_S[idx])
+        self.consecutive_failures += 1
+        self.retry_not_before = time.monotonic() + delay
+        return delay
 
 
 # ------------------------------------------------------------------
@@ -234,28 +281,46 @@ def _load_new_plans(seen_ids: set[str]) -> list[Signal]:
 # Robinhood helpers (decoupled from swing shadow_reviewer)
 # ------------------------------------------------------------------
 
-def _get_price(session: _MCPSession, ticker: str) -> float | None:
-    """Return latest last-trade price for ticker, or None on error."""
-    try:
-        data = session.call("get_equity_quotes", symbols=[ticker])
-        results = data.get("data", {}).get("results", [])
-        if results:
-            # Quote data is nested: results[0]["quote"][field]
-            q = results[0].get("quote") or results[0]
-            ltp = q.get("last_trade_price")
-            if ltp is not None:
-                return float(ltp)
-            ask = q.get("ask_price")
-            bid = q.get("bid_price")
-            if ask is not None and bid is not None:
-                return (float(ask) + float(bid)) / 2
-            if ask is not None:
-                return float(ask)
-            if bid is not None:
-                return float(bid)
-    except Exception as exc:
-        log.warning("Price fetch failed for %s: %s", ticker, exc)
+def _quote_price(item: dict[str, Any]) -> float | None:
+    q = item.get("quote") or item
+    ltp = q.get("last_trade_price")
+    if ltp is not None:
+        return float(ltp)
+    ask = q.get("ask_price")
+    bid = q.get("bid_price")
+    if ask is not None and bid is not None:
+        return (float(ask) + float(bid)) / 2
+    if ask is not None:
+        return float(ask)
+    if bid is not None:
+        return float(bid)
     return None
+
+
+def _get_prices(session: _MCPSession, tickers: list[str]) -> dict[str, float]:
+    """Fetch all due ticker quotes in one Robinhood request."""
+    if not tickers:
+        return {}
+    symbols = list(dict.fromkeys(t.upper() for t in tickers))
+    data = session.call("get_equity_quotes", symbols=symbols)
+    results = data.get("data", {}).get("results", [])
+    prices: dict[str, float] = {}
+    for index, item in enumerate(results):
+        q = item.get("quote") or item
+        symbol = str(
+            item.get("symbol")
+            or q.get("symbol")
+            or q.get("instrument_symbol")
+            or ""
+        ).upper()
+        if not symbol and len(results) == len(symbols):
+            # Robinhood preserves request order even when a response omits the
+            # redundant symbol field.
+            symbol = symbols[index]
+        price = _quote_price(item)
+        if symbol and price is not None:
+            prices[symbol] = price
+    return prices
 
 
 def _get_agentic_account(session: _MCPSession) -> str:
@@ -267,16 +332,23 @@ def _get_agentic_account(session: _MCPSession) -> str:
     return agentic[0]["account_number"]
 
 
-def _place_market_buy(session: _MCPSession, account_number: str, ticker: str, usd: float) -> OrderResult:
-    """Place a $usd market buy for ticker. Returns OrderResult."""
+def _place_limit_buy(
+    session: _MCPSession,
+    account_number: str,
+    ticker: str,
+    usd: float,
+    limit_price: float,
+) -> OrderResult:
+    """Place a marketable dollar-based limit buy capped at ``limit_price``."""
     ref_id = str(uuid.uuid5(uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), f"daytrader:{ticker}:{time.time()}"))
     order_kwargs: dict[str, Any] = {
         "account_number": account_number,
         "symbol": ticker,
         "side": "buy",
-        "type": "market",
+        "type": "limit",
         "time_in_force": "gfd",
         "dollar_amount": str(usd),   # API requires string, not number
+        "limit_price": f"{limit_price:.2f}",
         "ref_id": ref_id,
     }
     resp = session.call("place_equity_order", **order_kwargs)
@@ -312,6 +384,40 @@ def _place_market_buy(session: _MCPSession, account_number: str, ticker: str, us
         fill_qty=fill_qty,
         fill_usd=round(fill_price * fill_qty, 4) if fill_price and fill_qty else None,
     )
+
+
+def _entry_limit_price(trigger_price: float) -> float:
+    """Maximum permitted entry price for a PLAN breakout."""
+    return round(trigger_price * (1 + ENTRY_LIMIT_OFFSET_PCT / 100), 2)
+
+
+def _poll_entry_order(
+    session: _MCPSession,
+    account_number: str,
+    ticker: str,
+    order_id: str,
+) -> OrderResult | None:
+    """Return the latest state of a previously submitted entry order."""
+    try:
+        data = session.call("get_equity_orders", account_number=account_number, symbol=ticker)
+        orders = data.get("data", {}).get("orders", [])
+        order = next((item for item in orders if item.get("id") == order_id), None)
+        if order is None:
+            return None
+        avg = order.get("average_price")
+        qty = order.get("cumulative_quantity")
+        fill_price = float(avg) if avg is not None else None
+        fill_qty = float(qty) if qty is not None else None
+        return OrderResult(
+            order_id=order_id,
+            state=order.get("state", "unknown"),
+            fill_price=fill_price,
+            fill_qty=fill_qty,
+            fill_usd=round(fill_price * fill_qty, 4) if fill_price and fill_qty else None,
+        )
+    except Exception as exc:
+        log.warning("Could not check entry order for %s: %s", ticker, exc)
+        return None
 
 
 def _place_stop_order(session: _MCPSession, account_number: str, ticker: str, qty: float, stop_price: float) -> str | None:
@@ -430,7 +536,69 @@ def _is_market_hours(now: datetime) -> bool:
     return (9, 30) <= (now.hour, now.minute) <= (16, 0)
 
 
-def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayPosition]:
+def _activate_filled_position(
+    session: _MCPSession,
+    account_number: str,
+    pos: DayPosition,
+    result: OrderResult,
+) -> bool:
+    """Move a filled entry into managed open-position state."""
+    if result.state.lower() == "partially_filled":
+        # Stop the unfilled remainder before managing the shares already bought.
+        # Re-read once after cancellation in case the final fill quantity changed.
+        _cancel_order(session, account_number, result.order_id)
+        latest = _poll_entry_order(
+            session, account_number, pos.ticker, result.order_id
+        )
+        if latest and latest.fill_price and latest.fill_qty:
+            result = latest
+    if not result.fill_price or not result.fill_qty:
+        return False
+
+    pos.buy_order_id = result.order_id
+    pos.fill_price = result.fill_price
+    pos.fill_qty = result.fill_qty
+    pos.entered_at = datetime.now(timezone.utc).isoformat()
+    pos.status = "open"
+    pos.high_water_mark = result.fill_price
+    pos.stop_price = round(result.fill_price * (1 - _INITIAL_STOP_PCT / 100), 4)
+    pos.stop_order_id = _place_stop_order(
+        session, account_number, pos.ticker, result.fill_qty, pos.stop_price
+    )
+    if pos.target_price:
+        pos.limit_order_id = _place_limit_sell(
+            session, account_number, pos.ticker, result.fill_qty, pos.target_price
+        )
+    log.info(
+        "Entered %s fill=%.4f stop=%.4f target=%s order=%s",
+        pos.ticker,
+        pos.fill_price,
+        pos.stop_price,
+        pos.target_price,
+        pos.buy_order_id,
+    )
+    return True
+
+
+def _position_poll_interval(pos: DayPosition) -> int:
+    """Return this ticker's own polling interval without affecting others."""
+    if pos.status in ("pending_entry", "open"):
+        return NEAR_POLL_INTERVAL_S
+    if (
+        pos.status == "watching"
+        and pos.trigger_price
+        and pos.current_price is not None
+        and abs(pos.current_price / pos.trigger_price - 1) * 100 <= NEAR_TRIGGER_PCT
+    ):
+        return NEAR_POLL_INTERVAL_S
+    return FAR_POLL_INTERVAL_S
+
+
+def run_once(
+    positions: list[DayPosition],
+    seen_plan_ids: set[str],
+    runtime: DayTraderRuntime | None = None,
+) -> list[DayPosition]:
     """
     Execute one iteration of the day-trade loop.
     Modifies `positions` in-place and returns it.
@@ -441,7 +609,10 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
     # 1. Ingest new PLAN signals.
     new_plans = _load_new_plans(seen_plan_ids)
     for sig in new_plans:
-        existing = [p for p in positions if p.ticker == sig.ticker and p.status in ("watching", "open")]
+        existing = [
+            p for p in positions
+            if p.ticker == sig.ticker and p.status in ("watching", "pending_entry", "open")
+        ]
         if existing:
             log.info("Already watching/open %s — skip new PLAN", sig.ticker)
             continue
@@ -460,28 +631,38 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
     if not _is_market_hours(now):
         return positions
 
-    # 2. Open MCP session once per iteration for all tickers.
+    active = [
+        pos for pos in positions
+        if pos.status in ("watching", "pending_entry", "open")
+    ]
+    due = runtime.due_positions(active) if runtime else active
+    if not due or (runtime and not runtime.can_request()):
+        return positions
+
+    # 2. Reuse one MCP session/account and batch all due quote requests.
     try:
-        token = _load_token()
-        session = _MCPSession(token)
-        account_number = _get_agentic_account(session)
+        if runtime:
+            session, account_number = runtime.connection()
+        else:
+            session = _MCPSession(_load_token())
+            account_number = _get_agentic_account(session)
+        prices = _get_prices(session, [pos.ticker for pos in due])
+        if runtime:
+            runtime.record_success()
     except Exception as exc:
-        log.error("Cannot open MCP session: %s", exc)
+        if runtime:
+            delay = runtime.record_failure()
+            log.error("Robinhood batch quote failed; retrying in %.0fs: %s", delay, exc)
+        else:
+            log.error("Cannot open MCP session or fetch quotes: %s", exc)
         return positions
 
     force_close = _is_force_close(now)
     eod_tighten = _is_eod_tighten(now)
     changed = False
 
-    for pos in positions:
-        if pos.status not in ("watching", "open"):
-            continue
-
-        try:
-            price = _get_price(session, pos.ticker)
-        except Exception as exc:
-            log.warning("Price error for %s: %s", pos.ticker, exc)
-            continue
+    for pos in due:
+        price = prices.get(pos.ticker.upper())
 
         if price is not None:
             if pos.current_price != price:
@@ -493,6 +674,23 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
                     pos.ticker, price, pos.trigger_price or 0,
                     (price / pos.trigger_price - 1) * 100 if pos.trigger_price else 0,
                 )
+        else:
+            log.warning("Batch quote missing %s; no new order decision", pos.ticker)
+
+        if runtime:
+            runtime.schedule(pos)
+
+        # --- Resolve a limit entry that remained pending after submission. ---
+        if pos.status == "pending_entry" and pos.buy_order_id:
+            result = _poll_entry_order(session, account_number, pos.ticker, pos.buy_order_id)
+            if result and _activate_filled_position(session, account_number, pos, result):
+                changed = True
+            elif result and result.state.lower() in {
+                "cancelled", "canceled", "rejected", "failed", "expired"
+            }:
+                pos.status = "expired"
+                pos.exit_reason = f"entry_{result.state.lower()}"
+                changed = True
 
         # --- Force close all open day trades at 3:50 pm ET ---
         if force_close and pos.status == "open" and pos.fill_qty:
@@ -518,48 +716,53 @@ def run_once(positions: list[DayPosition], seen_plan_ids: set[str]) -> list[DayP
             changed = True
             continue
 
-        # --- Entry: watching → open ---
+        if force_close and pos.status == "pending_entry":
+            if pos.buy_order_id:
+                _cancel_order(session, account_number, pos.buy_order_id)
+            pos.status = "expired"
+            pos.exit_reason = "entry_eod"
+            changed = True
+            continue
+
+        # --- Entry: watching -> protected limit order -> open ---
         if pos.status == "watching" and price is not None and pos.trigger_price is not None:
             if price >= pos.trigger_price:
+                limit_price = _entry_limit_price(pos.trigger_price)
+                pos.entry_limit_price = limit_price
+                if price > limit_price:
+                    log.warning(
+                        "SKIP GAP: %s price=%.4f exceeds max entry %.4f (trigger=%.4f)",
+                        pos.ticker, price, limit_price, pos.trigger_price,
+                    )
+                    pos.status = "expired"
+                    pos.exit_reason = "entry_gap_above_limit"
+                    changed = True
+                    continue
+
                 log.info(
-                    "TRIGGER: %s price=%.4f >= trigger=%.4f — buying $%.0f",
-                    pos.ticker, price, pos.trigger_price, DAY_TRADE_BUDGET_USD
+                    "TRIGGER: %s price=%.4f >= trigger=%.4f — limit buying $%.0f at max %.4f",
+                    pos.ticker, price, pos.trigger_price, DAY_TRADE_BUDGET_USD, limit_price,
                 )
                 try:
-                    result = _place_market_buy(session, account_number, pos.ticker, DAY_TRADE_BUDGET_USD)
+                    result = _place_limit_buy(
+                        session,
+                        account_number,
+                        pos.ticker,
+                        DAY_TRADE_BUDGET_USD,
+                        limit_price,
+                    )
                 except RobinhoodMCPError as exc:
                     log.error("Buy failed for %s: %s", pos.ticker, exc)
                     continue
 
                 pos.buy_order_id = result.order_id
-                pos.fill_price = result.fill_price
-                pos.fill_qty = result.fill_qty
-                pos.entered_at = datetime.now(timezone.utc).isoformat()
-                pos.status = "open"
-                pos.high_water_mark = result.fill_price
-
-                if result.fill_price:
-                    pos.stop_price = round(result.fill_price * (1 - _INITIAL_STOP_PCT / 100), 4)
-                    # Place stop order
-                    if pos.fill_qty:
-                        pos.stop_order_id = _place_stop_order(
-                            session, account_number, pos.ticker, pos.fill_qty, pos.stop_price
-                        )
-                    # Place limit sell at Will's target if provided
-                    if pos.target_price and pos.fill_qty:
-                        pos.limit_order_id = _place_limit_sell(
-                            session, account_number, pos.ticker, pos.fill_qty, pos.target_price
-                        )
-
+                if not _activate_filled_position(session, account_number, pos, result):
+                    pos.status = "pending_entry"
+                    log.info(
+                        "Entry order pending for %s at limit %.4f order=%s state=%s",
+                        pos.ticker, limit_price, result.order_id, result.state,
+                    )
                 changed = True
-                log.info(
-                    "Entered %s fill=%.4f stop=%.4f target=%s order=%s",
-                    pos.ticker,
-                    pos.fill_price or 0,
-                    pos.stop_price or 0,
-                    pos.target_price,
-                    pos.buy_order_id,
-                )
             continue
 
         # --- Open position management ---
@@ -695,17 +898,24 @@ def main() -> None:
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
 
     log.info(
-        "Day trader started. budget=$%.0f poll=%ds positions_log=%s",
-        DAY_TRADE_BUDGET_USD, POLL_INTERVAL_S, POSITIONS_LOG,
+        "Day trader started. budget=$%.0f poll=%ds/%ds tick=%.1fs near=%.2f%% entry_cap=%.2f%% positions_log=%s",
+        DAY_TRADE_BUDGET_USD,
+        FAR_POLL_INTERVAL_S,
+        NEAR_POLL_INTERVAL_S,
+        SCHEDULER_TICK_S,
+        NEAR_TRIGGER_PCT,
+        ENTRY_LIMIT_OFFSET_PCT,
+        POSITIONS_LOG,
     )
     positions = _load_positions()
+    runtime = DayTraderRuntime()
     seen_plan_ids: set[str] = {
         p.plan_signal_id for p in positions if p.plan_signal_id
     }
 
     while True:
         try:
-            run_once(positions, seen_plan_ids)
+            run_once(positions, seen_plan_ids, runtime)
         except Exception as exc:
             log.exception("run_once error: %s", exc)
         # Heartbeat: touch file so the API can detect we're alive
@@ -713,7 +923,7 @@ def main() -> None:
             HEARTBEAT_FILE.touch()
         except Exception:
             pass
-        time.sleep(POLL_INTERVAL_S)
+        time.sleep(SCHEDULER_TICK_S)
 
 
 if __name__ == "__main__":

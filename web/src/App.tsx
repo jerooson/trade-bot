@@ -51,7 +51,9 @@ export default function App() {
   }, [view, dash, planData, swingData, dayTradeData]);
 
   const activeDayTradesCount =
-    dayTradeData.positions.filter(p => p.status === "open" || p.status === "watching").length;
+    dayTradeData.positions.filter(
+      p => p.status === "open" || p.status === "watching" || p.status === "pending_entry"
+    ).length;
 
   return (
     <div className="relative min-h-screen">
