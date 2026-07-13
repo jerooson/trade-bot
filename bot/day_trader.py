@@ -89,7 +89,7 @@ _FORCE_CLOSE_MINUTE = 50
 class DayPosition:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     ticker: str = ""
-    status: str = "watching"          # watching | pending_entry | open | closed | expired
+    status: str = "watching"          # watching | pending_entry | open | pending_exit | closed | expired
 
     trigger_price: float | None = None
     target_price: float | None = None
@@ -121,6 +121,11 @@ class DayPosition:
     # Close details
     exit_price: float | None = None
     exit_reason: str | None = None    # stop | target | eod | manual
+    exit_order_id: str | None = None
+    exit_requested_at: str | None = None
+    exit_filled_qty: float = 0.0
+    exit_filled_value: float = 0.0
+    exit_last_error: str | None = None
     realized_pnl: float | None = None
     realized_pnl_pct: float | None = None
     closed_at: str | None = None
@@ -391,13 +396,13 @@ def _entry_limit_price(trigger_price: float) -> float:
     return round(trigger_price * (1 + ENTRY_LIMIT_OFFSET_PCT / 100), 2)
 
 
-def _poll_entry_order(
+def _poll_order(
     session: _MCPSession,
     account_number: str,
     ticker: str,
     order_id: str,
 ) -> OrderResult | None:
-    """Return the latest state of a previously submitted entry order."""
+    """Return the latest state of a previously submitted equity order."""
     try:
         data = session.call("get_equity_orders", account_number=account_number, symbol=ticker)
         orders = data.get("data", {}).get("orders", [])
@@ -416,7 +421,7 @@ def _poll_entry_order(
             fill_usd=round(fill_price * fill_qty, 4) if fill_price and fill_qty else None,
         )
     except Exception as exc:
-        log.warning("Could not check entry order for %s: %s", ticker, exc)
+        log.warning("Could not check order %s for %s: %s", order_id, ticker, exc)
         return None
 
 
@@ -425,7 +430,7 @@ def _place_stop_order(session: _MCPSession, account_number: str, ticker: str, qt
     Attempt a stop_market sell order. Returns order_id or None.
 
     Robinhood does not support stop orders on fractional positions — in that
-    case we return None and rely on the bot's 60-second price check to
+    case we return None and rely on the bot's fast price check to
     trigger a market-sell when the stop level is breached.
     """
     ref_id = str(uuid.uuid5(uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), f"daystop:{ticker}:{stop_price}"))
@@ -496,22 +501,193 @@ def _cancel_order(session: _MCPSession, account_number: str, order_id: str) -> N
         log.warning("Could not cancel order %s: %s", order_id, exc)
 
 
-def _market_sell_all(session: _MCPSession, account_number: str, ticker: str, qty: float) -> None:
-    ref_id = str(uuid.uuid5(uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), f"dayclose:{ticker}:{time.time()}"))
-    try:
-        session.call(
-            "place_equity_order",
-            account_number=account_number,
-            symbol=ticker,
-            side="sell",
-            type="market",
-            quantity=str(round(qty, 6)),
-            time_in_force="gfd",
-            ref_id=ref_id,
+def _market_sell_all(
+    session: _MCPSession,
+    account_number: str,
+    ticker: str,
+    qty: float,
+    ref_key: str,
+) -> OrderResult:
+    """Submit a market sell and return its acknowledged broker state.
+
+    ``ref_key`` is stable for the same logical exit attempt, so retrying after
+    an ambiguous network failure remains idempotent at the broker boundary.
+    """
+    ref_id = str(uuid.uuid5(
+        uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
+        f"dayclose:{ref_key}",
+    ))
+    response = session.call(
+        "place_equity_order",
+        account_number=account_number,
+        symbol=ticker,
+        side="sell",
+        type="market",
+        quantity=f"{qty:.6f}",
+        time_in_force="gfd",
+        ref_id=ref_id,
+    )
+    order = response.get("data", {}).get("order", {})
+    order_id = order.get("id") or response.get("id", "")
+    state = order.get("state") or response.get("state", "queued")
+    if not order_id:
+        raise RobinhoodMCPError(
+            f"place_equity_order returned no exit order id for {ticker}"
         )
-        log.info("EOD market-sell placed for %s qty=%.4f", ticker, qty)
+    average_price = order.get("average_price")
+    cumulative_quantity = order.get("cumulative_quantity")
+    fill_price = float(average_price) if average_price is not None else None
+    fill_qty = (
+        float(cumulative_quantity) if cumulative_quantity is not None else None
+    )
+    log.info(
+        "Exit market-sell acknowledged for %s qty=%.6f order=%s state=%s",
+        ticker,
+        qty,
+        order_id,
+        state,
+    )
+    return OrderResult(
+        order_id=order_id,
+        state=state,
+        fill_price=fill_price,
+        fill_qty=fill_qty,
+        fill_usd=(
+            round(fill_price * fill_qty, 4)
+            if fill_price is not None and fill_qty is not None
+            else None
+        ),
+    )
+
+
+_EXIT_TERMINAL_FAILURE_STATES = {
+    "cancelled", "canceled", "rejected", "failed", "expired",
+}
+_QTY_EPSILON = 0.000001
+
+
+def _remaining_exit_qty(pos: DayPosition) -> float:
+    return max(0.0, float(pos.fill_qty or 0) - pos.exit_filled_qty)
+
+
+def _finalize_exit(pos: DayPosition, fill_price: float, fill_qty: float) -> None:
+    """Close a position using broker-confirmed cumulative sale proceeds."""
+    total_qty = pos.exit_filled_qty + fill_qty
+    total_value = pos.exit_filled_value + fill_price * fill_qty
+    original_qty = float(pos.fill_qty or 0)
+    if original_qty <= 0 or total_qty + _QTY_EPSILON < original_qty:
+        raise ValueError(
+            f"Cannot finalize {pos.ticker}: sold {total_qty} of {original_qty}"
+        )
+    pos.exit_filled_qty = total_qty
+    pos.exit_filled_value = total_value
+    pos.exit_price = total_value / total_qty
+    pos.realized_pnl = round(
+        total_value - float(pos.fill_price or 0) * total_qty,
+        2,
+    )
+    pos.realized_pnl_pct = (
+        round((pos.exit_price - pos.fill_price) / pos.fill_price * 100, 3)
+        if pos.fill_price
+        else None
+    )
+    pos.exit_order_id = None
+    pos.exit_last_error = None
+    pos.status = "closed"
+    pos.closed_at = datetime.now(timezone.utc).isoformat()
+    log.info(
+        "Exit filled for %s reason=%s price=%.4f qty=%.6f pnl=%.2f",
+        pos.ticker,
+        pos.exit_reason,
+        pos.exit_price,
+        total_qty,
+        pos.realized_pnl,
+    )
+
+
+def _apply_exit_order_result(pos: DayPosition, result: OrderResult) -> bool:
+    """Apply an exit order update; return True when persisted state changed."""
+    state = result.state.lower()
+    if state == "filled" and result.fill_price is not None and result.fill_qty:
+        _finalize_exit(pos, result.fill_price, result.fill_qty)
+        return True
+
+    if state in _EXIT_TERMINAL_FAILURE_STATES:
+        if result.fill_price is not None and result.fill_qty:
+            pos.exit_filled_qty += result.fill_qty
+            pos.exit_filled_value += result.fill_price * result.fill_qty
+        pos.exit_order_id = None
+        remaining = _remaining_exit_qty(pos)
+        if remaining <= _QTY_EPSILON and pos.exit_filled_qty > 0:
+            _finalize_exit(pos, 0.0, 0.0)
+        else:
+            pos.exit_last_error = state
+            log.error(
+                "Exit order %s for %s ended state=%s; %.6f shares remain and will retry",
+                result.order_id,
+                pos.ticker,
+                state,
+                remaining,
+            )
+        return True
+
+    # queued/new/confirmed/partially_filled remain broker-managed and are
+    # checked again on the position's next five-second poll.
+    return False
+
+
+def _start_or_retry_exit(
+    session: _MCPSession,
+    account_number: str,
+    pos: DayPosition,
+    reason: str,
+) -> bool:
+    """Enter pending_exit and submit only the unsold remainder."""
+    changed = False
+    if pos.status != "pending_exit":
+        pos.status = "pending_exit"
+        pos.exit_reason = reason
+        pos.exit_requested_at = datetime.now(timezone.utc).isoformat()
+        pos.exit_last_error = None
+        if pos.stop_order_id:
+            _cancel_order(session, account_number, pos.stop_order_id)
+            pos.stop_order_id = None
+        if pos.limit_order_id:
+            _cancel_order(session, account_number, pos.limit_order_id)
+            pos.limit_order_id = None
+        changed = True
+
+    if pos.exit_order_id:
+        return changed
+
+    remaining = _remaining_exit_qty(pos)
+    if remaining <= _QTY_EPSILON:
+        if pos.exit_filled_qty > 0:
+            _finalize_exit(pos, 0.0, 0.0)
+        return True
+
+    ref_key = f"{pos.id}:{pos.exit_filled_qty:.6f}"
+    try:
+        result = _market_sell_all(
+            session,
+            account_number,
+            pos.ticker,
+            remaining,
+            ref_key,
+        )
     except Exception as exc:
-        log.error("EOD market-sell failed for %s: %s", ticker, exc)
+        pos.exit_last_error = str(exc)
+        log.error(
+            "Exit submission failed for %s; position remains pending_exit and will retry: %s",
+            pos.ticker,
+            exc,
+        )
+        return True
+
+    pos.exit_order_id = result.order_id
+    pos.exit_last_error = None
+    _apply_exit_order_result(pos, result)
+    return True
 
 
 # ------------------------------------------------------------------
@@ -547,7 +723,7 @@ def _activate_filled_position(
         # Stop the unfilled remainder before managing the shares already bought.
         # Re-read once after cancellation in case the final fill quantity changed.
         _cancel_order(session, account_number, result.order_id)
-        latest = _poll_entry_order(
+        latest = _poll_order(
             session, account_number, pos.ticker, result.order_id
         )
         if latest and latest.fill_price and latest.fill_qty:
@@ -582,7 +758,7 @@ def _activate_filled_position(
 
 def _position_poll_interval(pos: DayPosition) -> int:
     """Return this ticker's own polling interval without affecting others."""
-    if pos.status in ("pending_entry", "open"):
+    if pos.status in ("pending_entry", "open", "pending_exit"):
         return NEAR_POLL_INTERVAL_S
     if (
         pos.status == "watching"
@@ -611,7 +787,7 @@ def run_once(
     for sig in new_plans:
         existing = [
             p for p in positions
-            if p.ticker == sig.ticker and p.status in ("watching", "pending_entry", "open")
+            if p.ticker == sig.ticker and p.status in ("watching", "pending_entry", "open", "pending_exit")
         ]
         if existing:
             log.info("Already watching/open %s — skip new PLAN", sig.ticker)
@@ -633,7 +809,7 @@ def run_once(
 
     active = [
         pos for pos in positions
-        if pos.status in ("watching", "pending_entry", "open")
+        if pos.status in ("watching", "pending_entry", "open", "pending_exit")
     ]
     due = runtime.due_positions(active) if runtime else active
     if not due or (runtime and not runtime.can_request()):
@@ -682,7 +858,7 @@ def run_once(
 
         # --- Resolve a limit entry that remained pending after submission. ---
         if pos.status == "pending_entry" and pos.buy_order_id:
-            result = _poll_entry_order(session, account_number, pos.ticker, pos.buy_order_id)
+            result = _poll_order(session, account_number, pos.ticker, pos.buy_order_id)
             if result and _activate_filled_position(session, account_number, pos, result):
                 changed = True
             elif result and result.state.lower() in {
@@ -692,22 +868,29 @@ def run_once(
                 pos.exit_reason = f"entry_{result.state.lower()}"
                 changed = True
 
+        # --- Resolve or retry a broker-confirmed exit. ---
+        if pos.status == "pending_exit":
+            if pos.exit_order_id:
+                result = _poll_order(
+                    session, account_number, pos.ticker, pos.exit_order_id
+                )
+                if result is not None and _apply_exit_order_result(pos, result):
+                    changed = True
+            if pos.status == "pending_exit" and not pos.exit_order_id:
+                if _start_or_retry_exit(
+                    session,
+                    account_number,
+                    pos,
+                    pos.exit_reason or "unknown",
+                ):
+                    changed = True
+            continue
+
         # --- Force close all open day trades at 3:50 pm ET ---
         if force_close and pos.status == "open" and pos.fill_qty:
             log.info("Force-closing %s at EOD (price=%.4f)", pos.ticker, price or 0)
-            if pos.stop_order_id:
-                _cancel_order(session, account_number, pos.stop_order_id)
-            if pos.limit_order_id:
-                _cancel_order(session, account_number, pos.limit_order_id)
-            _market_sell_all(session, account_number, pos.ticker, pos.fill_qty)
-            pos.status = "closed"
-            pos.exit_reason = "eod"
-            pos.exit_price = price
-            if pos.fill_price and price:
-                pos.realized_pnl = round((price - pos.fill_price) * (pos.fill_qty or 0), 2)
-                pos.realized_pnl_pct = round((price - pos.fill_price) / pos.fill_price * 100, 3)
-            pos.closed_at = datetime.now(timezone.utc).isoformat()
-            changed = True
+            if _start_or_retry_exit(session, account_number, pos, "eod"):
+                changed = True
             continue
 
         # --- Expire watching plans at EOD ---
@@ -771,47 +954,71 @@ def run_once(
             if pos.high_water_mark is None or price > pos.high_water_mark:
                 pos.high_water_mark = price
 
+            # A broker-managed stop owns the exit while it remains active.
+            # Never place a second market sell simply because the quote crossed
+            # the stop before the broker order status update reached us.
+            if pos.stop_order_id:
+                stop_result = _poll_order(
+                    session, account_number, pos.ticker, pos.stop_order_id
+                )
+                if (
+                    stop_result
+                    and stop_result.state.lower() == "filled"
+                    and stop_result.fill_price is not None
+                    and stop_result.fill_qty
+                ):
+                    pos.exit_reason = "stop"
+                    pos.exit_order_id = pos.stop_order_id
+                    pos.stop_order_id = None
+                    _finalize_exit(
+                        pos, stop_result.fill_price, stop_result.fill_qty
+                    )
+                    changed = True
+                    continue
+                if (
+                    stop_result
+                    and stop_result.state.lower() in _EXIT_TERMINAL_FAILURE_STATES
+                ):
+                    log.warning(
+                        "Broker stop %s for %s ended state=%s; reverting to bot-managed stop",
+                        pos.stop_order_id,
+                        pos.ticker,
+                        stop_result.state,
+                    )
+                    pos.stop_order_id = None
+                    changed = True
+                elif pos.stop_price and price <= pos.stop_price:
+                    pos.status = "pending_exit"
+                    pos.exit_reason = "stop"
+                    pos.exit_requested_at = datetime.now(timezone.utc).isoformat()
+                    pos.exit_order_id = pos.stop_order_id
+                    pos.stop_order_id = None
+                    changed = True
+                    continue
+
             # Check if stop was hit (for Robinhood-managed stop orders we
             # detect this by polling the order status, but as a safety net
             # we also check price directly).
             if pos.stop_price and price <= pos.stop_price:
                 log.info("Stop triggered for %s price=%.4f stop=%.4f — market selling", pos.ticker, price, pos.stop_price)
-                if pos.stop_order_id:
-                    _cancel_order(session, account_number, pos.stop_order_id)
-                if pos.limit_order_id:
-                    _cancel_order(session, account_number, pos.limit_order_id)
-                if pos.fill_qty:
-                    _market_sell_all(session, account_number, pos.ticker, pos.fill_qty)
-                pos.status = "closed"
-                pos.exit_reason = "stop"
-                pos.exit_price = price
-                pos.realized_pnl = round((price - pos.fill_price) * (pos.fill_qty or 0), 2)
-                pos.realized_pnl_pct = round((price - pos.fill_price) / pos.fill_price * 100, 3)
-                pos.closed_at = datetime.now(timezone.utc).isoformat()
-                changed = True
+                if _start_or_retry_exit(session, account_number, pos, "stop"):
+                    changed = True
                 continue
 
             # Bot-managed target check: sell when price hits Will's target.
             # (Robinhood rejects limit orders on fractional qty, so we monitor
             # the target via price polling and market-sell when hit.)
-            if pos.target_price and price >= pos.target_price:
+            if (
+                pos.target_price
+                and price >= pos.target_price
+                and not pos.limit_order_id
+            ):
                 log.info(
                     "Target hit for %s: price=%.4f >= target=%.4f — market selling",
                     pos.ticker, price, pos.target_price,
                 )
-                if pos.stop_order_id:
-                    _cancel_order(session, account_number, pos.stop_order_id)
-                if pos.limit_order_id:
-                    _cancel_order(session, account_number, pos.limit_order_id)
-                if pos.fill_qty:
-                    _market_sell_all(session, account_number, pos.ticker, pos.fill_qty)
-                pos.status = "closed"
-                pos.exit_reason = "target"
-                pos.exit_price = price
-                pos.realized_pnl = round((price - pos.fill_price) * (pos.fill_qty or 0), 2)
-                pos.realized_pnl_pct = round((price - pos.fill_price) / pos.fill_price * 100, 3)
-                pos.closed_at = datetime.now(timezone.utc).isoformat()
-                changed = True
+                if _start_or_retry_exit(session, account_number, pos, "target"):
+                    changed = True
                 continue
 
             # Also poll broker limit order if one was placed (for whole-share positions)
@@ -822,15 +1029,40 @@ def run_once(
                     tgt_order = next((o for o in orders if o.get("id") == pos.limit_order_id), None)
                     if tgt_order and tgt_order.get("state") == "filled":
                         fill_p = float(tgt_order.get("average_price") or price)
+                        fill_q = float(
+                            tgt_order.get("cumulative_quantity")
+                            or pos.fill_qty
+                            or 0
+                        )
                         log.info("Limit order filled for %s at %.4f", pos.ticker, fill_p)
                         if pos.stop_order_id:
                             _cancel_order(session, account_number, pos.stop_order_id)
-                        pos.status = "closed"
                         pos.exit_reason = "target"
-                        pos.exit_price = fill_p
-                        pos.realized_pnl = round((fill_p - pos.fill_price) * (pos.fill_qty or 0), 2)
-                        pos.realized_pnl_pct = round((fill_p - pos.fill_price) / pos.fill_price * 100, 3)
-                        pos.closed_at = datetime.now(timezone.utc).isoformat()
+                        pos.exit_order_id = pos.limit_order_id
+                        pos.limit_order_id = None
+                        pos.stop_order_id = None
+                        _finalize_exit(pos, fill_p, fill_q)
+                        changed = True
+                        continue
+                    if (
+                        tgt_order
+                        and str(tgt_order.get("state", "")).lower()
+                        in _EXIT_TERMINAL_FAILURE_STATES
+                    ):
+                        log.warning(
+                            "Broker target %s for %s ended state=%s; reverting to bot-managed target",
+                            pos.limit_order_id,
+                            pos.ticker,
+                            tgt_order.get("state"),
+                        )
+                        pos.limit_order_id = None
+                        changed = True
+                    elif pos.target_price and price >= pos.target_price:
+                        pos.status = "pending_exit"
+                        pos.exit_reason = "target"
+                        pos.exit_requested_at = datetime.now(timezone.utc).isoformat()
+                        pos.exit_order_id = pos.limit_order_id
+                        pos.limit_order_id = None
                         changed = True
                         continue
                 except Exception as exc:

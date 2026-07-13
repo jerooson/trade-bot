@@ -63,7 +63,7 @@ def _load_context(log_dir: Path = LOG_DIR) -> dict[str, Any]:
                 pass
     ctx["day_trades"] = [
         v for v in all_recs.values()
-        if v.get("status") in ("open", "watching", "pending_entry")
+        if v.get("status") in ("open", "watching", "pending_entry", "pending_exit")
     ]
 
     # Recent signals today (last 10)

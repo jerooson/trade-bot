@@ -169,7 +169,7 @@ export interface ProposedOrder {
 
 // -- Day trade types ----------------------------------------------------------
 
-export type DayTradeStatus = "watching" | "pending_entry" | "open" | "closed" | "expired";
+export type DayTradeStatus = "watching" | "pending_entry" | "open" | "pending_exit" | "closed" | "expired";
 
 export interface DayTradePosition {
   id: string;
@@ -189,6 +189,11 @@ export interface DayTradePosition {
   current_price: number | null;
   exit_price: number | null;
   exit_reason: string | null;    // "stop", "target", "eod", "manual"
+  exit_order_id: string | null;
+  exit_requested_at: string | null;
+  exit_filled_qty: number;
+  exit_filled_value: number;
+  exit_last_error: string | null;
   realized_pnl: number | null;
   realized_pnl_pct: number | null;
   closed_at: string | null;

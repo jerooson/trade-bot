@@ -52,7 +52,7 @@ export default function App() {
 
   const activeDayTradesCount =
     dayTradeData.positions.filter(
-      p => p.status === "open" || p.status === "watching" || p.status === "pending_entry"
+      p => p.status === "open" || p.status === "watching" || p.status === "pending_entry" || p.status === "pending_exit"
     ).length;
 
   return (

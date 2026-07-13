@@ -16,7 +16,7 @@ interface Props {
 export function DayTradeView({ dash, positions, pnl, serviceRunning }: Props) {
   const [sub, setSub] = useState<SubTab>("plans");
 
-  const openCount = positions.filter((p) => p.status === "open").length;
+  const openCount = positions.filter((p) => p.status === "open" || p.status === "pending_exit").length;
   const totalPnl = pnl?.total_realized_pnl ?? 0;
 
   return (
@@ -109,7 +109,7 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
   }
 
   const watching = positions.filter((p) => p.status === "watching" || p.status === "pending_entry");
-  const open = positions.filter((p) => p.status === "open");
+  const open = positions.filter((p) => p.status === "open" || p.status === "pending_exit");
   const closed = positions.filter((p) => p.status === "closed");
 
   return (
@@ -142,7 +142,7 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
       )}
 
       {open.length > 0 && (
-        <Section title="Open Positions" subtitle="in market — stop loss active">
+        <Section title="Open Positions" subtitle="in market — stop loss / broker exit tracking active">
           <div className="flex flex-col">
             <GridHeader cols={["ticker", "fill", "stop", "high", "p&l est.", "since"]} spans={[2,2,2,2,2,2]} />
             {open.map((p) => {
@@ -153,7 +153,11 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
                 <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
                   <div className="col-span-2 font-editorial text-xl italic text-bone-50">{p.ticker}</div>
                   <div className="col-span-2 tabular text-sm text-bone-200">${p.fill_price?.toFixed(2) ?? "—"}</div>
-                  <div className="col-span-2 tabular text-sm text-crt-short">${p.stop_price?.toFixed(2) ?? "—"}</div>
+                  <div className="col-span-2 tabular text-sm text-crt-short">
+                    {p.status === "pending_exit"
+                      ? `selling · ${p.exit_reason ?? "exit"}`
+                      : `$${p.stop_price?.toFixed(2) ?? "—"}`}
+                  </div>
                   <div className="col-span-2 tabular text-sm text-bone-400">${p.high_water_mark?.toFixed(2) ?? "—"}</div>
                   <div className="col-span-2">
                     {pnlEst != null ? (

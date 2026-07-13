@@ -33,9 +33,11 @@ from bot.day_trader import (
     NEAR_POLL_INTERVAL_S,
     DayTraderRuntime,
     DayPosition,
+    _apply_exit_order_result,
     _get_prices,
     _position_poll_interval,
     _place_limit_buy,
+    _start_or_retry_exit,
     run_once,
 )
 from bot.robinhood_mcp_client import OrderResult
@@ -139,6 +141,13 @@ class _Base(unittest.TestCase):
             m_dt.now.return_value = now
             # Keep datetime constructor and other methods working
             m_dt.side_effect = lambda *a, **k: __import__("datetime").datetime(*a, **k)
+            m_sell.side_effect = lambda _s, _a, _t, qty, _ref: OrderResult(
+                order_id="sell-001",
+                state="filled",
+                fill_price=price,
+                fill_qty=qty,
+                fill_usd=price * qty,
+            )
 
             run_once(positions, set())
 
@@ -263,7 +272,7 @@ class TestStopLoss(_Base):
         """THE BUG: price ≤ stop MUST call _market_sell_all."""
         pos = _open_pos(fill=10.0, stop=9.8, qty=2.0)
         positions, m = self._run([pos], price=9.79)
-        m["sell"].assert_called_once_with(unittest.mock.ANY, "acct", "TEST", 2.0)
+        self.assertEqual(m["sell"].call_args.args[:4], (unittest.mock.ANY, "acct", "TEST", 2.0))
 
     def test_stop_closes_position(self):
         """Position status becomes 'closed' after stop."""
@@ -281,11 +290,14 @@ class TestStopLoss(_Base):
         self.assertAlmostEqual(pos.exit_price, exit_p)
         self.assertAlmostEqual(pos.realized_pnl, (exit_p - fill) * qty, places=4)
 
-    def test_stop_cancels_existing_stop_order(self):
-        """If a broker stop order exists, it's cancelled before market sell."""
+    def test_stop_tracks_existing_broker_stop_without_duplicate_sell(self):
+        """A broker stop already owns the exit; never submit a duplicate sell."""
         pos = _open_pos(fill=10.0, stop=9.8, qty=2.0, stop_order_id="stp-999")
         positions, m = self._run([pos], price=9.7)
-        m["cancel"].assert_any_call(unittest.mock.ANY, "acct", "stp-999")
+        self.assertEqual(pos.status, "pending_exit")
+        self.assertEqual(pos.exit_order_id, "stp-999")
+        m["cancel"].assert_not_called()
+        m["sell"].assert_not_called()
 
     def test_stop_cancels_existing_limit_order(self):
         """If a broker limit order exists, it's cancelled on stop."""
@@ -322,7 +334,7 @@ class TestTarget(_Base):
         """price ≥ target MUST call _market_sell_all."""
         pos = _open_pos(fill=10.0, stop=9.8, qty=2.0, target=12.0)
         positions, m = self._run([pos], price=12.0)
-        m["sell"].assert_called_once_with(unittest.mock.ANY, "acct", "TEST", 2.0)
+        self.assertEqual(m["sell"].call_args.args[:4], (unittest.mock.ANY, "acct", "TEST", 2.0))
 
     def test_target_hit_closes_position_as_target(self):
         pos = _open_pos(fill=10.0, stop=9.8, qty=2.0, target=12.0)
@@ -352,7 +364,7 @@ class TestForceClose(_Base):
         """At 3:50 pm ET, open positions MUST be market-sold."""
         pos = _open_pos(fill=10.0, stop=9.8, qty=2.5)
         positions, m = self._run([pos], now=ET_FORCE_CLOSE, price=10.5)
-        m["sell"].assert_called_once_with(unittest.mock.ANY, "acct", "TEST", 2.5)
+        self.assertEqual(m["sell"].call_args.args[:4], (unittest.mock.ANY, "acct", "TEST", 2.5))
 
     def test_force_close_sets_exit_reason_eod(self):
         pos = _open_pos(fill=10.0, stop=9.8, qty=2.5)
@@ -389,6 +401,92 @@ class TestForceClose(_Base):
         positions, m = self._run([pos], now=ET_MARKET_OPEN, price=10.5)
         m["sell"].assert_not_called()
         self.assertEqual(pos.status, "open")
+
+
+class TestBrokerConfirmedExit(unittest.TestCase):
+
+    def test_queued_sell_remains_pending_exit(self):
+        pos = _open_pos(fill=10.0, stop=9.8, qty=2.0)
+        session = MagicMock()
+        with patch(
+            "bot.day_trader._market_sell_all",
+            return_value=OrderResult("sell-1", "queued", None, None, None),
+        ):
+            changed = _start_or_retry_exit(session, "acct", pos, "stop")
+        self.assertTrue(changed)
+        self.assertEqual(pos.status, "pending_exit")
+        self.assertEqual(pos.exit_order_id, "sell-1")
+        self.assertIsNone(pos.realized_pnl)
+        self.assertIsNone(pos.closed_at)
+
+    def test_filled_sell_uses_actual_broker_fill(self):
+        pos = _open_pos(fill=10.0, stop=9.8, qty=2.0)
+        pos.status = "pending_exit"
+        pos.exit_reason = "stop"
+        pos.exit_order_id = "sell-1"
+        changed = _apply_exit_order_result(
+            pos,
+            OrderResult("sell-1", "filled", 9.73, 2.0, 19.46),
+        )
+        self.assertTrue(changed)
+        self.assertEqual(pos.status, "closed")
+        self.assertAlmostEqual(pos.exit_price, 9.73)
+        self.assertEqual(pos.realized_pnl, -0.54)
+        self.assertAlmostEqual(pos.realized_pnl_pct, -2.7)
+
+    def test_rejected_sell_stays_pending_and_retries(self):
+        pos = _open_pos(fill=10.0, stop=9.8, qty=2.0)
+        pos.status = "pending_exit"
+        pos.exit_reason = "stop"
+        pos.exit_order_id = "sell-rejected"
+        _apply_exit_order_result(
+            pos,
+            OrderResult("sell-rejected", "rejected", None, None, None),
+        )
+        self.assertEqual(pos.status, "pending_exit")
+        self.assertIsNone(pos.exit_order_id)
+        self.assertEqual(pos.exit_last_error, "rejected")
+
+        with patch(
+            "bot.day_trader._market_sell_all",
+            return_value=OrderResult("sell-retry", "queued", None, None, None),
+        ) as sell:
+            _start_or_retry_exit(MagicMock(), "acct", pos, "stop")
+        self.assertEqual(sell.call_args.args[3], 2.0)
+        self.assertEqual(pos.exit_order_id, "sell-retry")
+
+    def test_terminal_partial_fill_retries_only_remainder(self):
+        pos = _open_pos(fill=10.0, stop=9.8, qty=2.0)
+        pos.status = "pending_exit"
+        pos.exit_reason = "stop"
+        pos.exit_order_id = "sell-partial"
+        _apply_exit_order_result(
+            pos,
+            OrderResult("sell-partial", "cancelled", 9.75, 0.75, 7.3125),
+        )
+        self.assertEqual(pos.exit_filled_qty, 0.75)
+        self.assertIsNone(pos.exit_order_id)
+
+        with patch(
+            "bot.day_trader._market_sell_all",
+            return_value=OrderResult("sell-rest", "filled", 9.70, 1.25, 12.125),
+        ) as sell:
+            _start_or_retry_exit(MagicMock(), "acct", pos, "stop")
+        self.assertAlmostEqual(sell.call_args.args[3], 1.25)
+        self.assertEqual(pos.status, "closed")
+        self.assertAlmostEqual(pos.exit_price, (9.75 * 0.75 + 9.70 * 1.25) / 2)
+
+    def test_submission_failure_never_marks_position_closed(self):
+        pos = _open_pos(fill=10.0, stop=9.8, qty=2.0)
+        with patch(
+            "bot.day_trader._market_sell_all",
+            side_effect=RuntimeError("temporary broker error"),
+        ):
+            _start_or_retry_exit(MagicMock(), "acct", pos, "stop")
+        self.assertEqual(pos.status, "pending_exit")
+        self.assertIsNone(pos.exit_order_id)
+        self.assertIn("temporary broker error", pos.exit_last_error or "")
+        self.assertIsNone(pos.realized_pnl)
 
 
 # ===========================================================================
