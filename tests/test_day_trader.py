@@ -27,6 +27,7 @@ from bot.day_trader import (
     DAY_TRADE_BUDGET_USD,
     _CONFIRM_POLLS,
     _INITIAL_STOP_PCT,
+    _STOP_POLICY_VERSION,
     _TRAILING_MILESTONES,
     ENTRY_ORDER_TTL_S,
     ENTRY_LIMIT_OFFSET_PCT,
@@ -37,6 +38,7 @@ from bot.day_trader import (
     _apply_entry_order_result,
     _apply_exit_order_result,
     _get_prices,
+    _migrate_stop_policy,
     _position_poll_interval,
     _place_limit_buy,
     _start_or_retry_exit,
@@ -56,7 +58,8 @@ ET_WEEKEND = datetime(2026, 6, 14, 10, 0, tzinfo=__import__("zoneinfo").ZoneInfo
 
 
 def _open_pos(fill=10.0, stop=9.8, qty=2.0, target=None, stop_order_id=None, limit_order_id=None,
-              milestone_idx=0, confirm_count=0, eod_tightened=False) -> DayPosition:
+              milestone_idx=0, confirm_count=0, confirm_milestone_idx=None,
+              eod_tightened=False) -> DayPosition:
     """Return a fully-entered open DayPosition."""
     return DayPosition(
         ticker="TEST",
@@ -72,6 +75,7 @@ def _open_pos(fill=10.0, stop=9.8, qty=2.0, target=None, stop_order_id=None, lim
         limit_order_id=limit_order_id,
         milestone_idx=milestone_idx,
         confirm_count=confirm_count,
+        confirm_milestone_idx=confirm_milestone_idx,
         eod_tightened=eod_tightened,
         plan_received_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -664,20 +668,21 @@ class TestEodTighten(_Base):
 class TestTrailingStop(_Base):
 
     def test_first_milestone_confirm_count_increments(self):
-        """First time price hits +3%, confirm_count goes to 1 (not yet upgraded)."""
+        """First time price hits +1%, confirm_count goes to 1 (not yet upgraded)."""
         fill = 10.0
         pos = _open_pos(fill=fill, stop=fill * 0.98, qty=2.0)
-        threshold = fill * (1 + _TRAILING_MILESTONES[0][0] / 100)  # +3%
+        threshold = fill * (1 + _TRAILING_MILESTONES[0][0] / 100)  # +1%
         positions, m = self._run([pos], price=threshold)
         self.assertEqual(pos.confirm_count, 1)
         self.assertEqual(pos.stop_price, round(fill * 0.98, 4))  # not yet upgraded
 
     def test_second_confirm_upgrades_stop(self):
-        """After CONFIRM_POLLS consecutive polls at +3%, stop is upgraded."""
+        """After CONFIRM_POLLS consecutive polls at +1%, stop is upgraded."""
         fill = 10.0
-        lock_in_pct = _TRAILING_MILESTONES[0][1]  # 0.5%
+        lock_in_pct = _TRAILING_MILESTONES[0][1]  # -0.5%
         pos = _open_pos(fill=fill, stop=fill * 0.98, qty=2.0,
-                        confirm_count=_CONFIRM_POLLS - 1)
+                        confirm_count=_CONFIRM_POLLS - 1,
+                        confirm_milestone_idx=0)
         threshold = fill * (1 + _TRAILING_MILESTONES[0][0] / 100)
         positions, m = self._run([pos], price=threshold + 0.01)
         expected_new_stop = round(fill * (1 + lock_in_pct / 100), 4)
@@ -688,8 +693,11 @@ class TestTrailingStop(_Base):
     def test_dip_resets_confirm_count(self):
         """If price dips below milestone threshold, confirm_count resets."""
         fill = 10.0
-        pos = _open_pos(fill=fill, stop=fill * 0.98, qty=2.0, confirm_count=1)
-        below_threshold = fill * 1.02  # below +3% milestone
+        pos = _open_pos(
+            fill=fill, stop=fill * 0.98, qty=2.0,
+            confirm_count=1, confirm_milestone_idx=0,
+        )
+        below_threshold = fill * 1.005  # below +1% milestone
         positions, m = self._run([pos], price=below_threshold)
         self.assertEqual(pos.confirm_count, 0)
 
@@ -698,19 +706,70 @@ class TestTrailingStop(_Base):
         fill = 10.0
         pos = _open_pos(fill=fill, stop=fill * 0.98, qty=2.0,
                         stop_order_id="old-stop",
-                        confirm_count=_CONFIRM_POLLS - 1)
+                        confirm_count=_CONFIRM_POLLS - 1,
+                        confirm_milestone_idx=0)
         threshold = fill * (1 + _TRAILING_MILESTONES[0][0] / 100)
         positions, m = self._run([pos], price=threshold + 0.01)
         m["cancel"].assert_any_call(unittest.mock.ANY, "acct", "old-stop")
 
     def test_multiple_milestones_advance_correctly(self):
-        """Starting at milestone 1, confirming +6% advances to milestone 2."""
+        """Starting at milestone 1, confirming +2% advances to milestone 2."""
         fill = 10.0
-        pos = _open_pos(fill=fill, stop=round(fill * 1.005, 4), qty=2.0,
-                        milestone_idx=1, confirm_count=_CONFIRM_POLLS - 1)
-        threshold = fill * (1 + _TRAILING_MILESTONES[1][0] / 100)  # +6%
+        pos = _open_pos(fill=fill, stop=round(fill * 0.995, 4), qty=2.0,
+                        milestone_idx=1, confirm_count=_CONFIRM_POLLS - 1,
+                        confirm_milestone_idx=1)
+        threshold = fill * (1 + _TRAILING_MILESTONES[1][0] / 100)  # +2%
         positions, m = self._run([pos], price=threshold + 0.01)
         self.assertEqual(pos.milestone_idx, 2)
+        self.assertEqual(pos.stop_price, round(fill * 1.002, 4))
+
+    def test_early_risk_reduction_policy_is_explicit(self):
+        self.assertEqual(
+            _TRAILING_MILESTONES[:4],
+            [(1.0, -0.5), (2.0, 0.2), (3.0, 0.5), (6.0, 3.0)],
+        )
+
+    def test_confirmed_three_percent_locks_half_percent(self):
+        fill = 10.0
+        pos = _open_pos(
+            fill=fill,
+            stop=round(fill * 1.002, 4),
+            qty=2.0,
+            milestone_idx=2,
+            confirm_count=_CONFIRM_POLLS - 1,
+            confirm_milestone_idx=2,
+        )
+        positions, m = self._run([pos], price=fill * 1.031)
+        self.assertEqual(pos.milestone_idx, 3)
+        self.assertEqual(pos.stop_price, round(fill * 1.005, 4))
+
+    def test_price_jump_confirms_highest_reached_milestone_without_delay(self):
+        fill = 10.0
+        pos = _open_pos(
+            fill=fill,
+            stop=fill * 0.98,
+            qty=2.0,
+            milestone_idx=0,
+            confirm_count=_CONFIRM_POLLS - 1,
+            confirm_milestone_idx=2,
+        )
+        self._run([pos], price=fill * 1.031)
+        self.assertEqual(pos.milestone_idx, 3)
+        self.assertEqual(pos.stop_price, round(fill * 1.005, 4))
+
+    def test_old_policy_position_keeps_existing_stop_and_skips_lower_steps(self):
+        pos = _open_pos(fill=10.0, stop=10.05, qty=2.0, milestone_idx=1)
+        pos.stop_policy_version = 1
+        self.assertTrue(_migrate_stop_policy(pos))
+        self.assertEqual(pos.stop_price, 10.05)
+        self.assertEqual(pos.milestone_idx, 3)  # next useful step is +6% -> +3%
+        self.assertEqual(pos.stop_policy_version, _STOP_POLICY_VERSION)
+
+    def test_legacy_json_is_marked_for_policy_migration(self):
+        data = _open_pos(fill=10.0, stop=10.05, qty=2.0).to_dict()
+        data.pop("stop_policy_version")
+        restored = DayPosition.from_dict(data)
+        self.assertEqual(restored.stop_policy_version, 1)
 
 
 # ===========================================================================

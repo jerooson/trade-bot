@@ -10,10 +10,10 @@ Strategy (all times US/Eastern):
     fails, the order times out, or only a partial fill is obtained.
   - Stop-loss management after entry:
       * Initial stop: fill_price × 0.98  (-2 %)
-      * Breakeven upgrade: when price holds ≥ fill × 1.03 for 2 consecutive
-        polls → move stop to fill × 1.005 (entry + buffer)
-      * Stepped trailing: each subsequent +3 % milestone confirmed by 2 polls
-        locks in the previous level (fill×1.005 → fill×1.03 → fill×1.06 …)
+      * Early risk reduction: confirmed +1 % moves the stop to -0.5 %;
+        confirmed +2 % moves it to +0.2 %; confirmed +3 % locks +0.5 %.
+      * Larger moves keep the existing stepped trail (+6 % locks +3 %,
+        +9 % locks +6 %, and so on).
   - Will's target: if PLAN has a target price, place a limit sell at that level
     immediately after entry (in addition to the stop).
   - EOD tightening: after 3:30 pm ET, tighten trailing to current × 0.99.
@@ -68,6 +68,8 @@ _RECONNECT_BACKOFF_S = (5, 10, 30)
 # Trailing-stop milestones: list of (threshold_pct, lock_in_pct) pairs.
 # "When price holds +threshold% for CONFIRM_POLLS, lock stop at +lock_in%."
 _TRAILING_MILESTONES = [
+    (1.0, -0.5),  # price +1% → reduce initial risk from -2% to -0.5%
+    (2.0, 0.2),   # price +2% → protect entry plus a small fill buffer
     (3.0, 0.5),   # price +3% → lock stop at entry+0.5%
     (6.0, 3.0),   # price +6% → lock stop at entry+3%
     (9.0, 6.0),   # price +9% → lock stop at entry+6%
@@ -78,6 +80,7 @@ _TRAILING_MILESTONES = [
 ]
 _CONFIRM_POLLS = 2       # number of consecutive polls needed to confirm milestone
 _INITIAL_STOP_PCT = 2.0
+_STOP_POLICY_VERSION = 2
 _EOD_TIGHT_HOUR = 15     # 3 pm ET
 _EOD_TIGHT_MINUTE = 30
 _FORCE_CLOSE_HOUR = 15
@@ -123,6 +126,8 @@ class DayPosition:
     current_price: float | None = None
     milestone_idx: int = 0            # next milestone to watch for
     confirm_count: int = 0            # consecutive polls at/above next milestone
+    confirm_milestone_idx: int | None = None
+    stop_policy_version: int = _STOP_POLICY_VERSION
 
     # EOD flag
     eod_tightened: bool = False
@@ -144,7 +149,11 @@ class DayPosition:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "DayPosition":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        values = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        # Records written before P2 used a different milestone index layout.
+        if "stop_policy_version" not in d:
+            values["stop_policy_version"] = 1
+        return cls(**values)
 
 
 @dataclass
@@ -920,6 +929,31 @@ def _submit_or_recover_entry(
     return True
 
 
+def _migrate_stop_policy(pos: DayPosition) -> bool:
+    """Map an older position to the first new milestone that raises its stop."""
+    if pos.stop_policy_version >= _STOP_POLICY_VERSION:
+        return False
+    current_stop = float(pos.stop_price or 0)
+    fill_price = float(pos.fill_price or 0)
+    if fill_price > 0:
+        pos.milestone_idx = len(_TRAILING_MILESTONES)
+        for idx, (_, lock_in_pct) in enumerate(_TRAILING_MILESTONES):
+            candidate = round(fill_price * (1 + lock_in_pct / 100), 4)
+            if candidate > current_stop:
+                pos.milestone_idx = idx
+                break
+    pos.confirm_count = 0
+    pos.confirm_milestone_idx = None
+    pos.stop_policy_version = _STOP_POLICY_VERSION
+    log.info(
+        "Migrated stop policy for %s; current stop=%.4f next milestone=%d",
+        pos.ticker,
+        current_stop,
+        pos.milestone_idx,
+    )
+    return True
+
+
 def _position_poll_interval(pos: DayPosition) -> int:
     """Return this ticker's own polling interval without affecting others."""
     if pos.status in ("pending_entry", "open", "pending_exit"):
@@ -1107,6 +1141,9 @@ def run_once(
 
         # --- Open position management ---
         if pos.status == "open" and price is not None and pos.fill_price:
+            if _migrate_stop_policy(pos):
+                changed = True
+
             # Update high-water mark
             if pos.high_water_mark is None or price > pos.high_water_mark:
                 pos.high_water_mark = price
@@ -1242,31 +1279,45 @@ def run_once(
 
             # Stepped trailing stop (normal hours)
             milestones = _TRAILING_MILESTONES
-            while pos.milestone_idx < len(milestones):
-                threshold_pct, lock_in_pct = milestones[pos.milestone_idx]
-                threshold_price = pos.fill_price * (1 + threshold_pct / 100)
-                if price >= threshold_price:
-                    pos.confirm_count += 1
-                    if pos.confirm_count >= _CONFIRM_POLLS:
-                        new_stop = round(pos.fill_price * (1 + lock_in_pct / 100), 4)
-                        if new_stop > (pos.stop_price or 0):
-                            log.info(
-                                "Trail stop upgrade %s: +%.0f%% confirmed → stop %.4f → %.4f",
-                                pos.ticker, threshold_pct, pos.stop_price or 0, new_stop
-                            )
-                            if pos.stop_order_id:
-                                _cancel_order(session, account_number, pos.stop_order_id)
-                            if pos.fill_qty:
-                                pos.stop_order_id = _place_stop_order(
-                                    session, account_number, pos.ticker, pos.fill_qty, new_stop
-                                )
-                            pos.stop_price = new_stop
-                            pos.confirm_count = 0
-                            pos.milestone_idx += 1
-                            changed = True
+            eligible_idx: int | None = None
+            for idx in range(pos.milestone_idx, len(milestones)):
+                threshold_pct, _ = milestones[idx]
+                if price >= pos.fill_price * (1 + threshold_pct / 100):
+                    eligible_idx = idx
                 else:
-                    pos.confirm_count = 0  # reset confirmation on dip
-                break  # only watch next milestone
+                    break
+
+            if eligible_idx is None:
+                pos.confirm_count = 0
+                pos.confirm_milestone_idx = None
+            else:
+                if pos.confirm_milestone_idx == eligible_idx:
+                    pos.confirm_count += 1
+                else:
+                    pos.confirm_milestone_idx = eligible_idx
+                    pos.confirm_count = 1
+
+                if pos.confirm_count >= _CONFIRM_POLLS:
+                    threshold_pct, lock_in_pct = milestones[eligible_idx]
+                    new_stop = round(
+                        pos.fill_price * (1 + lock_in_pct / 100), 4
+                    )
+                    if new_stop > (pos.stop_price or 0):
+                        log.info(
+                            "Trail stop upgrade %s: +%.0f%% confirmed → stop %.4f → %.4f",
+                            pos.ticker, threshold_pct, pos.stop_price or 0, new_stop
+                        )
+                        if pos.stop_order_id:
+                            _cancel_order(session, account_number, pos.stop_order_id)
+                        if pos.fill_qty:
+                            pos.stop_order_id = _place_stop_order(
+                                session, account_number, pos.ticker, pos.fill_qty, new_stop
+                            )
+                        pos.stop_price = new_stop
+                    pos.confirm_count = 0
+                    pos.confirm_milestone_idx = None
+                    pos.milestone_idx = eligible_idx + 1
+                    changed = True
 
     if changed:
         _flush_positions(positions)
