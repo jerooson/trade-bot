@@ -20,6 +20,7 @@ enabled_tools = [
   "get_accounts",
   "get_portfolio",
   "get_equity_positions",
+  "get_equity_quotes",
   "get_equity_tradability",
   "get_equity_orders",
   "place_equity_order",
