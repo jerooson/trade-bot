@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { Bot, CheckCircle2, ChevronDown, ChevronRight, Loader2, MessageSquare, Send, Trash2, X, XCircle } from "lucide-react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -502,6 +504,67 @@ function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
 // Agent text renderer
 // ---------------------------------------------------------------------------
 
+function MarkdownAnswer({ text, loading = false }: { text: string; loading?: boolean }) {
+  return (
+    <div className="text-sm text-bone-100 leading-relaxed">
+      <Markdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+          ul: ({ children }) => (
+            <ul className="mb-2 ml-5 list-disc space-y-1 last:mb-0">{children}</ul>
+          ),
+          ol: ({ children }) => (
+            <ol className="mb-2 ml-5 list-decimal space-y-1 last:mb-0">{children}</ol>
+          ),
+          table: ({ children }) => (
+            <div className="my-3 overflow-x-auto rounded-lg border border-ink-500/50 bg-ink-900/60 shadow-inner">
+              <table className="w-full min-w-[360px] border-collapse text-xs">
+                {children}
+              </table>
+            </div>
+          ),
+          thead: ({ children }) => <thead className="bg-ink-950/90">{children}</thead>,
+          tbody: ({ children }) => <tbody>{children}</tbody>,
+          tr: ({ children }) => (
+            <tr className="border-t border-ink-600/40 first:border-t-0 even:bg-white/[0.025] hover:bg-white/[0.04]">
+              {children}
+            </tr>
+          ),
+          th: ({ children }) => (
+            <th className="px-3 py-2 text-left font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-bone-500 [&:not(:first-child)]:text-right">
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td className="whitespace-nowrap px-3 py-2 text-left font-mono tabular-nums text-bone-300 first:font-semibold first:text-bone-100 [&:not(:first-child)]:text-right">
+              {children}
+            </td>
+          ),
+          code: ({ children }) => (
+            <code className="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-[0.9em] text-crt-long">
+              {children}
+            </code>
+          ),
+          pre: ({ children }) => (
+            <pre className="my-2 overflow-x-auto rounded-lg border border-ink-600/50 bg-ink-950 p-3 text-xs">
+              {children}
+            </pre>
+          ),
+          strong: ({ children }) => (
+            <strong className="font-semibold text-bone-50">{children}</strong>
+          ),
+        }}
+      >
+        {text}
+      </Markdown>
+      {loading && (
+        <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-bone-400 align-middle" />
+      )}
+    </div>
+  );
+}
+
 function AgentText({ text, loading }: { text: string; loading: boolean }) {
   // Auto-collapse thinking when the answer arrives
   const [open, setOpen] = useState(true);
@@ -598,20 +661,15 @@ function AgentText({ text, loading }: { text: string; loading: boolean }) {
 
       {/* ── Final answer ────────────────────────────────────────── */}
       {answer ? (
-        <div className="text-sm text-bone-100 leading-relaxed whitespace-pre-wrap">
-          {answer}
-          {loading && (
-            <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-bone-400 align-middle" />
-          )}
-        </div>
+        <MarkdownAnswer text={answer} loading={loading} />
       ) : !hasThinking && text ? (
         /* Fallback: couldn't parse, show raw filtered text */
-        <div className="text-sm text-bone-100 leading-relaxed whitespace-pre-wrap">
-          {text
+        <MarkdownAnswer
+          text={text
             .split("\n")
             .filter((l) => !NOISE_LINE_RE.test(l.trim()))
             .join("\n")}
-        </div>
+        />
       ) : null}
     </div>
   );
