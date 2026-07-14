@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { Bot, CheckCircle2, ChevronDown, ChevronRight, Loader2, MessageSquare, Send, Trash2, X, XCircle } from "lucide-react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -504,60 +502,116 @@ function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
 // Agent text renderer
 // ---------------------------------------------------------------------------
 
+type AnswerSegment =
+  | { kind: "text"; text: string }
+  | { kind: "table"; headers: string[]; rows: string[][] };
+
+function parseTableRow(line: string): string[] | null {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|")) return null;
+  const body = trimmed.replace(/^\|/, "").replace(/\|$/, "");
+  const cells = body.split("|").map((cell) => cell.trim());
+  return cells.length > 1 ? cells : null;
+}
+
+function isTableDivider(cells: string[] | null, columnCount: number): boolean {
+  return Boolean(
+    cells
+    && cells.length === columnCount
+    && cells.every((cell) => /^:?-{3,}:?$/.test(cell)),
+  );
+}
+
+function cleanTableCell(cell: string): string {
+  return cell
+    .replace(/^`(.*)`$/, "$1")
+    .replace(/^\*\*(.*)\*\*$/, "$1");
+}
+
+function parseAnswerSegments(text: string): AnswerSegment[] {
+  const lines = text.split("\n");
+  const segments: AnswerSegment[] = [];
+  let textLines: string[] = [];
+
+  const flushText = () => {
+    const value = textLines.join("\n").trim();
+    if (value) segments.push({ kind: "text", text: value });
+    textLines = [];
+  };
+
+  for (let i = 0; i < lines.length;) {
+    const headers = parseTableRow(lines[i]);
+    const divider = i + 1 < lines.length ? parseTableRow(lines[i + 1]) : null;
+    if (!headers || !isTableDivider(divider, headers.length)) {
+      textLines.push(lines[i]);
+      i += 1;
+      continue;
+    }
+
+    flushText();
+    i += 2;
+    const rows: string[][] = [];
+    while (i < lines.length) {
+      const row = parseTableRow(lines[i]);
+      if (!row || row.length !== headers.length) break;
+      rows.push(row.map(cleanTableCell));
+      i += 1;
+    }
+    segments.push({
+      kind: "table",
+      headers: headers.map(cleanTableCell),
+      rows,
+    });
+  }
+
+  flushText();
+  return segments;
+}
+
 function MarkdownAnswer({ text, loading = false }: { text: string; loading?: boolean }) {
+  const segments = parseAnswerSegments(text);
   return (
-    <div className="text-sm text-bone-100 leading-relaxed">
-      <Markdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-          ul: ({ children }) => (
-            <ul className="mb-2 ml-5 list-disc space-y-1 last:mb-0">{children}</ul>
-          ),
-          ol: ({ children }) => (
-            <ol className="mb-2 ml-5 list-decimal space-y-1 last:mb-0">{children}</ol>
-          ),
-          table: ({ children }) => (
-            <div className="my-3 overflow-x-auto rounded-lg border border-ink-500/50 bg-ink-900/60 shadow-inner">
-              <table className="w-full min-w-[360px] border-collapse text-xs">
-                {children}
-              </table>
-            </div>
-          ),
-          thead: ({ children }) => <thead className="bg-ink-950/90">{children}</thead>,
-          tbody: ({ children }) => <tbody>{children}</tbody>,
-          tr: ({ children }) => (
-            <tr className="border-t border-ink-600/40 first:border-t-0 even:bg-white/[0.025] hover:bg-white/[0.04]">
-              {children}
-            </tr>
-          ),
-          th: ({ children }) => (
-            <th className="px-3 py-2 text-left font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-bone-500 [&:not(:first-child)]:text-right">
-              {children}
-            </th>
-          ),
-          td: ({ children }) => (
-            <td className="whitespace-nowrap px-3 py-2 text-left font-mono tabular-nums text-bone-300 first:font-semibold first:text-bone-100 [&:not(:first-child)]:text-right">
-              {children}
-            </td>
-          ),
-          code: ({ children }) => (
-            <code className="rounded bg-ink-700/70 px-1 py-0.5 font-mono text-[0.9em] text-crt-long">
-              {children}
-            </code>
-          ),
-          pre: ({ children }) => (
-            <pre className="my-2 overflow-x-auto rounded-lg border border-ink-600/50 bg-ink-950 p-3 text-xs">
-              {children}
-            </pre>
-          ),
-          strong: ({ children }) => (
-            <strong className="font-semibold text-bone-50">{children}</strong>
-          ),
-        }}
-      >
-        {text}
-      </Markdown>
+    <div className="flex flex-col gap-2 text-sm text-bone-100 leading-relaxed">
+      {segments.map((segment, index) => segment.kind === "text" ? (
+        <div key={index} className="whitespace-pre-wrap">{segment.text}</div>
+      ) : (
+        <div
+          key={index}
+          className="overflow-x-auto rounded-lg border border-ink-500/50 bg-ink-900/60 shadow-inner"
+        >
+          <table className="w-full min-w-[360px] border-collapse text-xs">
+            <thead className="bg-ink-950/90">
+              <tr>
+                {segment.headers.map((header, column) => (
+                  <th
+                    key={column}
+                    className="px-3 py-2 text-left font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-bone-500 [&:not(:first-child)]:text-right"
+                  >
+                    {header}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {segment.rows.map((row, rowIndex) => (
+                <tr
+                  key={rowIndex}
+                  className="border-t border-ink-600/40 even:bg-white/[0.025] hover:bg-white/[0.04]"
+                >
+                  {row.map((cell, column) => (
+                    <td
+                      key={column}
+                      className="whitespace-nowrap px-3 py-2 text-left font-mono tabular-nums text-bone-300 first:font-semibold first:text-bone-100 [&:not(:first-child)]:text-right"
+                    >
+                      {cell}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
       {loading && (
         <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-bone-400 align-middle" />
       )}
