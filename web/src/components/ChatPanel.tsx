@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { Bot, CheckCircle2, ChevronDown, ChevronRight, Loader2, MessageSquare, Send, Trash2, X, XCircle } from "lucide-react";
 
@@ -401,7 +401,9 @@ interface ParsedCodex {
 }
 
 const NOISE_LINE_RE =
-  /^(WARNING:|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:|tokens used|--------|\d{4}-\d{2}-\d{2}T.*|Reading additional input|warning: Codex|OpenAI Codex v)/;
+  /^(WARNING:|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:|--------|\d{4}-\d{2}-\d{2}T.*|Reading additional input|warning: Codex|OpenAI Codex v)/;
+
+const TOKEN_COUNT_LINE_RE = /^(?:\d{4,}|\d{1,3}(?:,\d{3})+)$/;
 
 function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
   const lines = raw.split("\n");
@@ -416,13 +418,26 @@ function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
     const line = lines[i];
     const trimmed = line.trim();
 
-    if (NOISE_LINE_RE.test(trimmed)) continue;
+    // "tokens used" ends the real response. Handle it before generic noise
+    // filtering so comma-formatted counts such as "15,355" never leak into
+    // the visible answer.
+    if (trimmed === "tokens used") {
+      if (cur) {
+        answer = cur.narration.trim();
+        cur = null;
+      }
+      phase = "after_tokens";
+      continue;
+    }
 
-    // Skip everything after the "tokens used" marker (duplicate final answer)
+    // Skip everything after the marker, including the token count and any
+    // cleanup noise printed by the Codex CLI.
     if (phase === "after_tokens") continue;
 
-    // Skip standalone numeric token-count lines
-    if (/^\d{4,}$/.test(trimmed)) continue;
+    if (NOISE_LINE_RE.test(trimmed)) continue;
+
+    // Defensive fallback for older output that omits the marker.
+    if (TOKEN_COUNT_LINE_RE.test(trimmed)) continue;
 
     // "user" alone marks start of the prompt echo — skip until next "codex"
     if (trimmed === "user" && phase === "before_prompt") {
@@ -452,16 +467,6 @@ function parseCodexOutput(raw: string, loading: boolean): ParsedCodex {
     }
 
     if (phase !== "in_response") continue;
-
-    // "tokens used" marks the end of real responses; current block = answer
-    if (trimmed === "tokens used") {
-      if (cur) {
-        answer = cur.narration.trim();
-        cur = null;
-      }
-      phase = "after_tokens";
-      continue;
-    }
 
     // MCP tool call lines
     if (trimmed.startsWith("mcp: ")) {
@@ -525,7 +530,37 @@ function isTableDivider(cells: string[] | null, columnCount: number): boolean {
 function cleanTableCell(cell: string): string {
   return cell
     .replace(/^`(.*)`$/, "$1")
-    .replace(/^\*\*(.*)\*\*$/, "$1");
+    .replace(/^\*\*(.*)\*\*$/, "$1")
+    .replace(/^\*(.*)\*$/, "$1");
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const tokenPattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*)/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = tokenPattern.exec(text)) !== null) {
+    if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+
+    const token = match[0];
+    const key = `${match.index}-${token.length}`;
+    if (token.startsWith("**")) {
+      nodes.push(<strong key={key} className="font-semibold text-bone-50">{token.slice(2, -2)}</strong>);
+    } else if (token.startsWith("`")) {
+      nodes.push(
+        <code key={key} className="rounded bg-ink-950/80 px-1 py-0.5 font-mono text-[0.9em] text-bone-200">
+          {token.slice(1, -1)}
+        </code>,
+      );
+    } else {
+      nodes.push(<em key={key}>{token.slice(1, -1)}</em>);
+    }
+    cursor = tokenPattern.lastIndex;
+  }
+
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes;
 }
 
 function parseAnswerSegments(text: string): AnswerSegment[] {
@@ -573,7 +608,7 @@ function MarkdownAnswer({ text, loading = false }: { text: string; loading?: boo
   return (
     <div className="flex flex-col gap-2 text-sm text-bone-100 leading-relaxed">
       {segments.map((segment, index) => segment.kind === "text" ? (
-        <div key={index} className="whitespace-pre-wrap">{segment.text}</div>
+        <div key={index} className="whitespace-pre-wrap">{renderInlineMarkdown(segment.text)}</div>
       ) : (
         <div
           key={index}
