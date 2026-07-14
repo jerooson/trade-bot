@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
@@ -26,10 +27,12 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from bot.manual_day_plans import cancel_plan, create_plan, load_plans
 
 log = logging.getLogger("server.api")
 
@@ -58,6 +61,7 @@ PNL_PATH = LOG_DIR / "trade_pnl.jsonl"
 
 # Day trader state (written by bot/day_trader.py).
 DAY_TRADE_POSITIONS_PATH = LOG_DIR / "day_trade_positions.jsonl"
+MANUAL_DAY_TRADE_PLANS_PATH = PROJECT_ROOT / "state" / "manual_day_trade_plans.json"
 # Service PID file written by the day_trader process.
 DAY_TRADER_PID_PATH = LOG_DIR / "day_trader.pid"
 
@@ -637,10 +641,119 @@ def list_pnl() -> dict[str, Any]:
     }
 
 
+def _latest_day_trade_positions() -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    if not DAY_TRADE_POSITIONS_PATH.exists():
+        return []
+    with DAY_TRADE_POSITIONS_PATH.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+                latest[rec["id"]] = rec
+            except Exception:
+                continue
+    return list(latest.values())
+
+
+def _manual_plan_views(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    plans = load_plans(MANUAL_DAY_TRADE_PLANS_PATH)
+    views: list[dict[str, Any]] = []
+    for plan in plans:
+        view = dict(plan)
+        related = [p for p in positions if p.get("manual_plan_id") == plan.get("id")]
+        active = next(
+            (p for p in reversed(related) if p.get("status") in {
+                "watching", "pending_entry", "open", "pending_exit"
+            }),
+            None,
+        )
+        filled = next((p for p in reversed(related) if p.get("fill_qty")), None)
+        if plan.get("status") == "cancelled":
+            derived_status = "cancelled"
+        elif filled:
+            derived_status = "executed"
+        elif active and active.get("status") == "pending_entry":
+            derived_status = "entry_pending"
+        elif active and active.get("status") == "watching":
+            derived_status = "armed" if active.get("armed") else "waiting_rearm"
+        else:
+            ticker = str(plan.get("ticker", "")).upper()
+            conflict = any(
+                p.get("ticker") == ticker
+                and p.get("manual_plan_id") != plan.get("id")
+                and p.get("status") in {"watching", "pending_entry", "open", "pending_exit"}
+                for p in positions
+            )
+            derived_status = "blocked_conflict" if conflict else "queued"
+        view["derived_status"] = derived_status
+        view["position_id"] = (active or filled or {}).get("id")
+        views.append(view)
+    return sorted(views, key=lambda item: item.get("created_at") or "", reverse=True)
+
+
+class ManualDayPlanRequest(BaseModel):
+    ticker: str
+    trigger_price: float
+    target_price: float | None = None
+    setup: str | None = None
+
+
+@app.post("/api/daytrader/manual-plans")
+def add_manual_day_plan(request: ManualDayPlanRequest) -> dict[str, Any]:
+    ticker = request.ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", ticker):
+        raise HTTPException(status_code=422, detail="invalid ticker")
+    if not math.isfinite(request.trigger_price) or request.trigger_price <= 0:
+        raise HTTPException(status_code=422, detail="trigger price must be positive")
+    if request.target_price is not None and (
+        not math.isfinite(request.target_price) or request.target_price <= 0
+    ):
+        raise HTTPException(status_code=422, detail="target price must be positive")
+    if request.setup is not None and len(request.setup.strip()) > 500:
+        raise HTTPException(status_code=422, detail="setup must be 500 characters or less")
+    positions = _latest_day_trade_positions()
+    consumed_plan_ids = {
+        str(p.get("manual_plan_id"))
+        for p in positions
+        if p.get("manual_plan_id") and p.get("fill_qty")
+    }
+    try:
+        plan = create_plan(
+            ticker,
+            request.trigger_price,
+            request.target_price,
+            request.setup,
+            path=MANUAL_DAY_TRADE_PLANS_PATH,
+            consumed_plan_ids=consumed_plan_ids,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return next(
+        view for view in _manual_plan_views(positions) if view.get("id") == plan["id"]
+    )
+
+
+@app.delete("/api/daytrader/manual-plans/{plan_id}")
+def remove_manual_day_plan(plan_id: str) -> dict[str, Any]:
+    positions = _latest_day_trade_positions()
+    if any(
+        p.get("manual_plan_id") == plan_id
+        and (p.get("fill_qty") or p.get("status") in {"open", "pending_exit", "closed"})
+        for p in positions
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="watch already executed; manage the position instead",
+        )
+    plan = cancel_plan(plan_id, path=MANUAL_DAY_TRADE_PLANS_PATH)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="manual watch not found")
+    return plan
+
+
 @app.get("/api/daytrader")
 def get_daytrader_state() -> dict[str, Any]:
     """Return all day-trade positions (watching/open/closed) and P&L summary."""
-    import os
 
     # Check if day_trader service is running.
     # The day_trader writes a heartbeat timestamp to day_trader.heartbeat every
@@ -659,33 +772,7 @@ def get_daytrader_state() -> dict[str, Any]:
         # Heartbeat not written yet (first startup); trust PID file existence
         service_running = True
 
-    positions: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    if DAY_TRADE_POSITIONS_PATH.exists():
-        with DAY_TRADE_POSITIONS_PATH.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    seen_ids.discard(rec.get("id", ""))
-                    seen_ids.add(rec.get("id", ""))
-                except json.JSONDecodeError:
-                    continue
-        # Replay to get last state per id
-        all_recs: dict[str, dict] = {}
-        with DAY_TRADE_POSITIONS_PATH.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    all_recs[rec["id"]] = rec
-                except Exception:
-                    continue
-        positions = list(all_recs.values())
+    positions = _latest_day_trade_positions()
 
     # Build P&L summary from closed positions
     closed = [p for p in positions if p.get("status") == "closed" and p.get("realized_pnl") is not None]
@@ -720,6 +807,7 @@ def get_daytrader_state() -> dict[str, Any]:
             "records": pnl_records,
         },
         "service_running": service_running,
+        "manual_plans": _manual_plan_views(positions),
     }
 
 

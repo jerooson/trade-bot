@@ -178,6 +178,10 @@ export interface DayTradePosition {
   trigger_price: number | null;
   target_price: number | null;
   setup: string | null;
+  source?: "discord" | "manual";
+  manual_plan_id?: string | null;
+  good_til_cancelled?: boolean;
+  armed?: boolean;
   plan_received_at: string;
   entry_limit_price: number | null;
   entered_at: string | null;
@@ -197,6 +201,29 @@ export interface DayTradePosition {
   realized_pnl: number | null;
   realized_pnl_pct: number | null;
   closed_at: string | null;
+}
+
+export type ManualDayPlanStatus =
+  | "queued"
+  | "blocked_conflict"
+  | "waiting_rearm"
+  | "armed"
+  | "entry_pending"
+  | "executed"
+  | "cancelled";
+
+export interface ManualDayPlan {
+  id: string;
+  ticker: string;
+  trigger_price: number;
+  target_price: number | null;
+  setup: string | null;
+  status: "active" | "cancelled";
+  derived_status: ManualDayPlanStatus;
+  created_at: string;
+  updated_at: string;
+  cancelled_at: string | null;
+  position_id: string | null;
 }
 
 export interface DayTradePnlRecord {

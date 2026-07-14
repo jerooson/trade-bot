@@ -1,6 +1,7 @@
 import type {
   DayTradePnl,
   DayTradePosition,
+  ManualDayPlan,
   OpenPosition,
   PnlSummary,
   ProposedOrder,
@@ -186,12 +187,41 @@ export interface DayTradeState {
   positions: DayTradePosition[];
   pnl: DayTradePnl | null;
   service_running: boolean;
+  manual_plans: ManualDayPlan[];
 }
 
 export async function fetchDayTradeState(): Promise<DayTradeState> {
   const res = await fetch("/api/daytrader");
   if (!res.ok) throw new Error(`daytrader: ${res.status}`);
   return res.json();
+}
+
+export async function createManualDayPlan(input: {
+  ticker: string;
+  trigger_price: number;
+  target_price: number | null;
+  setup: string | null;
+}): Promise<ManualDayPlan> {
+  const res = await fetch("/api/daytrader/manual-plans", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail ?? `manual watch: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function cancelManualDayPlan(planId: string): Promise<void> {
+  const res = await fetch(`/api/daytrader/manual-plans/${planId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail ?? `cancel manual watch: ${res.status}`);
+  }
 }
 
 /** Open the executor orders SSE stream. Returns a cleanup function. */

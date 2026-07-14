@@ -42,6 +42,7 @@ from bot.day_trader import (
     _position_poll_interval,
     _place_limit_buy,
     _start_or_retry_exit,
+    _sync_manual_plans,
     run_once,
 )
 from bot.robinhood_mcp_client import OrderResult
@@ -121,15 +122,38 @@ def _patch_env(now=ET_MARKET_OPEN, price=10.0, buy_result: OrderResult | None = 
 class _Base(unittest.TestCase):
     """Base with convenience patching."""
 
-    def _run(self, positions, now=ET_MARKET_OPEN, price=10.0, buy_result=None, new_plans=None):
+    def _run(
+        self,
+        positions,
+        now=ET_MARKET_OPEN,
+        price=10.0,
+        buy_result=None,
+        new_plans=None,
+        manual_plans=None,
+    ):
         """Run run_once with all I/O mocked. Returns (positions, mock_namespace)."""
         if buy_result is None:
             buy_result = OrderResult(
                 order_id="buy-001", state="filled",
                 fill_price=price, fill_qty=2.0, fill_usd=price * 2,
             )
+        if manual_plans is None:
+            manual_plans = [
+                {
+                    "id": pos.manual_plan_id,
+                    "ticker": pos.ticker,
+                    "trigger_price": pos.trigger_price,
+                    "target_price": pos.target_price,
+                    "setup": pos.setup,
+                    "status": "active",
+                    "created_at": pos.plan_received_at,
+                }
+                for pos in positions
+                if pos.source == "manual" and pos.manual_plan_id
+            ]
         mocks = {}
         with patch("bot.day_trader._load_new_plans", return_value=new_plans or []) as m_plans, \
+             patch("bot.day_trader.load_plans", return_value=manual_plans), \
              patch("bot.day_trader._load_token", return_value="tok") as m_tok, \
              patch("bot.day_trader._MCPSession", return_value=MagicMock()) as m_sess, \
              patch("bot.day_trader._get_agentic_account", return_value="acct") as m_acct, \
@@ -328,6 +352,29 @@ class TestPendingEntryLifecycle(_Base):
         self.assertTrue(changed)
         self.assertEqual(pos.status, "expired")
         self.assertEqual(pos.exit_reason, "entry_lost_trigger")
+
+    def test_cancelled_unfilled_manual_entry_returns_to_waiting_rearm(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.status = "pending_entry"
+        pos.source = "manual"
+        pos.manual_plan_id = "manual-1"
+        pos.good_til_cancelled = True
+        pos.armed = True
+        pos.buy_order_id = "buy-empty"
+        pos.entry_limit_price = 10.02
+        pos.entry_cancel_reason = "lost_trigger"
+        changed = _apply_entry_order_result(
+            MagicMock(),
+            "acct",
+            pos,
+            OrderResult("buy-empty", "cancelled", None, None, None),
+        )
+        self.assertTrue(changed)
+        self.assertEqual(pos.status, "watching")
+        self.assertFalse(pos.armed)
+        self.assertEqual(pos.entry_attempt_no, 1)
+        self.assertIsNone(pos.buy_order_id)
+        self.assertIsNone(pos.entry_limit_price)
 
     def test_price_losing_trigger_requests_cancel_and_stays_pending(self):
         pos = _watching_pos(trigger=10.0)
@@ -963,7 +1010,107 @@ class TestProtectedEntryAndPolling(unittest.TestCase):
             runtime.schedule(near)
             runtime.schedule(far)
         self.assertEqual(runtime.next_due[near.id], 100.0 + NEAR_POLL_INTERVAL_S)
-        self.assertEqual(runtime.next_due[far.id], 100.0 + FAR_POLL_INTERVAL_S)
+        self.assertEqual(runtime.next_due[far.id], 105.0)
+
+
+class TestManualDayWatches(_Base):
+
+    @staticmethod
+    def _manual_watch(*, armed: bool = False) -> DayPosition:
+        pos = _watching_pos(trigger=10.0)
+        pos.source = "manual"
+        pos.manual_plan_id = "manual-1"
+        pos.good_til_cancelled = True
+        pos.armed = armed
+        return pos
+
+    def test_sync_creates_unarmed_persistent_watch(self):
+        plans = [{
+            "id": "manual-1",
+            "ticker": "GTLB",
+            "trigger_price": 34.06,
+            "target_price": None,
+            "setup": "Breakout",
+            "status": "active",
+            "created_at": "2026-07-14T12:00:00+00:00",
+        }]
+        positions: list[DayPosition] = []
+        with patch("bot.day_trader.load_plans", return_value=plans), \
+             patch("bot.day_trader._append_position") as append:
+            changed = _sync_manual_plans(positions)
+        self.assertTrue(changed)
+        self.assertEqual(len(positions), 1)
+        pos = positions[0]
+        self.assertEqual(pos.ticker, "GTLB")
+        self.assertEqual(pos.source, "manual")
+        self.assertTrue(pos.good_til_cancelled)
+        self.assertFalse(pos.armed)
+        append.assert_called_once_with(pos)
+
+    def test_new_watch_above_trigger_does_not_buy(self):
+        pos = self._manual_watch(armed=False)
+        _, mocks = self._run([pos], price=10.01)
+        self.assertEqual(pos.status, "watching")
+        self.assertFalse(pos.armed)
+        mocks["buy"].assert_not_called()
+
+    def test_watch_arms_below_then_buys_on_later_breakout(self):
+        pos = self._manual_watch(armed=False)
+        _, first = self._run([pos], price=9.99)
+        self.assertTrue(pos.armed)
+        first["buy"].assert_not_called()
+
+        _, second = self._run([pos], price=10.0)
+        self.assertEqual(pos.status, "open")
+        second["buy"].assert_called_once()
+
+    def test_gap_does_not_chase_and_waits_to_rearm(self):
+        pos = self._manual_watch(armed=True)
+        _, mocks = self._run([pos], price=10.50)
+        self.assertEqual(pos.status, "watching")
+        self.assertFalse(pos.armed)
+        self.assertEqual(pos.exit_reason, "waiting_rearm_after_gap")
+        mocks["buy"].assert_not_called()
+
+    def test_manual_watch_survives_end_of_day(self):
+        pos = self._manual_watch(armed=True)
+        self._run([pos], now=ET_FORCE_CLOSE, price=9.99)
+        self.assertEqual(pos.status, "watching")
+
+    def test_registry_cancel_expires_unfilled_watch(self):
+        pos = self._manual_watch(armed=True)
+        cancelled = [{
+            "id": "manual-1",
+            "ticker": "TEST",
+            "trigger_price": 10.0,
+            "status": "cancelled",
+        }]
+        with patch("bot.day_trader.load_plans", return_value=cancelled):
+            changed = _sync_manual_plans([pos])
+        self.assertTrue(changed)
+        self.assertEqual(pos.status, "expired")
+        self.assertEqual(pos.exit_reason, "manual_cancel")
+
+    def test_cancelled_partial_fill_is_exited_safely(self):
+        pos = self._manual_watch(armed=True)
+        pos.status = "pending_entry"
+        pos.buy_order_id = "buy-partial"
+        pos.entry_submitted_at = ET_MARKET_OPEN.isoformat()
+        pos.manual_cancel_requested = True
+        with patch(
+            "bot.day_trader._poll_order",
+            return_value=OrderResult(
+                "buy-partial", "cancelled", 10.01, 0.75, 7.5075
+            ),
+        ):
+            _, mocks = self._run([pos], price=10.0)
+        self.assertEqual(pos.status, "closed")
+        self.assertEqual(pos.exit_reason, "manual")
+        self.assertEqual(pos.fill_qty, 0.75)
+        mocks["sell"].assert_called_once()
+
+
+class TestProtectedEntryHelpers(unittest.TestCase):
 
     def test_runtime_reuses_mcp_session_and_account(self):
         runtime = DayTraderRuntime()

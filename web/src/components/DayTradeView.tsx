@@ -1,19 +1,22 @@
-import { useState } from "react";
+import { useState, type FormEvent } from "react";
 import clsx from "clsx";
-import type { DayTradePosition, DayTradePnl } from "../lib/types";
+import type { DayTradePosition, DayTradePnl, ManualDayPlan } from "../lib/types";
+import { cancelManualDayPlan, createManualDayPlan } from "../lib/api";
 import { SignalsView, type DashLike } from "./SignalsView";
 import { relativeTime } from "../lib/format";
 
-type SubTab = "plans" | "active" | "pnl";
+type SubTab = "plans" | "manual" | "active" | "pnl";
 
 interface Props {
   dash: DashLike;
   positions: DayTradePosition[];
+  manualPlans: ManualDayPlan[];
   pnl: DayTradePnl | null;
   serviceRunning: boolean;
+  onManualPlansChanged: () => void;
 }
 
-export function DayTradeView({ dash, positions, pnl, serviceRunning }: Props) {
+export function DayTradeView({ dash, positions, manualPlans, pnl, serviceRunning, onManualPlansChanged }: Props) {
   const [sub, setSub] = useState<SubTab>("plans");
 
   const openCount = positions.filter((p) => p.status === "open" || p.status === "pending_exit").length;
@@ -69,7 +72,7 @@ export function DayTradeView({ dash, positions, pnl, serviceRunning }: Props) {
 
       {/* Sub-tab nav */}
       <div className="mb-4 flex items-center gap-2">
-        {(["plans", "active", "pnl"] as SubTab[]).map((t) => (
+        {(["plans", "manual", "active", "pnl"] as SubTab[]).map((t) => (
           <button
             key={t}
             onClick={() => setSub(t)}
@@ -80,15 +83,132 @@ export function DayTradeView({ dash, positions, pnl, serviceRunning }: Props) {
                 : "border-ink-500/60 text-bone-400 hover:border-bone-300 hover:text-bone-100",
             )}
           >
-            {t === "plans" ? "Signal Plans" : t === "active" ? "Active Trades" : "P&L"}
+            {t === "plans" ? "Signal Plans" : t === "manual" ? "Manual Watches" : t === "active" ? "Active Trades" : "P&L"}
           </button>
         ))}
       </div>
 
       {sub === "plans" && <SignalsView dash={dash} />}
+      {sub === "manual" && <ManualWatchTab plans={manualPlans} onChanged={onManualPlansChanged} />}
       {sub === "active" && <ActiveTab positions={positions} serviceRunning={serviceRunning} />}
       {sub === "pnl" && <PnlTab pnl={pnl} />}
     </div>
+  );
+}
+
+function ManualWatchTab({ plans, onChanged }: { plans: ManualDayPlan[]; onChanged: () => void }) {
+  const [ticker, setTicker] = useState("");
+  const [trigger, setTrigger] = useState("");
+  const [target, setTarget] = useState("");
+  const [setup, setSetup] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    const triggerPrice = Number(trigger);
+    const targetPrice = target.trim() ? Number(target) : null;
+    if (!ticker.trim() || !Number.isFinite(triggerPrice) || triggerPrice <= 0) {
+      setError("Enter a ticker and a positive trigger price.");
+      return;
+    }
+    if (target.trim() && (!Number.isFinite(targetPrice) || (targetPrice ?? 0) <= 0)) {
+      setError("Target must be a positive price when provided.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await createManualDayPlan({
+        ticker: ticker.trim().toUpperCase(),
+        trigger_price: triggerPrice,
+        target_price: targetPrice,
+        setup: setup.trim() || null,
+      });
+      setTicker("");
+      setTrigger("");
+      setTarget("");
+      setSetup("");
+      onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancel(plan: ManualDayPlan) {
+    setBusy(true);
+    setError(null);
+    try {
+      await cancelManualDayPlan(plan.id);
+      onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Section title="Add Manual Watch" subtitle="good until executed or cancelled · max 25">
+        <form onSubmit={submit} className="grid grid-cols-1 gap-3 p-4 md:grid-cols-12">
+          <Field label="Ticker" value={ticker} onChange={setTicker} placeholder="GTLB" span="md:col-span-2" />
+          <Field label="Breakout >" value={trigger} onChange={setTrigger} placeholder="34.06" type="number" span="md:col-span-2" />
+          <Field label="Target (optional)" value={target} onChange={setTarget} placeholder="—" type="number" span="md:col-span-2" />
+          <Field label="Setup / note" value={setup} onChange={setSetup} placeholder="Manual breakout watch" span="md:col-span-4" />
+          <div className="flex items-end md:col-span-2">
+            <button disabled={busy} className="h-[38px] w-full border border-crt-amber/60 bg-crt-amber/10 px-3 text-[10px] uppercase tracking-[0.2em] text-crt-amber disabled:opacity-40">
+              {busy ? "Saving…" : "Add Watch"}
+            </button>
+          </div>
+        </form>
+        <div className="border-t border-ink-500/20 px-4 py-2 text-[10px] text-bone-500">
+          New watches wait for price below the trigger before arming. Entry cap remains trigger +0.2%.
+        </div>
+      </Section>
+
+      {error && <div className="border border-crt-short/50 bg-crt-short/10 px-4 py-3 text-sm text-crt-short">{error}</div>}
+
+      <Section title="Manual Watches" subtitle="persistent across trading days">
+        <div className="flex flex-col">
+          <GridHeader cols={["ticker", "trigger / cap", "target", "setup", "status", "action"]} spans={[2,2,1,3,2,2]} />
+          {plans.map((plan) => {
+            const cancellable = !["executed", "cancelled"].includes(plan.derived_status);
+            return (
+              <div key={plan.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3">
+                <div className="col-span-2 font-editorial text-xl italic text-bone-50">{plan.ticker}</div>
+                <div className="col-span-2 tabular text-sm text-crt-amber">
+                  ${plan.trigger_price.toFixed(2)}
+                  <span className="ml-1 text-[9px] text-bone-500">cap ${(plan.trigger_price * 1.002).toFixed(2)}</span>
+                </div>
+                <div className="col-span-1 tabular text-sm text-bone-300">{plan.target_price == null ? "—" : `$${plan.target_price.toFixed(2)}`}</div>
+                <div className="col-span-3 truncate text-[11px] text-bone-400">{plan.setup ?? "—"}</div>
+                <div className="col-span-2 text-[9px] uppercase tracking-[0.15em] text-bone-300">{plan.derived_status.replaceAll("_", " ")}</div>
+                <div className="col-span-2">
+                  {cancellable ? (
+                    <button disabled={busy} onClick={() => cancel(plan)} className="border border-crt-short/40 px-2 py-1 text-[9px] uppercase tracking-[0.16em] text-crt-short disabled:opacity-40">Cancel</button>
+                  ) : <span className="text-[9px] uppercase tracking-[0.16em] text-bone-600">{plan.derived_status}</span>}
+                </div>
+              </div>
+            );
+          })}
+          {plans.length === 0 && <div className="px-6 py-10 text-center font-editorial italic text-bone-400">No manual watches yet.</div>}
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+function Field({ label, value, onChange, placeholder, type = "text", span }: {
+  label: string; value: string; onChange: (value: string) => void; placeholder: string; type?: string; span: string;
+}) {
+  return (
+    <label className={span}>
+      <span className="mb-1 block text-[9px] uppercase tracking-[0.18em] text-bone-500">{label}</span>
+      <input type={type} min={type === "number" ? "0" : undefined} step={type === "number" ? "0.01" : undefined} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} className="h-[38px] w-full border border-ink-500/60 bg-ink-900/50 px-3 text-sm text-bone-100 outline-none focus:border-crt-amber/60" />
+    </label>
   );
 }
 
@@ -127,7 +247,10 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
                     <span className="ml-1 text-[9px] text-bone-500">cap ${p.entry_limit_price.toFixed(2)}</span>
                   )}
                 </div>
-                <div className="col-span-4 text-[11px] text-bone-400">{p.setup ?? "—"}</div>
+                <div className="col-span-4 text-[11px] text-bone-400">
+                  {p.setup ?? "—"}
+                  {p.source === "manual" && <span className="ml-2 text-[9px] uppercase tracking-[0.14em] text-crt-amber">manual</span>}
+                </div>
                 <div className="col-span-2 tabular text-[11px] text-bone-500">{relativeTime(p.plan_received_at)}</div>
                 <div className="col-span-2">
                   <span className="inline-flex items-center gap-1 border border-crt-amber/50 bg-crt-amber/10 px-1.5 py-0.5 text-[9px] uppercase tracking-[0.18em] text-crt-amber">
@@ -177,7 +300,7 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
       {open.length === 0 && watching.length === 0 && (
         <Section title="Active Trades" subtitle="no active day trades">
           <div className="px-6 py-12 text-center font-editorial text-lg italic text-bone-400">
-            No active day trades. Waiting for a new PLAN signal from Will.
+            No active day trades. Waiting for a Discord signal or manual watch.
           </div>
         </Section>
       )}

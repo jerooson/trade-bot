@@ -40,6 +40,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from bot.parser import Signal, SignalKind, parse_message
+from bot.manual_day_plans import DEFAULT_PATH as MANUAL_PLANS_PATH, load_plans
 from bot.robinhood_mcp_client import (
     OrderResult,
     RobinhoodMCPError,
@@ -102,6 +103,12 @@ class DayPosition:
     setup: str | None = None
     plan_signal_id: str | None = None
     plan_received_at: str = ""        # ISO
+    source: str = "discord"           # discord | manual
+    manual_plan_id: str | None = None
+    good_til_cancelled: bool = False
+    armed: bool = True
+    manual_cancel_requested: bool = False
+    entry_attempt_no: int = 0
 
     # Execution details
     buy_order_id: str | None = None
@@ -177,7 +184,11 @@ class DayTraderRuntime:
         return [p for p in positions if now >= self.next_due.get(p.id, 0.0)]
 
     def schedule(self, pos: DayPosition) -> None:
-        self.next_due[pos.id] = time.monotonic() + _position_poll_interval(pos)
+        interval = _position_poll_interval(pos)
+        now = time.monotonic()
+        # Align equal-frequency tickers to the same boundary so 5, 10, or 25
+        # watches still share one batched Robinhood quote request.
+        self.next_due[pos.id] = (now // interval + 1) * interval
 
     def can_request(self) -> bool:
         return time.monotonic() >= self.retry_not_before
@@ -298,6 +309,81 @@ def _load_new_plans(seen_ids: set[str]) -> list[Signal]:
         seen_ids.add(sig_id)
 
     return plans
+
+
+def _sync_manual_plans(positions: list[DayPosition]) -> bool:
+    """Create/cancel persistent manual watches from the API-owned registry."""
+    plans = {str(item.get("id")): item for item in load_plans(MANUAL_PLANS_PATH)}
+    changed = False
+
+    # Apply user cancellation to watches that have not become a position yet.
+    for pos in positions:
+        if pos.source != "manual" or not pos.manual_plan_id:
+            continue
+        plan = plans.get(pos.manual_plan_id)
+        if plan and plan.get("status") == "active":
+            continue
+        if pos.status == "watching":
+            pos.status = "expired"
+            pos.exit_reason = "manual_cancel"
+            pos.manual_cancel_requested = True
+            changed = True
+        elif pos.status == "pending_entry" and not pos.manual_cancel_requested:
+            pos.manual_cancel_requested = True
+            changed = True
+
+    for plan_id, plan in plans.items():
+        if plan.get("status") != "active":
+            continue
+        related = [p for p in positions if p.manual_plan_id == plan_id]
+        if any(
+            p.status in ("watching", "pending_entry", "open", "pending_exit", "closed")
+            or bool(p.fill_qty)
+            for p in related
+        ):
+            continue
+
+        ticker = str(plan.get("ticker", "")).upper()
+        trigger = plan.get("trigger_price")
+        if not ticker or trigger is None:
+            continue
+        # One active day-trade lifecycle per ticker, regardless of source.
+        if any(
+            p.ticker == ticker
+            and p.status in ("watching", "pending_entry", "open", "pending_exit")
+            for p in positions
+        ):
+            continue
+
+        pos = DayPosition(
+            ticker=ticker,
+            trigger_price=float(trigger),
+            target_price=(
+                float(plan["target_price"])
+                if plan.get("target_price") is not None
+                else None
+            ),
+            setup=plan.get("setup") or "Manual breakout watch",
+            plan_signal_id=f"manual:{plan_id}",
+            plan_received_at=plan.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            source="manual",
+            manual_plan_id=plan_id,
+            good_til_cancelled=True,
+            # A new manual watch must first observe price below the trigger.
+            # This prevents adding a watch above its trigger from buying now.
+            armed=False,
+        )
+        positions.append(pos)
+        _append_position(pos)
+        log.info(
+            "New manual day watch: %s trigger=%.4f target=%s plan=%s",
+            pos.ticker,
+            pos.trigger_price,
+            pos.target_price,
+            plan_id,
+        )
+        changed = True
+    return changed
 
 
 # ------------------------------------------------------------------
@@ -817,6 +903,27 @@ def _request_entry_cancel(
     return True
 
 
+def _reset_manual_watch_after_unfilled_entry(pos: DayPosition) -> None:
+    """Re-arm a GTC watch with a fresh idempotency attempt after no fill."""
+    pos.status = "watching"
+    pos.armed = False
+    pos.buy_order_id = None
+    pos.entry_submitted_at = None
+    pos.entry_cancel_requested_at = None
+    pos.entry_cancel_reason = None
+    pos.entry_last_error = None
+    pos.entry_filled_qty = 0.0
+    pos.entry_filled_value = 0.0
+    pos.entry_limit_price = None
+    pos.exit_reason = None
+    pos.entry_attempt_no += 1
+    log.info(
+        "Manual watch %s returned to waiting-rearm after unfilled attempt %d",
+        pos.ticker,
+        pos.entry_attempt_no,
+    )
+
+
 def _apply_entry_order_result(
     session: _MCPSession,
     account_number: str,
@@ -853,13 +960,16 @@ def _apply_entry_order_result(
                 return _activate_filled_position(
                     session, account_number, pos, final_result
                 ) or changed
-        pos.status = "expired"
-        pos.exit_reason = (
-            f"entry_{pos.entry_cancel_reason}"
-            if pos.entry_cancel_reason
-            else f"entry_{state}"
-        )
-        pos.entry_last_error = state
+        if pos.good_til_cancelled and not pos.manual_cancel_requested:
+            _reset_manual_watch_after_unfilled_entry(pos)
+        else:
+            pos.status = "expired"
+            pos.exit_reason = (
+                f"entry_{pos.entry_cancel_reason}"
+                if pos.entry_cancel_reason
+                else f"entry_{state}"
+            )
+            pos.entry_last_error = state
         return True
 
     if pos.entry_filled_qty > 0:
@@ -904,7 +1014,7 @@ def _submit_or_recover_entry(
             pos.ticker,
             DAY_TRADE_BUDGET_USD,
             pos.entry_limit_price,
-            pos.id,
+            f"{pos.id}:{pos.entry_attempt_no}",
         )
     except Exception as exc:
         pos.entry_last_error = f"submission_ambiguous:{exc}"
@@ -1002,6 +1112,9 @@ def run_once(
         _append_position(pos)
         log.info("New day-trade plan: %s trigger=%.2f target=%s", sig.ticker, sig.trigger or 0, sig.target)
 
+    if _sync_manual_plans(positions):
+        _flush_positions(positions)
+
     if not _is_market_hours(now):
         return positions
 
@@ -1068,7 +1181,9 @@ def run_once(
 
             if pos.status == "pending_entry" and not pos.entry_cancel_requested_at:
                 cancel_reason: str | None = None
-                if force_close:
+                if pos.manual_cancel_requested:
+                    cancel_reason = "manual_cancel"
+                elif force_close:
                     cancel_reason = "eod"
                 elif price is not None and pos.trigger_price and price < pos.trigger_price:
                     cancel_reason = "lost_trigger"
@@ -1078,6 +1193,16 @@ def run_once(
                     session, account_number, pos, cancel_reason
                 ):
                     changed = True
+
+        if (
+            pos.status == "open"
+            and pos.source == "manual"
+            and pos.manual_cancel_requested
+            and pos.fill_qty
+        ):
+            if _start_or_retry_exit(session, account_number, pos, "manual"):
+                changed = True
+            continue
 
         # --- Resolve or retry a broker-confirmed exit. ---
         if pos.status == "pending_exit":
@@ -1106,8 +1231,9 @@ def run_once(
 
         # --- Expire watching plans at EOD ---
         if force_close and pos.status == "watching":
-            pos.status = "expired"
-            changed = True
+            if not pos.good_til_cancelled:
+                pos.status = "expired"
+                changed = True
             continue
 
         if force_close and pos.status == "pending_entry":
@@ -1118,6 +1244,18 @@ def run_once(
 
         # --- Entry: watching -> protected limit order -> open ---
         if pos.status == "watching" and price is not None and pos.trigger_price is not None:
+            if pos.good_til_cancelled and not pos.armed:
+                if price < pos.trigger_price:
+                    pos.armed = True
+                    pos.exit_reason = None
+                    changed = True
+                    log.info(
+                        "Manual watch armed: %s price=%.4f below trigger=%.4f",
+                        pos.ticker,
+                        price,
+                        pos.trigger_price,
+                    )
+                continue
             if price >= pos.trigger_price:
                 limit_price = _entry_limit_price(pos.trigger_price)
                 pos.entry_limit_price = limit_price
@@ -1126,8 +1264,12 @@ def run_once(
                         "SKIP GAP: %s price=%.4f exceeds max entry %.4f (trigger=%.4f)",
                         pos.ticker, price, limit_price, pos.trigger_price,
                     )
-                    pos.status = "expired"
-                    pos.exit_reason = "entry_gap_above_limit"
+                    if pos.good_til_cancelled:
+                        pos.armed = False
+                        pos.exit_reason = "waiting_rearm_after_gap"
+                    else:
+                        pos.status = "expired"
+                        pos.exit_reason = "entry_gap_above_limit"
                     changed = True
                     continue
 

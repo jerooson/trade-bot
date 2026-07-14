@@ -37,6 +37,7 @@ services:
       HOME: /home/deploy
     volumes:
       - ./logs:/app/logs:ro
+      - ./state:/app/state
       - /usr/local/lib/node_modules:/usr/local/lib/node_modules:ro
       - /home/deploy/.codex:/home/deploy/.codex
     healthcheck:

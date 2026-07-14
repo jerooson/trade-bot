@@ -80,8 +80,10 @@ export default function App() {
             <DayTradeView
               dash={dash}
               positions={dayTradeData.positions}
+              manualPlans={dayTradeData.manualPlans}
               pnl={dayTradeData.pnl}
               serviceRunning={dayTradeData.serviceRunning}
+              onManualPlansChanged={dayTradeData.refetch}
             />
           )}
           {view === "watchlist" && (
