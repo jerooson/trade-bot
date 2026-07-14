@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -28,11 +28,13 @@ from bot.day_trader import (
     _CONFIRM_POLLS,
     _INITIAL_STOP_PCT,
     _TRAILING_MILESTONES,
+    ENTRY_ORDER_TTL_S,
     ENTRY_LIMIT_OFFSET_PCT,
     FAR_POLL_INTERVAL_S,
     NEAR_POLL_INTERVAL_S,
     DayTraderRuntime,
     DayPosition,
+    _apply_entry_order_result,
     _apply_exit_order_result,
     _get_prices,
     _position_poll_interval,
@@ -139,6 +141,7 @@ class _Base(unittest.TestCase):
 
             # Make datetime.now(ET) return `now` so time checks work
             m_dt.now.return_value = now
+            m_dt.fromisoformat.side_effect = datetime.fromisoformat
             # Keep datetime constructor and other methods working
             m_dt.side_effect = lambda *a, **k: __import__("datetime").datetime(*a, **k)
             m_sell.side_effect = lambda _s, _a, _t, qty, _ref: OrderResult(
@@ -260,6 +263,140 @@ class TestEntry(_Base):
         positions, m = self._run([pos], price=9.0, new_plans=[sig2])
         # Still only one position
         self.assertEqual(len(positions), 1)
+
+
+class TestPendingEntryLifecycle(_Base):
+
+    def test_partial_fill_cancels_remainder_but_does_not_open_early(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.status = "pending_entry"
+        pos.buy_order_id = "buy-partial"
+        session = MagicMock()
+        with patch("bot.day_trader._cancel_order", return_value=True) as cancel, \
+             patch("bot.day_trader._place_stop_order") as stop:
+            changed = _apply_entry_order_result(
+                session,
+                "acct",
+                pos,
+                OrderResult("buy-partial", "partially_filled", 10.01, 0.75, 7.5075),
+            )
+        self.assertTrue(changed)
+        self.assertEqual(pos.status, "pending_entry")
+        self.assertEqual(pos.entry_filled_qty, 0.75)
+        self.assertEqual(pos.entry_cancel_reason, "partial_fill")
+        cancel.assert_called_once_with(session, "acct", "buy-partial")
+        stop.assert_not_called()
+
+    def test_cancelled_partial_fill_opens_only_final_quantity(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.status = "pending_entry"
+        pos.buy_order_id = "buy-partial"
+        pos.entry_filled_qty = 0.75
+        pos.entry_filled_value = 7.5075
+        pos.entry_cancel_requested_at = datetime.now(timezone.utc).isoformat()
+        pos.entry_cancel_reason = "partial_fill"
+        session = MagicMock()
+        with patch("bot.day_trader._place_stop_order", return_value="stop-1") as stop, \
+             patch("bot.day_trader._place_limit_sell", return_value=None):
+            changed = _apply_entry_order_result(
+                session,
+                "acct",
+                pos,
+                OrderResult("buy-partial", "cancelled", 10.02, 0.8, 8.016),
+            )
+        self.assertTrue(changed)
+        self.assertEqual(pos.status, "open")
+        self.assertEqual(pos.fill_qty, 0.8)
+        self.assertEqual(pos.fill_price, 10.02)
+        stop.assert_called_once_with(session, "acct", "TEST", 0.8, 9.8196)
+
+    def test_cancelled_unfilled_entry_expires(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.status = "pending_entry"
+        pos.buy_order_id = "buy-empty"
+        pos.entry_cancel_reason = "lost_trigger"
+        changed = _apply_entry_order_result(
+            MagicMock(),
+            "acct",
+            pos,
+            OrderResult("buy-empty", "cancelled", None, None, None),
+        )
+        self.assertTrue(changed)
+        self.assertEqual(pos.status, "expired")
+        self.assertEqual(pos.exit_reason, "entry_lost_trigger")
+
+    def test_price_losing_trigger_requests_cancel_and_stays_pending(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.status = "pending_entry"
+        pos.buy_order_id = "buy-queued"
+        pos.entry_submitted_at = ET_MARKET_OPEN.isoformat()
+        with patch(
+            "bot.day_trader._poll_order",
+            return_value=OrderResult("buy-queued", "queued", None, None, None),
+        ):
+            _, mocks = self._run([pos], price=9.99)
+        self.assertEqual(pos.status, "pending_entry")
+        self.assertEqual(pos.entry_cancel_reason, "lost_trigger")
+        mocks["cancel"].assert_called_once()
+
+    def test_entry_timeout_requests_cancel(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.status = "pending_entry"
+        pos.buy_order_id = "buy-queued"
+        pos.entry_submitted_at = (
+            ET_MARKET_OPEN - timedelta(seconds=ENTRY_ORDER_TTL_S + 1)
+        ).isoformat()
+        with patch(
+            "bot.day_trader._poll_order",
+            return_value=OrderResult("buy-queued", "queued", None, None, None),
+        ):
+            _, mocks = self._run([pos], price=10.01)
+        self.assertEqual(pos.status, "pending_entry")
+        self.assertEqual(pos.entry_cancel_reason, "timeout")
+        mocks["cancel"].assert_called_once()
+
+    def test_eod_terminal_partial_fill_is_closed_not_orphaned(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.status = "pending_entry"
+        pos.buy_order_id = "buy-partial"
+        pos.entry_submitted_at = ET_MARKET_OPEN.isoformat()
+        pos.entry_cancel_requested_at = ET_FORCE_CLOSE.isoformat()
+        pos.entry_cancel_reason = "eod"
+        with patch(
+            "bot.day_trader._poll_order",
+            return_value=OrderResult(
+                "buy-partial", "cancelled", 10.01, 0.75, 7.5075
+            ),
+        ):
+            self._run([pos], now=ET_FORCE_CLOSE, price=10.0)
+        self.assertEqual(pos.status, "closed")
+        self.assertEqual(pos.exit_reason, "eod")
+        self.assertEqual(pos.fill_qty, 0.75)
+        self.assertEqual(pos.exit_filled_qty, 0.75)
+
+    def test_entry_ref_is_stable_for_safe_retry(self):
+        def make_session():
+            session = MagicMock()
+            session.call.side_effect = [
+                {"data": {"order": {"id": "order-1", "state": "queued"}}},
+                {"data": {"orders": [{
+                    "id": "order-1",
+                    "state": "filled",
+                    "average_price": "10.01",
+                    "cumulative_quantity": "1.998",
+                }]}},
+            ]
+            return session
+
+        first = make_session()
+        second = make_session()
+        with patch("bot.day_trader.time.sleep"):
+            _place_limit_buy(first, "acct", "TEST", 20, 10.02, "same-position")
+            _place_limit_buy(second, "acct", "TEST", 20, 10.02, "same-position")
+        self.assertEqual(
+            first.call.call_args_list[0].kwargs["ref_id"],
+            second.call.call_args_list[0].kwargs["ref_id"],
+        )
 
 
 # ===========================================================================
@@ -712,8 +849,8 @@ class TestResilience(_Base):
         m_sell.assert_not_called()
         self.assertEqual(pos.status, "open")
 
-    def test_buy_failure_leaves_position_watching(self):
-        """If buy order fails, position stays watching (not stuck in open)."""
+    def test_buy_failure_remains_pending_for_idempotent_recovery(self):
+        """An ambiguous submit never retries as a fresh logical order."""
         from bot.robinhood_mcp_client import RobinhoodMCPError
         pos = _watching_pos(trigger=10.0)
         with patch("bot.day_trader._load_new_plans", return_value=[]), \
@@ -728,7 +865,8 @@ class TestResilience(_Base):
              patch("bot.day_trader.datetime") as m_dt:
             m_dt.now.return_value = ET_MARKET_OPEN
             run_once([pos], set())
-        self.assertEqual(pos.status, "watching")
+        self.assertEqual(pos.status, "pending_entry")
+        self.assertIn("submission_ambiguous", pos.entry_last_error or "")
 
 
 class TestProtectedEntryAndPolling(unittest.TestCase):
@@ -793,7 +931,7 @@ class TestProtectedEntryAndPolling(unittest.TestCase):
             }]}},
         ]
         with patch("bot.day_trader.time.sleep"):
-            result = _place_limit_buy(session, "acct", "TEST", 20, 10.02)
+            result = _place_limit_buy(session, "acct", "TEST", 20, 10.02, "position-1")
         kwargs = session.call.call_args_list[0].kwargs
         self.assertEqual(kwargs["type"], "limit")
         self.assertEqual(kwargs["limit_price"], "10.02")

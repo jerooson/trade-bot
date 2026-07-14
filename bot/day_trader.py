@@ -5,7 +5,9 @@ Strategy (all times US/Eastern):
   - Read PLAN signals from logs/signals.jsonl (kind == "PLAN").
   - Poll adaptively (15 s normally, 5 s near a trigger/open position).
   - When price crosses the trigger, buy with a protected limit order capped
-    slightly above the PLAN trigger; never chase a gap beyond that cap.
+    slightly above the PLAN trigger; never chase a gap beyond that cap.  Entry
+    orders use a stable idempotency ref and are cancelled if the breakout
+    fails, the order times out, or only a partial fill is obtained.
   - Stop-loss management after entry:
       * Initial stop: fill_price × 0.98  (-2 %)
       * Breakeven upgrade: when price holds ≥ fill × 1.03 for 2 consecutive
@@ -57,6 +59,7 @@ FAR_POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_FAR_POLL_INTERVAL_S", "15"))
 NEAR_POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_NEAR_POLL_INTERVAL_S", "5"))
 NEAR_TRIGGER_PCT = float(os.getenv("DAY_TRADE_NEAR_TRIGGER_PCT", "0.5"))
 ENTRY_LIMIT_OFFSET_PCT = float(os.getenv("DAY_TRADE_ENTRY_LIMIT_OFFSET_PCT", "0.2"))
+ENTRY_ORDER_TTL_S = int(os.getenv("DAY_TRADE_ENTRY_ORDER_TTL_S", "30"))
 SCHEDULER_TICK_S = float(os.getenv("DAY_TRADE_SCHEDULER_TICK_S", "1"))
 SIGNALS_LOG = Path("logs/signals.jsonl")
 POSITIONS_LOG = Path("logs/day_trade_positions.jsonl")
@@ -100,6 +103,12 @@ class DayPosition:
     # Execution details
     buy_order_id: str | None = None
     entry_limit_price: float | None = None
+    entry_submitted_at: str | None = None
+    entry_cancel_requested_at: str | None = None
+    entry_cancel_reason: str | None = None
+    entry_last_error: str | None = None
+    entry_filled_qty: float = 0.0
+    entry_filled_value: float = 0.0
     fill_price: float | None = None
     fill_qty: float | None = None
     entered_at: str | None = None
@@ -343,9 +352,13 @@ def _place_limit_buy(
     ticker: str,
     usd: float,
     limit_price: float,
+    ref_key: str,
 ) -> OrderResult:
     """Place a marketable dollar-based limit buy capped at ``limit_price``."""
-    ref_id = str(uuid.uuid5(uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), f"daytrader:{ticker}:{time.time()}"))
+    ref_id = str(uuid.uuid5(
+        uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
+        f"dayentry:{ref_key}",
+    ))
     order_kwargs: dict[str, Any] = {
         "account_number": account_number,
         "symbol": ticker,
@@ -378,6 +391,10 @@ def _place_limit_buy(
                 if avg is not None and qty is not None:
                     fill_price = float(avg)
                     fill_qty = float(qty)
+                if str(state).lower() in {
+                    "filled", "partially_filled", "cancelled", "canceled",
+                    "rejected", "failed", "expired",
+                }:
                     break
         except Exception:
             pass
@@ -493,12 +510,14 @@ def _place_limit_sell(session: _MCPSession, account_number: str, ticker: str, qt
         return None
 
 
-def _cancel_order(session: _MCPSession, account_number: str, order_id: str) -> None:
+def _cancel_order(session: _MCPSession, account_number: str, order_id: str) -> bool:
     try:
         session.call("cancel_equity_order", account_number=account_number, order_id=order_id)
         log.info("Cancelled order %s", order_id)
+        return True
     except Exception as exc:
         log.warning("Could not cancel order %s: %s", order_id, exc)
+        return False
 
 
 def _market_sell_all(
@@ -718,16 +737,7 @@ def _activate_filled_position(
     pos: DayPosition,
     result: OrderResult,
 ) -> bool:
-    """Move a filled entry into managed open-position state."""
-    if result.state.lower() == "partially_filled":
-        # Stop the unfilled remainder before managing the shares already bought.
-        # Re-read once after cancellation in case the final fill quantity changed.
-        _cancel_order(session, account_number, result.order_id)
-        latest = _poll_order(
-            session, account_number, pos.ticker, result.order_id
-        )
-        if latest and latest.fill_price and latest.fill_qty:
-            result = latest
+    """Move a final entry fill into managed open-position state."""
     if not result.fill_price or not result.fill_qty:
         return False
 
@@ -753,6 +763,160 @@ def _activate_filled_position(
         pos.target_price,
         pos.buy_order_id,
     )
+    return True
+
+
+_ENTRY_TERMINAL_FAILURE_STATES = {
+    "cancelled", "canceled", "rejected", "failed", "expired",
+}
+
+
+def _record_entry_fill(pos: DayPosition, result: OrderResult) -> bool:
+    """Persist the broker's cumulative entry fill without double counting."""
+    if result.fill_price is None or not result.fill_qty:
+        return False
+    qty = float(result.fill_qty)
+    value = float(result.fill_usd or result.fill_price * qty)
+    if qty == pos.entry_filled_qty and value == pos.entry_filled_value:
+        return False
+    pos.entry_filled_qty = qty
+    pos.entry_filled_value = value
+    return True
+
+
+def _request_entry_cancel(
+    session: _MCPSession,
+    account_number: str,
+    pos: DayPosition,
+    reason: str,
+) -> bool:
+    """Request cancellation once, while keeping the order pending until final."""
+    if not pos.buy_order_id or pos.entry_cancel_requested_at:
+        return False
+    if not _cancel_order(session, account_number, pos.buy_order_id):
+        pos.entry_last_error = f"cancel_failed:{reason}"
+        return True
+    pos.entry_cancel_requested_at = datetime.now(timezone.utc).isoformat()
+    pos.entry_cancel_reason = reason
+    pos.entry_last_error = None
+    log.info(
+        "Entry cancellation requested for %s order=%s reason=%s",
+        pos.ticker,
+        pos.buy_order_id,
+        reason,
+    )
+    return True
+
+
+def _apply_entry_order_result(
+    session: _MCPSession,
+    account_number: str,
+    pos: DayPosition,
+    result: OrderResult,
+) -> bool:
+    """Apply an entry update without exposing an unknown residual buy quantity."""
+    changed = _record_entry_fill(pos, result)
+    state = result.state.lower()
+
+    if state == "filled":
+        pos.entry_last_error = None
+        return _activate_filled_position(
+            session, account_number, pos, result
+        ) or changed
+
+    if state in _ENTRY_TERMINAL_FAILURE_STATES:
+        # A cancelled order can still contain a legitimate partial fill.  Only
+        # after the order is terminal do we know the final quantity to protect.
+        if pos.entry_filled_qty > 0:
+            fill_price = (
+                pos.entry_filled_value / pos.entry_filled_qty
+                if pos.entry_filled_value > 0
+                else result.fill_price
+            )
+            if fill_price:
+                final_result = OrderResult(
+                    result.order_id,
+                    state,
+                    fill_price,
+                    pos.entry_filled_qty,
+                    pos.entry_filled_value or fill_price * pos.entry_filled_qty,
+                )
+                return _activate_filled_position(
+                    session, account_number, pos, final_result
+                ) or changed
+        pos.status = "expired"
+        pos.exit_reason = (
+            f"entry_{pos.entry_cancel_reason}"
+            if pos.entry_cancel_reason
+            else f"entry_{state}"
+        )
+        pos.entry_last_error = state
+        return True
+
+    if pos.entry_filled_qty > 0:
+        # Do not install protection for a moving quantity.  Cancel the
+        # remainder first, then activate the final partial fill above.
+        return _request_entry_cancel(
+            session, account_number, pos, "partial_fill"
+        ) or changed
+    return changed
+
+
+def _entry_order_timed_out(pos: DayPosition, now: datetime) -> bool:
+    if not pos.entry_submitted_at:
+        return False
+    try:
+        submitted = datetime.fromisoformat(pos.entry_submitted_at)
+    except ValueError:
+        return True
+    if submitted.tzinfo is None:
+        submitted = submitted.replace(tzinfo=timezone.utc)
+    return (now.astimezone(timezone.utc) - submitted).total_seconds() >= ENTRY_ORDER_TTL_S
+
+
+def _submit_or_recover_entry(
+    session: _MCPSession,
+    account_number: str,
+    pos: DayPosition,
+) -> bool:
+    """Submit an entry with a stable ref, or recover its acknowledgement."""
+    if pos.buy_order_id or pos.entry_limit_price is None:
+        return False
+    if not pos.entry_submitted_at:
+        pos.entry_submitted_at = datetime.now(timezone.utc).isoformat()
+    pos.status = "pending_entry"
+    # Persist the intent before crossing the broker boundary.  A restart can
+    # safely repeat this call because ``pos.id`` generates the same ref_id.
+    _append_position(pos)
+    try:
+        result = _place_limit_buy(
+            session,
+            account_number,
+            pos.ticker,
+            DAY_TRADE_BUDGET_USD,
+            pos.entry_limit_price,
+            pos.id,
+        )
+    except Exception as exc:
+        pos.entry_last_error = f"submission_ambiguous:{exc}"
+        log.error(
+            "Entry acknowledgement missing for %s; stable-ref recovery will retry: %s",
+            pos.ticker,
+            exc,
+        )
+        return True
+
+    pos.buy_order_id = result.order_id
+    pos.entry_last_error = None
+    _apply_entry_order_result(session, account_number, pos, result)
+    if pos.status == "pending_entry":
+        log.info(
+            "Entry order pending for %s at limit %.4f order=%s state=%s",
+            pos.ticker,
+            pos.entry_limit_price,
+            result.order_id,
+            result.state,
+        )
     return True
 
 
@@ -857,16 +1021,29 @@ def run_once(
             runtime.schedule(pos)
 
         # --- Resolve a limit entry that remained pending after submission. ---
+        if pos.status == "pending_entry" and not pos.buy_order_id:
+            if _submit_or_recover_entry(session, account_number, pos):
+                changed = True
+
         if pos.status == "pending_entry" and pos.buy_order_id:
             result = _poll_order(session, account_number, pos.ticker, pos.buy_order_id)
-            if result and _activate_filled_position(session, account_number, pos, result):
+            if result and _apply_entry_order_result(
+                session, account_number, pos, result
+            ):
                 changed = True
-            elif result and result.state.lower() in {
-                "cancelled", "canceled", "rejected", "failed", "expired"
-            }:
-                pos.status = "expired"
-                pos.exit_reason = f"entry_{result.state.lower()}"
-                changed = True
+
+            if pos.status == "pending_entry" and not pos.entry_cancel_requested_at:
+                cancel_reason: str | None = None
+                if force_close:
+                    cancel_reason = "eod"
+                elif price is not None and pos.trigger_price and price < pos.trigger_price:
+                    cancel_reason = "lost_trigger"
+                elif _entry_order_timed_out(pos, now):
+                    cancel_reason = "timeout"
+                if cancel_reason and _request_entry_cancel(
+                    session, account_number, pos, cancel_reason
+                ):
+                    changed = True
 
         # --- Resolve or retry a broker-confirmed exit. ---
         if pos.status == "pending_exit":
@@ -900,11 +1077,9 @@ def run_once(
             continue
 
         if force_close and pos.status == "pending_entry":
-            if pos.buy_order_id:
-                _cancel_order(session, account_number, pos.buy_order_id)
-            pos.status = "expired"
-            pos.exit_reason = "entry_eod"
-            changed = True
+            # Cancellation has been requested above.  Do not mark this order
+            # expired until Robinhood reports a terminal state; it may contain
+            # a partial fill that must be sold at EOD.
             continue
 
         # --- Entry: watching -> protected limit order -> open ---
@@ -926,26 +1101,8 @@ def run_once(
                     "TRIGGER: %s price=%.4f >= trigger=%.4f — limit buying $%.0f at max %.4f",
                     pos.ticker, price, pos.trigger_price, DAY_TRADE_BUDGET_USD, limit_price,
                 )
-                try:
-                    result = _place_limit_buy(
-                        session,
-                        account_number,
-                        pos.ticker,
-                        DAY_TRADE_BUDGET_USD,
-                        limit_price,
-                    )
-                except RobinhoodMCPError as exc:
-                    log.error("Buy failed for %s: %s", pos.ticker, exc)
-                    continue
-
-                pos.buy_order_id = result.order_id
-                if not _activate_filled_position(session, account_number, pos, result):
-                    pos.status = "pending_entry"
-                    log.info(
-                        "Entry order pending for %s at limit %.4f order=%s state=%s",
-                        pos.ticker, limit_price, result.order_id, result.state,
-                    )
-                changed = True
+                if _submit_or_recover_entry(session, account_number, pos):
+                    changed = True
             continue
 
         # --- Open position management ---
