@@ -60,6 +60,18 @@ def test_heat_parser_uses_reply_ticker_and_ignores_moving_average_numbers():
     assert idea["auto_eligible"] is True
 
 
+def test_heat_parser_prefers_actual_buy_ticker_and_reviews_high_risk_trade():
+    idea = parse_heat_idea(
+        "刚发现schwab夜盘不能买MUZ，但是MUU可以买。30.5买了些MUU，短线博反弹，极高风险",
+        idea_id="live-1",
+        created_at="2026-07-16T01:49:00+00:00",
+    )
+    assert idea is not None
+    assert idea["ticker"] == "MUU"
+    assert idea["trigger_price"] == 30.5
+    assert idea["auto_eligible"] is False
+
+
 @pytest.mark.parametrize("text", [
     "SPY put 关注突破600",
     "NVDA 做空，跌破150",

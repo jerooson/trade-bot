@@ -30,8 +30,9 @@ _MANAGEMENT_RE = re.compile(
     r"(?:减仓|止盈|落袋|卖出|清仓|平仓|runner|trim|take\s*profit|sold|sell)",
     re.I,
 )
+_RISK_RE = re.compile(r"(?:极高风险|高风险|风险很高|谨慎|小仓位|轻仓)", re.I)
 _ENTRY_INTENT_RE = re.compile(
-    r"(?:关注|留意|突破|站上|超过|高于|买入|做多|考虑操作|看好|breakout|"
+    r"(?:关注|留意|突破|站上|超过|高于|买入|买了|买点|建仓|做多|考虑操作|看好|bought|breakout|"
     r"break\s*(?:out|above)|buy|long|reclaim)",
     re.I,
 )
@@ -45,10 +46,32 @@ _TRIGGER_PATTERNS = (
         r"\$?([0-9]+(?:\.[0-9]+)?)\s*(?:以上)?\s*(?:突破|站上|breakout|break\s*above)",
         re.I,
     ),
+    re.compile(
+        r"\$?([0-9]+(?:\.[0-9]+)?)\s*(?:附近|左右)?\s*"
+        r"(?:买入|买了|买点|建仓|做多|bought|buy)",
+        re.I,
+    ),
+)
+
+_DIRECT_BUY_TICKER_PATTERNS = (
+    re.compile(
+        r"\$?[0-9]+(?:\.[0-9]+)?\s*(?:附近|左右)?\s*"
+        r"(?:买入|买了|买点|建仓|做多)[^A-Z0-9]{0,10}\$?([A-Z][A-Z0-9.-]{0,5})",
+        re.I,
+    ),
+    re.compile(
+        r"\$?([A-Z][A-Z0-9.-]{0,5})[^0-9]{0,12}\$?[0-9]+(?:\.[0-9]+)?\s*"
+        r"(?:买入|买了|买点|建仓|做多|bought|buy)",
+        re.I,
+    ),
 )
 
 
 def _ticker_from(text: str) -> str | None:
+    for pattern in _DIRECT_BUY_TICKER_PATTERNS:
+        match = pattern.search(text or "")
+        if match and match.group(1).upper() not in _BLOCKED_TICKERS:
+            return match.group(1).upper()
     for match in _TICKER_RE.finditer(text or ""):
         ticker = match.group(1).upper().rstrip(".")
         if ticker not in _BLOCKED_TICKERS:
@@ -96,7 +119,9 @@ def parse_heat_idea(
         return None
 
     trigger = _trigger_from(body)
-    auto_eligible = trigger is not None
+    # Heat explicitly labels some trades as unusually risky. Preserve the
+    # parsed level for a fast review, but never auto-approve those messages.
+    auto_eligible = trigger is not None and not _RISK_RE.search(body)
     return {
         "event_type": "idea",
         "id": str(idea_id),
