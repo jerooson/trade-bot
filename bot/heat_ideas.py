@@ -114,16 +114,16 @@ def _ticker_from(text: str) -> str | None:
         ticker = cash_tag.group(1).upper().rstrip(".")
         if ticker not in _BLOCKED_TICKERS:
             return ticker
+    for match in _TICKER_RE.finditer(text or ""):
+        ticker = match.group(1).upper().rstrip(".")
+        if len(ticker) > 1 and ticker not in _BLOCKED_TICKERS:
+            return ticker
     for token in re.findall(
         r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9.-]{1,5})(?![A-Za-z0-9])",
         text or "",
     ):
         ticker = token.upper().rstrip(".")
         if ticker in _MIXED_CASE_TICKERS:
-            return ticker
-    for match in _TICKER_RE.finditer(text or ""):
-        ticker = match.group(1).upper().rstrip(".")
-        if len(ticker) > 1 and ticker not in _BLOCKED_TICKERS:
             return ticker
     return None
 

@@ -129,6 +129,16 @@ def test_heat_parser_prefers_actual_buy_ticker_and_reviews_high_risk_trade():
     assert idea["auto_eligible"] is False
 
 
+def test_heat_parser_prefers_explicit_uppercase_ticker_over_later_alias():
+    idea = parse_heat_idea(
+        "说一下我买入MUU的交易策略。原计划是MU跌破YDL后收回做反弹。",
+        idea_id="muu-context",
+        created_at="2026-07-16T13:11:24+00:00",
+    )
+    assert idea is not None
+    assert idea["ticker"] == "MUU"
+
+
 @pytest.mark.parametrize("text", [
     "SPY put 关注突破600",
     "关注 SPY sell puts",
