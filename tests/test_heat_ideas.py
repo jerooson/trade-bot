@@ -224,3 +224,35 @@ def test_heat_api_review_approve_and_toggle(monkeypatch, workspace_tmp):
     assert toggled.json()["auto_trading_enabled"] is True
     final = client.get("/api/daytrader").json()
     assert final["heat_ideas"][0]["derived_status"] == "queued"
+
+
+def test_heat_api_rejected_idea_overrides_expired_position_status(monkeypatch, workspace_tmp):
+    ideas = workspace_tmp / "logs" / "heat.jsonl"
+    decisions = workspace_tmp / "state" / "decisions.jsonl"
+    settings = workspace_tmp / "state" / "settings.json"
+    positions = workspace_tmp / "logs" / "positions.jsonl"
+    _write_jsonl(ideas, [{
+        "event_type": "idea", "id": "nq-1", "ticker": "NQ",
+        "trigger_price": 29685, "target_price": None, "setup": "20 point stop",
+        "text": "Buy NQ at 29685, 20 point SL", "reply_text": None,
+        "attachments": [], "auto_eligible": True, "confidence": "explicit",
+        "created_at": "2026-07-16T02:48:29+00:00",
+    }])
+    _write_jsonl(decisions, [{
+        "idea_id": "nq-1", "decision": "rejected",
+        "decided_at": "2026-07-16T03:10:25+00:00",
+    }])
+    _write_jsonl(positions, [{
+        "id": "heat-nq-1", "ticker": "NQ", "source": "heat",
+        "heat_idea_id": "nq-1", "status": "expired", "fill_qty": None,
+        "exit_reason": "heat_disabled",
+    }])
+    settings.write_text('{"auto_trading_enabled": true}', encoding="utf-8")
+    monkeypatch.setattr(api, "HEAT_IDEAS_PATH", ideas)
+    monkeypatch.setattr(api, "HEAT_DECISIONS_PATH", decisions)
+    monkeypatch.setattr(api, "HEAT_SETTINGS_PATH", settings)
+    monkeypatch.setattr(api, "DAY_TRADE_POSITIONS_PATH", positions)
+
+    idea = TestClient(api.app).get("/api/daytrader").json()["heat_ideas"][0]
+    assert idea["derived_status"] == "rejected"
+    assert idea["position_status"] == "expired"

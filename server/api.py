@@ -710,7 +710,16 @@ def _heat_idea_views(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         position = next((p for p in reversed(related) if p.get("status") in {
             "watching", "pending_entry", "open", "pending_exit", "closed", "expired"
         }), None)
-        if position:
+        has_execution = any(
+            p.get("fill_qty") or p.get("status") in {"open", "pending_exit", "closed"}
+            for p in related
+        )
+        if idea.get("decision") == "rejected" and not has_execution:
+            idea["derived_status"] = "rejected"
+            if position:
+                idea["position_id"] = position.get("id")
+                idea["position_status"] = position.get("status")
+        elif position:
             idea["position_id"] = position.get("id")
             idea["position_status"] = position.get("status")
             if position.get("fill_qty") or position.get("status") in {"open", "pending_exit", "closed"}:
@@ -721,8 +730,6 @@ def _heat_idea_views(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 idea["derived_status"] = "entry_pending"
             else:
                 idea["derived_status"] = "armed" if position.get("armed") else "waiting_rearm"
-        elif idea.get("decision") == "rejected":
-            idea["derived_status"] = "rejected"
         elif idea.get("decision") == "approved":
             idea["derived_status"] = (
                 "unsupported_mapping"
