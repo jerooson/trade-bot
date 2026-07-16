@@ -737,11 +737,41 @@ def _heat_idea_views(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 else ("queued" if enabled else "paused")
             )
         else:
-            idea["derived_status"] = "needs_review"
+            classification = str(idea.get("classification") or "needs_level")
+            idea["derived_status"] = (
+                "needs_review"
+                if classification == "actionable_setup"
+                else classification
+            )
         idea["attachment_urls"] = [
             f"/api/daytrader/heat-attachments/{name}"
             for name in idea.get("attachments") or []
         ]
+
+    latest_tickers: set[str] = set()
+    for index, idea in enumerate(ideas):
+        ticker = str(idea.get("ticker") or "").upper()
+        idea["is_latest_for_ticker"] = ticker not in latest_tickers
+        latest_tickers.add(ticker)
+        earlier = [
+            previous
+            for previous in ideas[index + 1:]
+            if str(previous.get("ticker") or "").upper() == ticker
+        ]
+        idea["ticker_history"] = [
+            {
+                "id": previous.get("id"),
+                "ticker": previous.get("ticker"),
+                "text": previous.get("text"),
+                "classification": previous.get("classification"),
+                "trigger_price": previous.get("trigger_price"),
+                "derived_status": previous.get("derived_status"),
+                "created_at": previous.get("created_at"),
+                "attachment_urls": previous.get("attachment_urls") or [],
+            }
+            for previous in earlier[:5]
+        ]
+        idea["history_count"] = len(earlier)
     return ideas
 
 

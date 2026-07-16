@@ -45,6 +45,62 @@ def test_heat_parser_routes_chart_watch_to_review():
     assert idea["ticker"] == "GOOGL"
     assert idea["trigger_price"] is None
     assert idea["auto_eligible"] is False
+    assert idea["classification"] == "needs_level"
+
+
+def test_heat_parser_normalizes_mixed_case_ticker_without_matching_word_fragment():
+    msft = parse_heat_idea(
+        "Msft关注能否站稳 fib 0.5",
+        idea_id="msft-1",
+        created_at="2026-07-16T17:14:03+00:00",
+    )
+    false_positive = parse_heat_idea(
+        "不是，是今天才突破黄线的，一触发Alter，就可以买入",
+        idea_id="alter-1",
+        created_at="2026-07-16T16:56:07+00:00",
+    )
+    assert msft is not None
+    assert msft["ticker"] == "MSFT"
+    assert msft["classification"] == "needs_level"
+    assert false_positive is None
+
+
+def test_heat_parser_requires_cash_tag_for_single_letter_ticker():
+    assert parse_heat_idea(
+        "M关注突破",
+        idea_id="bare-m",
+        created_at="2026-07-16T17:14:03+00:00",
+    ) is None
+    tagged = parse_heat_idea(
+        "$M关注突破",
+        idea_id="tagged-m",
+        created_at="2026-07-16T17:14:03+00:00",
+    )
+    assert tagged is not None and tagged["ticker"] == "M"
+
+
+def test_heat_parser_classifies_swing_context_and_position_updates():
+    ibm = parse_heat_idea(
+        "喜欢抄底操作的可以关注IBM，fib 1支撑反弹，有可能会去回补缺口",
+        idea_id="ibm-1",
+        created_at="2026-07-16T17:25:18+00:00",
+    )
+    iwm = parse_heat_idea(
+        "IWM站上YDH，所以并不是全面下跌的市场，只是资金轮换",
+        idea_id="iwm-1",
+        created_at="2026-07-16T14:11:47+00:00",
+    )
+    muu = parse_heat_idea(
+        "说一下我买入MUU的交易策略，买早了，仓位很轻，今天收不回去就应该止损",
+        idea_id="muu-1",
+        created_at="2026-07-16T13:11:24+00:00",
+    )
+    assert ibm is not None and ibm["classification"] == "swing_dca"
+    assert iwm is not None and iwm["classification"] == "market_context"
+    assert muu is not None and muu["classification"] == "position_update"
+    assert not ibm["auto_eligible"]
+    assert not iwm["auto_eligible"]
+    assert not muu["auto_eligible"]
 
 
 def test_heat_parser_uses_reply_ticker_and_ignores_moving_average_numbers():
@@ -99,12 +155,15 @@ def test_heat_parser_accepts_explicit_bearish_breakdown_route():
     assert idea["leveraged_candidates"] == ["NVD", "NVDQ"]
 
 
-def test_heat_parser_still_rejects_position_management_only():
-    assert parse_heat_idea(
+def test_heat_parser_keeps_position_management_as_non_trade_context():
+    idea = parse_heat_idea(
         "GOOGL 减仓一半",
         idea_id="5",
         created_at="2026-07-15T15:00:00+00:00",
-    ) is None
+    )
+    assert idea is not None
+    assert idea["classification"] == "position_update"
+    assert idea["auto_eligible"] is False
 
 
 def test_materializer_associates_followup_chart_and_review_decision():
@@ -123,6 +182,24 @@ def test_materializer_associates_followup_chart_and_review_decision():
     assert rows[0]["attachments"] == ["chart.png"]
     assert rows[0]["trigger_price"] == 360.5
     assert rows[0]["status"] == "approved"
+
+
+def test_materializer_repairs_legacy_m_and_hides_alter_false_positive():
+    rows = materialize_heat_ideas([
+        {
+            "event_type": "idea", "id": "msft", "ticker": "M",
+            "text": "Msft关注能否站稳 fib 0.5", "reply_text": None,
+            "trigger_price": None, "direction": "long", "auto_eligible": False,
+            "created_at": "2026-07-16T17:14:03+00:00",
+        },
+        {
+            "event_type": "idea", "id": "alter", "ticker": "A",
+            "text": "不是，是今天才突破黄线的，一触发Alter，就可以买入",
+            "reply_text": None, "trigger_price": None, "direction": "long",
+            "auto_eligible": False, "created_at": "2026-07-16T16:56:07+00:00",
+        },
+    ])
+    assert [row["ticker"] for row in rows] == ["MSFT"]
 
 
 def test_day_trader_sync_creates_unarmed_current_day_heat_watch(monkeypatch, workspace_tmp):
@@ -207,7 +284,7 @@ def test_heat_api_review_approve_and_toggle(monkeypatch, workspace_tmp):
     client = TestClient(api.app)
 
     initial = client.get("/api/daytrader").json()
-    assert initial["heat_ideas"][0]["derived_status"] == "needs_review"
+    assert initial["heat_ideas"][0]["derived_status"] == "needs_level"
     approved = client.post("/api/daytrader/heat-ideas/spy-1/approve", json={
         "ticker": "SPY", "trigger_price": 660.5,
         "target_price": 672, "setup": "descending-line breakout",
@@ -224,6 +301,45 @@ def test_heat_api_review_approve_and_toggle(monkeypatch, workspace_tmp):
     assert toggled.json()["auto_trading_enabled"] is True
     final = client.get("/api/daytrader").json()
     assert final["heat_ideas"][0]["derived_status"] == "queued"
+
+
+def test_heat_api_groups_earlier_context_by_ticker(monkeypatch, workspace_tmp):
+    ideas = workspace_tmp / "logs" / "heat.jsonl"
+    decisions = workspace_tmp / "state" / "decisions.jsonl"
+    settings = workspace_tmp / "state" / "settings.json"
+    positions = workspace_tmp / "logs" / "positions.jsonl"
+    _write_jsonl(ideas, [
+        {
+            "event_type": "idea", "id": "msft-old", "ticker": "MSFT",
+            "trigger_price": 520, "target_price": None,
+            "text": "MSFT突破520关注", "setup": "MSFT突破520关注",
+            "reply_text": None, "attachments": ["old.png"],
+            "direction": "long", "auto_eligible": False,
+            "created_at": "2026-07-15T14:00:00+00:00",
+        },
+        {
+            "event_type": "idea", "id": "msft-new", "ticker": "M",
+            "trigger_price": None, "target_price": None,
+            "text": "Msft关注能否站稳 fib 0.5", "setup": "fib watch",
+            "reply_text": None, "attachments": [],
+            "direction": "long", "auto_eligible": False,
+            "created_at": "2026-07-16T17:14:03+00:00",
+        },
+    ])
+    monkeypatch.setattr(api, "HEAT_IDEAS_PATH", ideas)
+    monkeypatch.setattr(api, "HEAT_DECISIONS_PATH", decisions)
+    monkeypatch.setattr(api, "HEAT_SETTINGS_PATH", settings)
+    monkeypatch.setattr(api, "DAY_TRADE_POSITIONS_PATH", positions)
+
+    heat = TestClient(api.app).get("/api/daytrader").json()["heat_ideas"]
+    assert heat[0]["ticker"] == "MSFT"
+    assert heat[0]["is_latest_for_ticker"] is True
+    assert heat[0]["history_count"] == 1
+    assert heat[0]["ticker_history"][0]["trigger_price"] == 520
+    assert heat[0]["ticker_history"][0]["attachment_urls"] == [
+        "/api/daytrader/heat-attachments/old.png"
+    ]
+    assert heat[1]["is_latest_for_ticker"] is False
 
 
 def test_heat_api_rejected_idea_overrides_expired_position_status(monkeypatch, workspace_tmp):

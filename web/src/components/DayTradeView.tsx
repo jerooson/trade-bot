@@ -6,6 +6,7 @@ import { SignalsView, type DashLike } from "./SignalsView";
 import { relativeTime } from "../lib/format";
 
 type SubTab = "plans" | "heat" | "manual" | "active" | "pnl";
+type HeatFilter = "review" | "swing" | "context" | "all";
 
 interface Props {
   dash: DashLike;
@@ -85,7 +86,7 @@ export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSett
                 : "border-ink-500/60 text-bone-400 hover:border-bone-300 hover:text-bone-100",
             )}
           >
-            {t === "plans" ? "Signal Plans" : t === "heat" ? `Heat Ideas${heatIdeas.filter(i => i.derived_status === "needs_review").length ? ` (${heatIdeas.filter(i => i.derived_status === "needs_review").length})` : ""}` : t === "manual" ? "Manual Watches" : t === "active" ? "Active Trades" : "P&L"}
+            {t === "plans" ? "Signal Plans" : t === "heat" ? `Heat Ideas${heatIdeas.filter(i => i.decision === null && ["actionable_setup", "needs_level"].includes(i.classification)).length ? ` (${heatIdeas.filter(i => i.decision === null && ["actionable_setup", "needs_level"].includes(i.classification)).length})` : ""}` : t === "manual" ? "Manual Watches" : t === "active" ? "Active Trades" : "P&L"}
           </button>
         ))}
       </div>
@@ -106,6 +107,24 @@ function HeatIdeasTab({ ideas, settings, onChanged }: {
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState<HeatFilter>("review");
+  const [latestOnly, setLatestOnly] = useState(true);
+
+  const counts = {
+    review: ideas.filter((idea) => idea.decision === null && ["actionable_setup", "needs_level"].includes(idea.classification)).length,
+    swing: ideas.filter((idea) => idea.decision !== "rejected" && idea.classification === "swing_dca").length,
+    context: ideas.filter((idea) => idea.decision !== "rejected" && ["market_context", "position_update"].includes(idea.classification)).length,
+    all: ideas.length,
+  };
+  const filteredIdeas = ideas.filter((idea) => {
+    if (filter === "review") return idea.decision === null && ["actionable_setup", "needs_level"].includes(idea.classification);
+    if (filter === "swing") return idea.decision !== "rejected" && idea.classification === "swing_dca";
+    if (filter === "context") return idea.decision !== "rejected" && ["market_context", "position_update"].includes(idea.classification);
+    return true;
+  });
+  const visibleIdeas = latestOnly
+    ? filteredIdeas.filter((idea, index) => filteredIdeas.findIndex((candidate) => candidate.ticker === idea.ticker) === index)
+    : filteredIdeas;
 
   async function toggle() {
     setBusy(true);
@@ -141,9 +160,31 @@ function HeatIdeasTab({ ideas, settings, onChanged }: {
       {error && <div className="border border-crt-short/50 bg-crt-short/10 px-4 py-3 text-sm text-crt-short">{error}</div>}
 
       <Section title="Heat Ideas" subtitle="newest first · images are saved locally before Discord links expire">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink-500/30 bg-ink-950 p-3">
+          <div className="flex flex-wrap gap-2">
+            {(["review", "swing", "context", "all"] as HeatFilter[]).map((item) => (
+              <button
+                key={item}
+                onClick={() => setFilter(item)}
+                className={clsx(
+                  "border px-2.5 py-1 text-[9px] uppercase tracking-[0.16em]",
+                  filter === item ? "border-crt-amber/60 text-crt-amber" : "border-ink-500/60 text-bone-500",
+                )}
+              >
+                {item === "review" ? "Trade Review" : item === "swing" ? "Swing / DCA" : item === "context" ? "Context" : "All"} ({counts[item]})
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => setLatestOnly((value) => !value)}
+            className={clsx("border px-2.5 py-1 text-[9px] uppercase tracking-[0.16em]", latestOnly ? "border-crt-long/50 text-crt-long" : "border-ink-500/60 text-bone-500")}
+          >
+            {latestOnly ? "Latest per ticker" : "Full message log"}
+          </button>
+        </div>
         <div className="grid grid-cols-1 gap-px bg-ink-500/20 lg:grid-cols-2">
-          {ideas.map((idea) => <HeatIdeaCard key={idea.id} idea={idea} onChanged={onChanged} />)}
-          {ideas.length === 0 && <div className="col-span-full bg-ink-950 px-6 py-12 text-center font-editorial italic text-bone-400">No Heat ideas captured yet.</div>}
+          {visibleIdeas.map((idea) => <HeatIdeaCard key={idea.id} idea={idea} onChanged={onChanged} />)}
+          {visibleIdeas.length === 0 && <div className="col-span-full bg-ink-950 px-6 py-12 text-center font-editorial italic text-bone-400">No Heat items in this view.</div>}
         </div>
       </Section>
     </div>
@@ -160,6 +201,14 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => Pr
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const executed = idea.derived_status === "executed";
+  const tradeReviewable = ["actionable_setup", "needs_level"].includes(idea.classification);
+  const categoryLabel = {
+    actionable_setup: "actionable",
+    needs_level: "needs level",
+    market_context: "market context",
+    position_update: "position update",
+    swing_dca: "swing / dca",
+  }[idea.classification];
 
   async function approve() {
     const triggerPrice = Number(trigger);
@@ -206,7 +255,7 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => Pr
         <div>
           <span className="font-editorial text-2xl italic text-bone-50">{idea.ticker}</span>
           <span className={clsx("ml-2 border px-1.5 py-0.5 text-[8px] uppercase tracking-[0.15em]", idea.auto_eligible ? "border-crt-long/40 text-crt-long" : "border-crt-amber/40 text-crt-amber")}>
-            {idea.auto_eligible ? "explicit" : "review"}
+            {categoryLabel}
           </span>
         </div>
         <div className="text-right text-[9px] uppercase tracking-[0.14em] text-bone-500">
@@ -217,9 +266,13 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => Pr
 
       <p className="mt-3 whitespace-pre-wrap text-[12px] leading-5 text-bone-300">{idea.text}</p>
       <div className="mt-2 text-[10px] uppercase tracking-[0.14em] text-bone-500">
-        {idea.mapping_supported
-          ? `P0 route: ${idea.leveraged_candidates.join(" / ")}`
-          : "No P0 leveraged ETF route — review only"}
+        {idea.classification === "swing_dca"
+          ? "Swing / DCA context — intraday automation disabled"
+          : ["market_context", "position_update"].includes(idea.classification)
+            ? "Context only — no trade approval"
+            : idea.mapping_supported
+              ? `P0 route: ${idea.leveraged_candidates.join(" / ")}`
+              : "No P0 leveraged ETF route — review only"}
       </div>
       {idea.reply_text && <p className="mt-2 border-l border-ink-500 pl-3 text-[10px] leading-4 text-bone-500">Reply context: {idea.reply_text}</p>}
 
@@ -229,7 +282,40 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => Pr
         </div>
       )}
 
-      {!executed && (
+      {idea.ticker_history.length > 0 && (
+        <details className="mt-3 border border-ink-500/40 bg-ink-900/30 px-3 py-2">
+          <summary className="cursor-pointer text-[9px] uppercase tracking-[0.16em] text-crt-amber">
+            Earlier {idea.ticker} context ({idea.history_count})
+          </summary>
+          <div className="mt-2 space-y-2">
+            {idea.ticker_history.map((previous) => (
+              <div key={previous.id} className="border-l border-ink-500 pl-3 text-[10px] leading-4 text-bone-400">
+                <div className="uppercase tracking-[0.12em] text-bone-600">
+                  {relativeTime(previous.created_at)} · {previous.classification.replaceAll("_", " ")}
+                  {previous.trigger_price != null ? ` · level ${previous.trigger_price}` : ""}
+                </div>
+                <div className="mt-1 whitespace-pre-wrap">{previous.text}</div>
+                {previous.attachment_urls.length > 0 && (
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    {previous.attachment_urls.map((url) => (
+                      <a key={url} href={url} target="_blank" rel="noreferrer">
+                        <img src={url} alt={`${idea.ticker} earlier Heat chart`} className="max-h-28 w-full border border-ink-500/40 object-contain" />
+                      </a>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+      {idea.classification === "needs_level" && idea.history_count === 0 && (
+        <div className="mt-3 border-l border-crt-amber/50 pl-3 text-[10px] leading-4 text-bone-500">
+          No earlier saved {idea.ticker} context. The listener does not backfill older Discord history.
+        </div>
+      )}
+
+      {!executed && tradeReviewable && (
         <div className="mt-4 grid grid-cols-2 gap-2">
           <Field label="Ticker" value={ticker} onChange={setTicker} placeholder="GOOGL" span="" />
           <Field label="Trigger >" value={trigger} onChange={setTrigger} placeholder="360.00" type="number" span="" />
@@ -253,10 +339,15 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => Pr
       )}
 
       {error && <div className="mt-2 text-[10px] text-crt-short">{error}</div>}
-      {!executed && (
+      {!executed && tradeReviewable && (
         <div className="mt-3 flex gap-2">
           <button disabled={busy} onClick={approve} className="border border-crt-long/50 px-3 py-1.5 text-[9px] uppercase tracking-[0.16em] text-crt-long disabled:opacity-40">Approve / Update</button>
           {idea.decision !== "rejected" && <button disabled={busy} onClick={reject} className="border border-crt-short/50 px-3 py-1.5 text-[9px] uppercase tracking-[0.16em] text-crt-short disabled:opacity-40">Reject</button>}
+        </div>
+      )}
+      {!executed && !tradeReviewable && idea.decision !== "rejected" && (
+        <div className="mt-3">
+          <button disabled={busy} onClick={reject} className="border border-ink-500/60 px-3 py-1.5 text-[9px] uppercase tracking-[0.16em] text-bone-500 disabled:opacity-40">Dismiss</button>
         </div>
       )}
     </article>

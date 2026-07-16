@@ -248,11 +248,24 @@ export interface HeatIdea {
   reply_text: string | null;
   auto_eligible: boolean;
   confidence: "high" | "review";
+  classification: "actionable_setup" | "needs_level" | "market_context" | "position_update" | "swing_dca";
   status: "auto_approved" | "approved" | "rejected" | "needs_review";
   decision: "approved" | "rejected" | null;
   derived_status: string;
   created_at: string;
   attachment_urls: string[];
+  is_latest_for_ticker: boolean;
+  history_count: number;
+  ticker_history: Array<{
+    id: string;
+    ticker: string;
+    text: string;
+    classification: HeatIdea["classification"];
+    trigger_price: number | null;
+    derived_status: string;
+    created_at: string;
+    attachment_urls: string[];
+  }>;
   position_id?: string | null;
   position_status?: DayTradeStatus | null;
 }
