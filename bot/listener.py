@@ -22,12 +22,14 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import discord  # provided by `discord.py-self`
 from dotenv import load_dotenv
 
 from bot.parser import Signal, parse_message
+from bot.heat_ideas import append_jsonl as append_heat_jsonl, parse_heat_idea
 from bot.plan_parser import TradePlan, parse_plan
 from bot.swing_parser import TradeAction, parse_swing
 
@@ -48,7 +50,7 @@ def _setup_logging() -> None:
 class ListenerConfig:
     """Resolved configuration for the listener.
 
-    Each watched channel falls into one of three roles, each with its own
+    Each watched channel falls into one of four roles, each with its own
     parser and JSONL log:
 
     - `signal_channels`  -> bot.parser       (PLAN/TRIGGER/PROFIT signals)
@@ -62,13 +64,23 @@ class ListenerConfig:
     signal_channels: set[int]
     plan_channels: set[int]
     swing_channels: set[int]
+    heat_channels: set[int]
+    heat_author_ids: set[int]
     signal_log_path: Path
     plan_log_path: Path
     swing_log_path: Path
+    heat_log_path: Path
+    heat_attachments_dir: Path
+    heat_max_attachment_bytes: int
 
     @property
     def all_channels(self) -> set[int]:
-        return self.signal_channels | self.plan_channels | self.swing_channels
+        return (
+            self.signal_channels
+            | self.plan_channels
+            | self.swing_channels
+            | self.heat_channels
+        )
 
 
 def _parse_channel_ids(raw: str, var_name: str) -> set[int]:
@@ -96,17 +108,26 @@ def _load_config() -> ListenerConfig:
     swing_channels = _parse_channel_ids(
         os.environ.get("DISCORD_SWING_CHANNEL_IDS", ""), "DISCORD_SWING_CHANNEL_IDS"
     )
+    heat_channels = _parse_channel_ids(
+        os.environ.get("DISCORD_HEAT_CHANNEL_IDS", ""), "DISCORD_HEAT_CHANNEL_IDS"
+    )
+    heat_author_ids = _parse_channel_ids(
+        os.environ.get("DISCORD_HEAT_AUTHOR_IDS", ""), "DISCORD_HEAT_AUTHOR_IDS"
+    )
 
-    if not (signal_channels or plan_channels or swing_channels):
+    if not (signal_channels or plan_channels or swing_channels or heat_channels):
         sys.exit(
             "At least one of DISCORD_CHANNEL_IDS / DISCORD_PLAN_CHANNEL_IDS / "
-            "DISCORD_SWING_CHANNEL_IDS must be set in .env"
+            "DISCORD_SWING_CHANNEL_IDS / DISCORD_HEAT_CHANNEL_IDS must be set in .env"
         )
+    if heat_channels and not heat_author_ids:
+        sys.exit("DISCORD_HEAT_AUTHOR_IDS is required when a Heat channel is configured")
 
     sets = [
         ("DISCORD_CHANNEL_IDS", signal_channels),
         ("DISCORD_PLAN_CHANNEL_IDS", plan_channels),
         ("DISCORD_SWING_CHANNEL_IDS", swing_channels),
+        ("DISCORD_HEAT_CHANNEL_IDS", heat_channels),
     ]
     for i in range(len(sets)):
         for j in range(i + 1, len(sets)):
@@ -120,17 +141,33 @@ def _load_config() -> ListenerConfig:
     signal_log_path = Path(os.environ.get("SIGNAL_LOG_PATH", "./logs/signals.jsonl"))
     plan_log_path = Path(os.environ.get("PLAN_LOG_PATH", "./logs/plans.jsonl"))
     swing_log_path = Path(os.environ.get("SWING_LOG_PATH", "./logs/swings.jsonl"))
-    for p in (signal_log_path, plan_log_path, swing_log_path):
+    heat_log_path = Path(os.environ.get("HEAT_IDEAS_LOG_PATH", "./logs/heat_ideas.jsonl"))
+    heat_attachments_dir = Path(
+        os.environ.get("HEAT_ATTACHMENTS_DIR", "./logs/heat_attachments")
+    )
+    try:
+        heat_max_attachment_bytes = int(
+            os.environ.get("HEAT_MAX_ATTACHMENT_BYTES", str(8 * 1024 * 1024))
+        )
+    except ValueError:
+        sys.exit("HEAT_MAX_ATTACHMENT_BYTES must be an integer")
+    for p in (signal_log_path, plan_log_path, swing_log_path, heat_log_path):
         p.parent.mkdir(parents=True, exist_ok=True)
+    heat_attachments_dir.mkdir(parents=True, exist_ok=True)
 
     return ListenerConfig(
         token=token,
         signal_channels=signal_channels,
         plan_channels=plan_channels,
         swing_channels=swing_channels,
+        heat_channels=heat_channels,
+        heat_author_ids=heat_author_ids,
         signal_log_path=signal_log_path,
         plan_log_path=plan_log_path,
         swing_log_path=swing_log_path,
+        heat_log_path=heat_log_path,
+        heat_attachments_dir=heat_attachments_dir,
+        heat_max_attachment_bytes=heat_max_attachment_bytes,
     )
 
 
@@ -184,6 +221,9 @@ def _embed_text(embed: discord.Embed) -> str:
 def build_client(config: ListenerConfig) -> discord.Client:
     """Construct the discord.py-self client with our event handlers wired up."""
     client = discord.Client()
+    # author id -> (idea id, source timestamp).  Heat often posts chart-only
+    # messages immediately after the explanatory text.
+    recent_heat_ideas: dict[int, tuple[str, datetime]] = {}
 
     @client.event
     async def on_ready() -> None:
@@ -194,6 +234,8 @@ def build_client(config: ListenerConfig) -> discord.Client:
             log.info("Plan    channel(s): %s", ", ".join(map(str, config.plan_channels)))
         if config.swing_channels:
             log.info("Swing   channel(s): %s", ", ".join(map(str, config.swing_channels)))
+        if config.heat_channels:
+            log.info("Heat    channel(s): %s", ", ".join(map(str, config.heat_channels)))
 
     @client.event
     async def on_message(message: discord.Message) -> None:
@@ -205,6 +247,8 @@ def build_client(config: ListenerConfig) -> discord.Client:
             await _handle_plan_message(message, config.plan_log_path)
         elif cid in config.swing_channels:
             await _handle_swing_message(message, config.swing_log_path)
+        elif cid in config.heat_channels:
+            await _handle_heat_message(message)
         # else: not a watched channel, ignore.
 
     async def _handle_signal_message(message: discord.Message, log_path: Path) -> None:
@@ -272,6 +316,91 @@ def build_client(config: ListenerConfig) -> discord.Client:
             actionable_marker,
         )
 
+    async def _save_heat_attachments(message: discord.Message) -> list[str]:
+        saved: list[str] = []
+        allowed = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+        for index, attachment in enumerate(message.attachments[:4]):
+            suffix = Path(attachment.filename or "").suffix.lower()
+            content_type = str(getattr(attachment, "content_type", "") or "")
+            if suffix not in allowed and not content_type.startswith("image/"):
+                continue
+            if int(getattr(attachment, "size", 0) or 0) > config.heat_max_attachment_bytes:
+                log.warning("Skipping oversized Heat attachment %s", attachment.filename)
+                continue
+            if suffix not in allowed:
+                suffix = ".jpg"
+            filename = f"{message.id}-{index}{suffix}"
+            path = config.heat_attachments_dir / filename
+            try:
+                await attachment.save(path)
+            except Exception as exc:
+                log.warning("Could not save Heat attachment %s: %s", attachment.filename, exc)
+                continue
+            saved.append(filename)
+        return saved
+
+    async def _reply_text(message: discord.Message) -> str:
+        reference = getattr(message, "reference", None)
+        if not reference:
+            return ""
+        resolved = getattr(reference, "resolved", None)
+        if resolved is None and getattr(reference, "message_id", None):
+            try:
+                resolved = await message.channel.fetch_message(reference.message_id)
+            except Exception:
+                return ""
+        if resolved is None:
+            return ""
+        chunks = [str(getattr(resolved, "content", "") or "")]
+        for embed in getattr(resolved, "embeds", []):
+            chunks.append(_embed_text(embed))
+        return "\n".join(chunk for chunk in chunks if chunk).strip()
+
+    async def _handle_heat_message(message: discord.Message) -> None:
+        author_id = int(message.author.id)
+        if author_id not in config.heat_author_ids:
+            return
+
+        attachments = await _save_heat_attachments(message)
+        text_chunks = [message.content or ""]
+        text_chunks.extend(_embed_text(embed) for embed in message.embeds)
+        body = "\n".join(chunk for chunk in text_chunks if chunk).strip()
+        created_at = message.created_at.isoformat()
+        idea = parse_heat_idea(
+            body,
+            reply_text=await _reply_text(message),
+            idea_id=str(message.id),
+            created_at=created_at,
+        )
+        if idea is not None:
+            idea["attachments"] = attachments
+            idea["discord"] = _discord_metadata(message)
+            append_heat_jsonl(config.heat_log_path, idea)
+            recent_heat_ideas[author_id] = (idea["id"], message.created_at)
+            log.info(
+                "HEAT_IDEA %s trigger=%s mode=%s attachments=%d",
+                idea["ticker"], idea["trigger_price"],
+                "auto" if idea["auto_eligible"] else "review", len(attachments),
+            )
+            return
+
+        # Associate a separate chart-only post with Heat's immediately prior
+        # text idea.  No new order candidate is created from an image alone.
+        previous = recent_heat_ideas.get(author_id)
+        if attachments and not body and previous:
+            idea_id, previous_at = previous
+            age_s = (message.created_at - previous_at).total_seconds()
+            if 0 <= age_s <= 120:
+                append_heat_jsonl(config.heat_log_path, {
+                    "event_type": "attachment_update",
+                    "id": str(message.id),
+                    "idea_id": idea_id,
+                    "attachments": attachments,
+                    "created_at": created_at,
+                    "discord": _discord_metadata(message),
+                })
+                log.info("HEAT_CHART idea=%s attachments=%d", idea_id, len(attachments))
+
     return client
 
 
@@ -284,6 +413,8 @@ def main() -> None:
         log.info("Plans   -> %s", config.plan_log_path)
     if config.swing_channels:
         log.info("Swings  -> %s", config.swing_log_path)
+    if config.heat_channels:
+        log.info("Heat    -> %s", config.heat_log_path)
 
     client = build_client(config)
     try:

@@ -1,6 +1,8 @@
 import type {
   DayTradePnl,
   DayTradePosition,
+  HeatIdea,
+  HeatSettings,
   ManualDayPlan,
   OpenPosition,
   PnlSummary,
@@ -188,6 +190,8 @@ export interface DayTradeState {
   pnl: DayTradePnl | null;
   service_running: boolean;
   manual_plans: ManualDayPlan[];
+  heat_ideas: HeatIdea[];
+  heat_settings: HeatSettings;
 }
 
 export async function fetchDayTradeState(): Promise<DayTradeState> {
@@ -222,6 +226,42 @@ export async function cancelManualDayPlan(planId: string): Promise<void> {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.detail ?? `cancel manual watch: ${res.status}`);
   }
+}
+
+export async function approveHeatIdea(ideaId: string, input: {
+  ticker: string;
+  trigger_price: number;
+  target_price: number | null;
+  setup: string | null;
+}): Promise<HeatIdea> {
+  const res = await fetch(`/api/daytrader/heat-ideas/${ideaId}/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail ?? `approve Heat idea: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function rejectHeatIdea(ideaId: string): Promise<void> {
+  const res = await fetch(`/api/daytrader/heat-ideas/${ideaId}/reject`, { method: "POST" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail ?? `reject Heat idea: ${res.status}`);
+  }
+}
+
+export async function setHeatAutoTrading(enabled: boolean): Promise<HeatSettings> {
+  const res = await fetch("/api/daytrader/heat-settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ auto_trading_enabled: enabled }),
+  });
+  if (!res.ok) throw new Error(`Heat settings: ${res.status}`);
+  return res.json();
 }
 
 /** Open the executor orders SSE stream. Returns a cleanup function. */

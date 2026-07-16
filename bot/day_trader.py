@@ -40,6 +40,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from bot.parser import Signal, SignalKind, parse_message
+from bot.heat_ideas import (
+    HEAT_DECISIONS_PATH,
+    HEAT_IDEAS_PATH,
+    HEAT_SETTINGS_PATH,
+    load_heat_settings,
+    load_materialized_heat_ideas,
+)
 from bot.manual_day_plans import DEFAULT_PATH as MANUAL_PLANS_PATH, load_plans
 from bot.robinhood_mcp_client import (
     OrderResult,
@@ -64,6 +71,7 @@ ENTRY_ORDER_TTL_S = int(os.getenv("DAY_TRADE_ENTRY_ORDER_TTL_S", "30"))
 SCHEDULER_TICK_S = float(os.getenv("DAY_TRADE_SCHEDULER_TICK_S", "1"))
 SIGNALS_LOG = Path("logs/signals.jsonl")
 POSITIONS_LOG = Path("logs/day_trade_positions.jsonl")
+MAX_HEAT_PLANS_PER_DAY = int(os.getenv("DAY_TRADE_MAX_HEAT_PLANS_PER_DAY", "3"))
 _RECONNECT_BACKOFF_S = (5, 10, 30)
 
 # Trailing-stop milestones: list of (threshold_pct, lock_in_pct) pairs.
@@ -103,8 +111,9 @@ class DayPosition:
     setup: str | None = None
     plan_signal_id: str | None = None
     plan_received_at: str = ""        # ISO
-    source: str = "discord"           # discord | manual
+    source: str = "discord"           # discord | manual | heat
     manual_plan_id: str | None = None
+    heat_idea_id: str | None = None
     good_til_cancelled: bool = False
     armed: bool = True
     manual_cancel_requested: bool = False
@@ -383,6 +392,113 @@ def _sync_manual_plans(positions: list[DayPosition]) -> bool:
             plan_id,
         )
         changed = True
+    return changed
+
+
+def _sync_heat_ideas(
+    positions: list[DayPosition],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Create current-session watches from approved Heat ideas.
+
+    The settings switch controls creation and unfilled entries only.  Turning
+    it off never abandons an already-open position; normal stop/EOD management
+    remains active.
+    """
+    now_et = now or datetime.now(ET)
+    settings = load_heat_settings(HEAT_SETTINGS_PATH)
+    enabled = bool(settings.get("auto_trading_enabled"))
+    ideas = load_materialized_heat_ideas(HEAT_IDEAS_PATH, HEAT_DECISIONS_PATH)
+    by_id = {str(item.get("id")): item for item in ideas}
+    changed = False
+
+    for pos in positions:
+        if pos.source != "heat" or not pos.heat_idea_id:
+            continue
+        idea = by_id.get(pos.heat_idea_id)
+        approved = bool(idea and idea.get("decision") == "approved")
+        if enabled and approved:
+            continue
+        if pos.status == "watching":
+            pos.status = "expired"
+            pos.exit_reason = "heat_disabled" if not enabled else "heat_rejected"
+            pos.manual_cancel_requested = True
+            changed = True
+        elif pos.status == "pending_entry" and not pos.manual_cancel_requested:
+            pos.manual_cancel_requested = True
+            changed = True
+
+    if not enabled:
+        return changed
+
+    created_today = 0
+    for pos in positions:
+        if pos.source != "heat":
+            continue
+        try:
+            received = datetime.fromisoformat(pos.plan_received_at.replace("Z", "+00:00"))
+            if received.astimezone(ET).date() == now_et.date():
+                created_today += 1
+        except (ValueError, TypeError):
+            continue
+
+    for idea in ideas:
+        if idea.get("decision") != "approved":
+            continue
+        idea_id = str(idea.get("id", ""))
+        if not idea_id or any(p.heat_idea_id == idea_id for p in positions):
+            continue
+        try:
+            created = datetime.fromisoformat(
+                str(idea.get("created_at", "")).replace("Z", "+00:00")
+            )
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if created.astimezone(ET).date() != now_et.date():
+            continue
+        if created_today >= MAX_HEAT_PLANS_PER_DAY:
+            log.warning("Heat daily plan cap reached (%d)", MAX_HEAT_PLANS_PER_DAY)
+            break
+
+        ticker = str(idea.get("ticker", "")).upper()
+        trigger = idea.get("trigger_price")
+        if not ticker or trigger is None:
+            continue
+        if any(
+            p.ticker == ticker
+            and p.status in ("watching", "pending_entry", "open", "pending_exit")
+            for p in positions
+        ):
+            continue
+
+        pos = DayPosition(
+            ticker=ticker,
+            trigger_price=float(trigger),
+            target_price=(
+                float(idea["target_price"])
+                if idea.get("target_price") is not None
+                else None
+            ),
+            setup=idea.get("setup") or "Heat breakout watch",
+            plan_signal_id=f"heat:{idea_id}",
+            plan_received_at=created.isoformat(),
+            source="heat",
+            heat_idea_id=idea_id,
+            good_til_cancelled=False,
+            # Observe price below the trigger before accepting a new breakout.
+            armed=False,
+        )
+        positions.append(pos)
+        _append_position(pos)
+        created_today += 1
+        changed = True
+        log.info(
+            "New Heat day watch: %s trigger=%.4f target=%s idea=%s",
+            pos.ticker, pos.trigger_price, pos.target_price, idea_id,
+        )
     return changed
 
 
@@ -1114,6 +1230,8 @@ def run_once(
 
     if _sync_manual_plans(positions):
         _flush_positions(positions)
+    if _sync_heat_ideas(positions, now=now):
+        _flush_positions(positions)
 
     if not _is_market_hours(now):
         return positions
@@ -1196,7 +1314,7 @@ def run_once(
 
         if (
             pos.status == "open"
-            and pos.source == "manual"
+            and pos.source in ("manual", "heat")
             and pos.manual_cancel_requested
             and pos.fill_qty
         ):
@@ -1244,13 +1362,14 @@ def run_once(
 
         # --- Entry: watching -> protected limit order -> open ---
         if pos.status == "watching" and price is not None and pos.trigger_price is not None:
-            if pos.good_til_cancelled and not pos.armed:
+            if not pos.armed:
                 if price < pos.trigger_price:
                     pos.armed = True
                     pos.exit_reason = None
                     changed = True
                     log.info(
-                        "Manual watch armed: %s price=%.4f below trigger=%.4f",
+                        "%s watch armed: %s price=%.4f below trigger=%.4f",
+                        pos.source.capitalize(),
                         pos.ticker,
                         price,
                         pos.trigger_price,

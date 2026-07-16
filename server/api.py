@@ -29,10 +29,16 @@ from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from bot.manual_day_plans import cancel_plan, create_plan, load_plans
+from bot.heat_ideas import (
+    append_jsonl as append_heat_jsonl,
+    load_heat_settings,
+    load_materialized_heat_ideas,
+    save_heat_settings,
+)
 
 log = logging.getLogger("server.api")
 
@@ -62,6 +68,10 @@ PNL_PATH = LOG_DIR / "trade_pnl.jsonl"
 # Day trader state (written by bot/day_trader.py).
 DAY_TRADE_POSITIONS_PATH = LOG_DIR / "day_trade_positions.jsonl"
 MANUAL_DAY_TRADE_PLANS_PATH = PROJECT_ROOT / "state" / "manual_day_trade_plans.json"
+HEAT_IDEAS_PATH = LOG_DIR / "heat_ideas.jsonl"
+HEAT_ATTACHMENTS_PATH = LOG_DIR / "heat_attachments"
+HEAT_DECISIONS_PATH = PROJECT_ROOT / "state" / "heat_idea_decisions.jsonl"
+HEAT_SETTINGS_PATH = PROJECT_ROOT / "state" / "heat_settings.json"
 # Service PID file written by the day_trader process.
 DAY_TRADER_PID_PATH = LOG_DIR / "day_trader.pid"
 
@@ -691,11 +701,54 @@ def _manual_plan_views(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(views, key=lambda item: item.get("created_at") or "", reverse=True)
 
 
+def _heat_idea_views(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ideas = load_materialized_heat_ideas(HEAT_IDEAS_PATH, HEAT_DECISIONS_PATH)
+    enabled = bool(load_heat_settings(HEAT_SETTINGS_PATH).get("auto_trading_enabled"))
+    for idea in ideas:
+        related = [p for p in positions if p.get("heat_idea_id") == idea.get("id")]
+        position = next((p for p in reversed(related) if p.get("status") in {
+            "watching", "pending_entry", "open", "pending_exit", "closed", "expired"
+        }), None)
+        if position:
+            idea["position_id"] = position.get("id")
+            idea["position_status"] = position.get("status")
+            if position.get("fill_qty") or position.get("status") in {"open", "pending_exit", "closed"}:
+                idea["derived_status"] = "executed"
+            elif position.get("status") == "expired":
+                idea["derived_status"] = position.get("exit_reason") or "expired"
+            elif position.get("status") == "pending_entry":
+                idea["derived_status"] = "entry_pending"
+            else:
+                idea["derived_status"] = "armed" if position.get("armed") else "waiting_rearm"
+        elif idea.get("decision") == "rejected":
+            idea["derived_status"] = "rejected"
+        elif idea.get("decision") == "approved":
+            idea["derived_status"] = "queued" if enabled else "paused"
+        else:
+            idea["derived_status"] = "needs_review"
+        idea["attachment_urls"] = [
+            f"/api/daytrader/heat-attachments/{name}"
+            for name in idea.get("attachments") or []
+        ]
+    return ideas
+
+
 class ManualDayPlanRequest(BaseModel):
     ticker: str
     trigger_price: float
     target_price: float | None = None
     setup: str | None = None
+
+
+class HeatIdeaDecisionRequest(BaseModel):
+    ticker: str
+    trigger_price: float
+    target_price: float | None = None
+    setup: str | None = None
+
+
+class HeatSettingsRequest(BaseModel):
+    auto_trading_enabled: bool
 
 
 @app.post("/api/daytrader/manual-plans")
@@ -749,6 +802,79 @@ def remove_manual_day_plan(plan_id: str) -> dict[str, Any]:
     if plan is None:
         raise HTTPException(status_code=404, detail="manual watch not found")
     return plan
+
+
+def _find_heat_idea(idea_id: str) -> dict[str, Any] | None:
+    return next(
+        (item for item in load_materialized_heat_ideas(
+            HEAT_IDEAS_PATH, HEAT_DECISIONS_PATH
+        ) if str(item.get("id")) == idea_id),
+        None,
+    )
+
+
+@app.post("/api/daytrader/heat-ideas/{idea_id}/approve")
+def approve_heat_idea(idea_id: str, request: HeatIdeaDecisionRequest) -> dict[str, Any]:
+    idea = _find_heat_idea(idea_id)
+    if idea is None:
+        raise HTTPException(status_code=404, detail="Heat idea not found")
+    ticker = request.ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", ticker):
+        raise HTTPException(status_code=422, detail="invalid ticker")
+    if not math.isfinite(request.trigger_price) or request.trigger_price <= 0:
+        raise HTTPException(status_code=422, detail="trigger price must be positive")
+    if request.target_price is not None and (
+        not math.isfinite(request.target_price) or request.target_price <= 0
+    ):
+        raise HTTPException(status_code=422, detail="target price must be positive")
+    setup = request.setup.strip() if request.setup else None
+    if setup and len(setup) > 500:
+        raise HTTPException(status_code=422, detail="setup must be 500 characters or less")
+    append_heat_jsonl(HEAT_DECISIONS_PATH, {
+        "idea_id": idea_id,
+        "decision": "approved",
+        "ticker": ticker,
+        "trigger_price": request.trigger_price,
+        "target_price": request.target_price,
+        "setup": setup or idea.get("setup") or "Heat breakout watch",
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return _find_heat_idea(idea_id) or {}
+
+
+@app.post("/api/daytrader/heat-ideas/{idea_id}/reject")
+def reject_heat_idea(idea_id: str) -> dict[str, Any]:
+    idea = _find_heat_idea(idea_id)
+    if idea is None:
+        raise HTTPException(status_code=404, detail="Heat idea not found")
+    positions = _latest_day_trade_positions()
+    if any(
+        p.get("heat_idea_id") == idea_id
+        and (p.get("fill_qty") or p.get("status") in {"open", "pending_exit", "closed"})
+        for p in positions
+    ):
+        raise HTTPException(status_code=409, detail="Heat idea already executed")
+    append_heat_jsonl(HEAT_DECISIONS_PATH, {
+        "idea_id": idea_id,
+        "decision": "rejected",
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return _find_heat_idea(idea_id) or {}
+
+
+@app.put("/api/daytrader/heat-settings")
+def update_heat_settings(request: HeatSettingsRequest) -> dict[str, Any]:
+    return save_heat_settings(request.auto_trading_enabled, HEAT_SETTINGS_PATH)
+
+
+@app.get("/api/daytrader/heat-attachments/{filename}")
+def get_heat_attachment(filename: str) -> FileResponse:
+    if filename != Path(filename).name:
+        raise HTTPException(status_code=404, detail="attachment not found")
+    path = HEAT_ATTACHMENTS_PATH / filename
+    if not path.is_file() or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        raise HTTPException(status_code=404, detail="attachment not found")
+    return FileResponse(path)
 
 
 @app.get("/api/daytrader")
@@ -808,6 +934,8 @@ def get_daytrader_state() -> dict[str, Any]:
         },
         "service_running": service_running,
         "manual_plans": _manual_plan_views(positions),
+        "heat_ideas": _heat_idea_views(positions),
+        "heat_settings": load_heat_settings(HEAT_SETTINGS_PATH),
     }
 
 

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchDayTradeState } from "../lib/api";
-import type { DayTradePnl, DayTradePosition, ManualDayPlan } from "../lib/types";
+import type { DayTradePnl, DayTradePosition, HeatIdea, HeatSettings, ManualDayPlan } from "../lib/types";
 
 interface DayTradeDataState {
   positions: DayTradePosition[];
   manualPlans: ManualDayPlan[];
+  heatIdeas: HeatIdea[];
+  heatSettings: HeatSettings;
   pnl: DayTradePnl | null;
   serviceRunning: boolean;
   loading: boolean;
@@ -17,6 +19,8 @@ const POLL_INTERVAL_MS = 15_000;
 export function useDayTradeData(): DayTradeDataState {
   const [positions, setPositions] = useState<DayTradePosition[]>([]);
   const [manualPlans, setManualPlans] = useState<ManualDayPlan[]>([]);
+  const [heatIdeas, setHeatIdeas] = useState<HeatIdea[]>([]);
+  const [heatSettings, setHeatSettings] = useState<HeatSettings>({ auto_trading_enabled: false, updated_at: null });
   const [pnl, setPnl] = useState<DayTradePnl | null>(null);
   const [serviceRunning, setServiceRunning] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -28,6 +32,8 @@ export function useDayTradeData(): DayTradeDataState {
       const data = await fetchDayTradeState();
       setPositions(data.positions);
       setManualPlans(data.manual_plans ?? []);
+      setHeatIdeas(data.heat_ideas ?? []);
+      setHeatSettings(data.heat_settings ?? { auto_trading_enabled: false, updated_at: null });
       setPnl(data.pnl);
       setServiceRunning(data.service_running);
       setError(null);
@@ -46,5 +52,5 @@ export function useDayTradeData(): DayTradeDataState {
     };
   }, [load]);
 
-  return { positions, manualPlans, pnl, serviceRunning, loading, error, refetch: load };
+  return { positions, manualPlans, heatIdeas, heatSettings, pnl, serviceRunning, loading, error, refetch: load };
 }

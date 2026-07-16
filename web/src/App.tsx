@@ -81,6 +81,8 @@ export default function App() {
               dash={dash}
               positions={dayTradeData.positions}
               manualPlans={dayTradeData.manualPlans}
+              heatIdeas={dayTradeData.heatIdeas}
+              heatSettings={dayTradeData.heatSettings}
               pnl={dayTradeData.pnl}
               serviceRunning={dayTradeData.serviceRunning}
               onManualPlansChanged={dayTradeData.refetch}

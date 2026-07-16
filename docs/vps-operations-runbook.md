@@ -264,6 +264,34 @@ systemctl status trade-bot-shadow-review --no-pager
 journalctl -u trade-bot-shadow-review -n 100 --no-pager
 ```
 
+### Heat day-trade ideas
+
+The listener can watch Heat's channel using stable Discord ID allowlists:
+
+```dotenv
+DISCORD_HEAT_CHANNEL_IDS=1121667438254227506
+DISCORD_HEAT_AUTHOR_IDS=<stable Discord user id>
+```
+
+Both settings are required together. Only new live messages from that author
+ID are captured; listener restarts do not replay history. Explicit numeric
+long-equity entries are auto-approved. Chart-only or non-numeric ideas wait in
+**Day Trade → Heat Ideas** for approval. Options, shorts, and trade-management
+messages are excluded.
+
+The Dashboard Heat switch controls new entries. Turning it off expires or
+cancels only unfilled Heat entries; filled positions retain normal stop,
+target, and EOD management. Heat watches must first observe price below the
+trigger, use the trigger +0.2% entry cap, and default to a maximum of three
+plan lifecycles per market day.
+
+Runtime files:
+
+- `logs/heat_ideas.jsonl` — append-only ideas and chart updates
+- `logs/heat_attachments/` — locally saved images
+- `state/heat_idea_decisions.jsonl` — Dashboard approvals/rejections
+- `state/heat_settings.json` — Heat entry kill switch
+
 ## Back Up Runtime Data
 
 Create a compressed backup on the VPS:

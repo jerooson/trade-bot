@@ -1,22 +1,24 @@
 import { useState, type FormEvent } from "react";
 import clsx from "clsx";
-import type { DayTradePosition, DayTradePnl, ManualDayPlan } from "../lib/types";
-import { cancelManualDayPlan, createManualDayPlan } from "../lib/api";
+import type { DayTradePosition, DayTradePnl, HeatIdea, HeatSettings, ManualDayPlan } from "../lib/types";
+import { approveHeatIdea, cancelManualDayPlan, createManualDayPlan, rejectHeatIdea, setHeatAutoTrading } from "../lib/api";
 import { SignalsView, type DashLike } from "./SignalsView";
 import { relativeTime } from "../lib/format";
 
-type SubTab = "plans" | "manual" | "active" | "pnl";
+type SubTab = "plans" | "heat" | "manual" | "active" | "pnl";
 
 interface Props {
   dash: DashLike;
   positions: DayTradePosition[];
   manualPlans: ManualDayPlan[];
+  heatIdeas: HeatIdea[];
+  heatSettings: HeatSettings;
   pnl: DayTradePnl | null;
   serviceRunning: boolean;
   onManualPlansChanged: () => void;
 }
 
-export function DayTradeView({ dash, positions, manualPlans, pnl, serviceRunning, onManualPlansChanged }: Props) {
+export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSettings, pnl, serviceRunning, onManualPlansChanged }: Props) {
   const [sub, setSub] = useState<SubTab>("plans");
 
   const openCount = positions.filter((p) => p.status === "open" || p.status === "pending_exit").length;
@@ -72,7 +74,7 @@ export function DayTradeView({ dash, positions, manualPlans, pnl, serviceRunning
 
       {/* Sub-tab nav */}
       <div className="mb-4 flex items-center gap-2">
-        {(["plans", "manual", "active", "pnl"] as SubTab[]).map((t) => (
+        {(["plans", "heat", "manual", "active", "pnl"] as SubTab[]).map((t) => (
           <button
             key={t}
             onClick={() => setSub(t)}
@@ -83,16 +85,158 @@ export function DayTradeView({ dash, positions, manualPlans, pnl, serviceRunning
                 : "border-ink-500/60 text-bone-400 hover:border-bone-300 hover:text-bone-100",
             )}
           >
-            {t === "plans" ? "Signal Plans" : t === "manual" ? "Manual Watches" : t === "active" ? "Active Trades" : "P&L"}
+            {t === "plans" ? "Signal Plans" : t === "heat" ? `Heat Ideas${heatIdeas.filter(i => i.derived_status === "needs_review").length ? ` (${heatIdeas.filter(i => i.derived_status === "needs_review").length})` : ""}` : t === "manual" ? "Manual Watches" : t === "active" ? "Active Trades" : "P&L"}
           </button>
         ))}
       </div>
 
       {sub === "plans" && <SignalsView dash={dash} />}
+      {sub === "heat" && <HeatIdeasTab ideas={heatIdeas} settings={heatSettings} onChanged={onManualPlansChanged} />}
       {sub === "manual" && <ManualWatchTab plans={manualPlans} onChanged={onManualPlansChanged} />}
       {sub === "active" && <ActiveTab positions={positions} serviceRunning={serviceRunning} />}
       {sub === "pnl" && <PnlTab pnl={pnl} />}
     </div>
+  );
+}
+
+function HeatIdeasTab({ ideas, settings, onChanged }: {
+  ideas: HeatIdea[];
+  settings: HeatSettings;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function toggle() {
+    setBusy(true);
+    setError(null);
+    try {
+      await setHeatAutoTrading(!settings.auto_trading_enabled);
+      onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Section title="Heat Automation" subtitle="explicit numeric breakouts auto-queue · chart levels require review">
+        <div className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
+          <div>
+            <div className={clsx("text-sm uppercase tracking-[0.18em]", settings.auto_trading_enabled ? "text-crt-long" : "text-crt-short")}>
+              {settings.auto_trading_enabled ? "Auto trading enabled" : "Auto trading paused"}
+            </div>
+            <div className="mt-1 max-w-3xl text-[11px] leading-5 text-bone-500">
+              Long equity entries only. New watches must arm below the trigger, use the +0.2% entry cap, and inherit the day trader's stop and EOD rules.
+            </div>
+          </div>
+          <button disabled={busy} onClick={toggle} className={clsx("border px-4 py-2 text-[10px] uppercase tracking-[0.2em] disabled:opacity-40", settings.auto_trading_enabled ? "border-crt-short/50 text-crt-short" : "border-crt-long/50 text-crt-long")}>
+            {settings.auto_trading_enabled ? "Pause Heat Entries" : "Enable Heat Entries"}
+          </button>
+        </div>
+      </Section>
+
+      {error && <div className="border border-crt-short/50 bg-crt-short/10 px-4 py-3 text-sm text-crt-short">{error}</div>}
+
+      <Section title="Heat Ideas" subtitle="newest first · images are saved locally before Discord links expire">
+        <div className="grid grid-cols-1 gap-px bg-ink-500/20 lg:grid-cols-2">
+          {ideas.map((idea) => <HeatIdeaCard key={idea.id} idea={idea} onChanged={onChanged} />)}
+          {ideas.length === 0 && <div className="col-span-full bg-ink-950 px-6 py-12 text-center font-editorial italic text-bone-400">No Heat ideas captured yet.</div>}
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => void }) {
+  const [ticker, setTicker] = useState(idea.ticker ?? "");
+  const [trigger, setTrigger] = useState(idea.trigger_price?.toString() ?? "");
+  const [target, setTarget] = useState(idea.target_price?.toString() ?? "");
+  const [setup, setSetup] = useState(idea.setup ?? idea.text ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const executed = idea.derived_status === "executed";
+
+  async function approve() {
+    const triggerPrice = Number(trigger);
+    const targetPrice = target.trim() ? Number(target) : null;
+    if (!ticker.trim() || !Number.isFinite(triggerPrice) || triggerPrice <= 0) {
+      setError("Ticker and positive trigger are required.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await approveHeatIdea(idea.id, {
+        ticker: ticker.trim().toUpperCase(),
+        trigger_price: triggerPrice,
+        target_price: targetPrice,
+        setup: setup.trim() || null,
+      });
+      onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reject() {
+    setBusy(true);
+    setError(null);
+    try {
+      await rejectHeatIdea(idea.id);
+      onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <article className="bg-ink-950 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <span className="font-editorial text-2xl italic text-bone-50">{idea.ticker}</span>
+          <span className={clsx("ml-2 border px-1.5 py-0.5 text-[8px] uppercase tracking-[0.15em]", idea.auto_eligible ? "border-crt-long/40 text-crt-long" : "border-crt-amber/40 text-crt-amber")}>
+            {idea.auto_eligible ? "explicit" : "review"}
+          </span>
+        </div>
+        <div className="text-right text-[9px] uppercase tracking-[0.14em] text-bone-500">
+          <div>{idea.derived_status.replaceAll("_", " ")}</div>
+          <div className="mt-1 normal-case tracking-normal">{relativeTime(idea.created_at)}</div>
+        </div>
+      </div>
+
+      <p className="mt-3 whitespace-pre-wrap text-[12px] leading-5 text-bone-300">{idea.text}</p>
+      {idea.reply_text && <p className="mt-2 border-l border-ink-500 pl-3 text-[10px] leading-4 text-bone-500">Reply context: {idea.reply_text}</p>}
+
+      {idea.attachment_urls.length > 0 && (
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          {idea.attachment_urls.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer"><img src={url} alt={`${idea.ticker} Heat chart`} className="max-h-72 w-full border border-ink-500/40 object-contain" /></a>)}
+        </div>
+      )}
+
+      {!executed && (
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <Field label="Ticker" value={ticker} onChange={setTicker} placeholder="GOOGL" span="" />
+          <Field label="Trigger >" value={trigger} onChange={setTrigger} placeholder="360.00" type="number" span="" />
+          <Field label="Target" value={target} onChange={setTarget} placeholder="optional" type="number" span="" />
+          <Field label="Setup" value={setup} onChange={setSetup} placeholder="Heat chart breakout" span="" />
+        </div>
+      )}
+
+      {error && <div className="mt-2 text-[10px] text-crt-short">{error}</div>}
+      {!executed && (
+        <div className="mt-3 flex gap-2">
+          <button disabled={busy} onClick={approve} className="border border-crt-long/50 px-3 py-1.5 text-[9px] uppercase tracking-[0.16em] text-crt-long disabled:opacity-40">Approve / Update</button>
+          {idea.decision !== "rejected" && <button disabled={busy} onClick={reject} className="border border-crt-short/50 px-3 py-1.5 text-[9px] uppercase tracking-[0.16em] text-crt-short disabled:opacity-40">Reject</button>}
+        </div>
+      )}
+    </article>
   );
 }
 

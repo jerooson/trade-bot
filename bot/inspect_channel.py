@@ -33,6 +33,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Dump raw recent messages from a Discord channel.")
     ap.add_argument("--channel", type=int, required=True, help="Channel ID to inspect.")
     ap.add_argument("--limit", type=int, default=10, help="Max messages to fetch (default 10).")
+    ap.add_argument("--author", help="Optional case-insensitive author name filter.")
     args = ap.parse_args()
 
     _setup_logging()
@@ -54,11 +55,14 @@ def main() -> None:
 
             count = 0
             async for msg in channel.history(limit=args.limit, oldest_first=False):
+                if args.author and args.author.lower() not in str(msg.author).lower():
+                    continue
                 count += 1
                 log.info("")
                 log.info("-" * 80)
-                log.info("[%s] %s  (msg_id=%s)", msg.created_at.strftime("%Y-%m-%d %H:%M"),
-                        msg.author, msg.id)
+                log.info("[%s] %s  (author_id=%s msg_id=%s)",
+                         msg.created_at.strftime("%Y-%m-%d %H:%M"),
+                         msg.author, msg.author.id, msg.id)
                 log.info("-" * 80)
                 if msg.content:
                     log.info("CONTENT:")

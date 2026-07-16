@@ -178,8 +178,9 @@ export interface DayTradePosition {
   trigger_price: number | null;
   target_price: number | null;
   setup: string | null;
-  source?: "discord" | "manual";
+  source?: "discord" | "manual" | "heat";
   manual_plan_id?: string | null;
+  heat_idea_id?: string | null;
   good_til_cancelled?: boolean;
   armed?: boolean;
   plan_received_at: string;
@@ -224,6 +225,30 @@ export interface ManualDayPlan {
   updated_at: string;
   cancelled_at: string | null;
   position_id: string | null;
+}
+
+export interface HeatIdea {
+  id: string;
+  ticker: string;
+  trigger_price: number | null;
+  target_price: number | null;
+  setup: string | null;
+  text: string;
+  reply_text: string | null;
+  auto_eligible: boolean;
+  confidence: "high" | "review";
+  status: "auto_approved" | "approved" | "rejected" | "needs_review";
+  decision: "approved" | "rejected" | null;
+  derived_status: string;
+  created_at: string;
+  attachment_urls: string[];
+  position_id?: string | null;
+  position_status?: DayTradeStatus | null;
+}
+
+export interface HeatSettings {
+  auto_trading_enabled: boolean;
+  updated_at: string | null;
 }
 
 export interface DayTradePnlRecord {
