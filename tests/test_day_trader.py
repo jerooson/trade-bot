@@ -4,7 +4,7 @@ Unit tests for bot/day_trader.py — dry-run with mocked MCP calls.
 Every test patches the network/IO layer so no real orders are placed.
 The primary contract verified in each test:
 
-  "If condition X is true, _market_sell_all / _place_limit_buy /
+  "If condition X is true, _market_sell_all / _place_fractional_market_buy /
    _cancel_order MUST be called with correct arguments and the position
    state MUST transition correctly."
 """
@@ -31,18 +31,23 @@ from bot.day_trader import (
     _TRAILING_MILESTONES,
     ENTRY_ORDER_TTL_S,
     ENTRY_LIMIT_OFFSET_PCT,
+    ENTRY_MAX_SPREAD_PCT,
     FAR_POLL_INTERVAL_S,
     NEAR_POLL_INTERVAL_S,
     DayTraderRuntime,
     DayPosition,
+    EntryPreflightRejected,
+    EntryPreflightUnavailable,
     _apply_entry_order_result,
     _apply_exit_order_result,
     _get_prices,
     _migrate_stop_policy,
     _position_poll_interval,
-    _place_limit_buy,
+    _place_fractional_market_buy,
     _start_or_retry_exit,
+    _submit_or_recover_entry,
     _sync_manual_plans,
+    _validate_entry_preflight,
     run_once,
 )
 from bot.robinhood_mcp_client import OrderResult
@@ -107,7 +112,8 @@ def _patch_env(now=ET_MARKET_OPEN, price=10.0, buy_result: OrderResult | None = 
         patch("bot.day_trader._MCPSession", return_value=MagicMock()),
         patch("bot.day_trader._get_agentic_account", return_value="acct-001"),
         patch("bot.day_trader._get_prices", return_value={"TEST": price}),
-        patch("bot.day_trader._place_limit_buy", return_value=buy_result),
+        patch("bot.day_trader._validate_entry_preflight", return_value=(price, price, price, 0.0)),
+        patch("bot.day_trader._place_fractional_market_buy", return_value=buy_result),
         patch("bot.day_trader._place_stop_order", return_value="stop-001"),
         patch("bot.day_trader._place_limit_sell", return_value="limit-001"),
         patch("bot.day_trader._cancel_order"),
@@ -158,7 +164,8 @@ class _Base(unittest.TestCase):
              patch("bot.day_trader._MCPSession", return_value=MagicMock()) as m_sess, \
              patch("bot.day_trader._get_agentic_account", return_value="acct") as m_acct, \
              patch("bot.day_trader._get_prices", return_value={"TEST": price}) as m_price, \
-             patch("bot.day_trader._place_limit_buy", return_value=buy_result) as m_buy, \
+             patch("bot.day_trader._validate_entry_preflight", return_value=(price, price, price, 0.0)) as m_preflight, \
+             patch("bot.day_trader._place_fractional_market_buy", return_value=buy_result) as m_buy, \
              patch("bot.day_trader._place_stop_order", return_value="stop-001") as m_stop, \
              patch("bot.day_trader._place_limit_sell", return_value="limit-001") as m_lim, \
              patch("bot.day_trader._cancel_order") as m_cancel, \
@@ -183,7 +190,7 @@ class _Base(unittest.TestCase):
             run_once(positions, set())
 
             mocks = {
-                "buy": m_buy, "stop": m_stop, "lim": m_lim,
+                "buy": m_buy, "preflight": m_preflight, "stop": m_stop, "lim": m_lim,
                 "cancel": m_cancel, "sell": m_sell,
                 "append": m_append, "flush": m_flush,
             }
@@ -211,7 +218,7 @@ class TestEntry(_Base):
         m["buy"].assert_called_once()
 
     def test_buy_placed_when_price_above_trigger_but_within_cap(self):
-        """A small breakout within the configured cap places a limit buy."""
+        """A small breakout within the configured cap places a protected buy."""
         pos = _watching_pos(trigger=10.0)
         positions, m = self._run([pos], price=10.01)
         self.assertEqual(pos.status, "open")
@@ -226,13 +233,13 @@ class TestEntry(_Base):
         self.assertEqual(pos.entry_limit_price, 10.02)
         m["buy"].assert_not_called()
 
-    def test_limit_buy_uses_trigger_based_cap(self):
+    def test_protected_buy_uses_trigger_based_cap(self):
         pos = _watching_pos(trigger=10.0)
         positions, m = self._run([pos], price=10.0)
         args = m["buy"].call_args[0]
         self.assertEqual(args[4], round(10.0 * (1 + ENTRY_LIMIT_OFFSET_PCT / 100), 2))
 
-    def test_unfilled_limit_order_becomes_pending(self):
+    def test_unfilled_market_order_becomes_pending(self):
         pos = _watching_pos(trigger=10.0)
         result = OrderResult("b1", "queued", None, None, None)
         positions, m = self._run([pos], price=10.0, buy_result=result)
@@ -442,8 +449,8 @@ class TestPendingEntryLifecycle(_Base):
         first = make_session()
         second = make_session()
         with patch("bot.day_trader.time.sleep"):
-            _place_limit_buy(first, "acct", "TEST", 20, 10.02, "same-position")
-            _place_limit_buy(second, "acct", "TEST", 20, 10.02, "same-position")
+            _place_fractional_market_buy(first, "acct", "TEST", 20, 10.02, "same-position")
+            _place_fractional_market_buy(second, "acct", "TEST", 20, 10.02, "same-position")
         self.assertEqual(
             first.call.call_args_list[0].kwargs["ref_id"],
             second.call.call_args_list[0].kwargs["ref_id"],
@@ -964,7 +971,9 @@ class TestResilience(_Base):
              patch("bot.day_trader._MCPSession", return_value=MagicMock()), \
              patch("bot.day_trader._get_agentic_account", return_value="acct"), \
              patch("bot.day_trader._get_prices", return_value={"TEST": 10.0}), \
-             patch("bot.day_trader._place_limit_buy",
+             patch("bot.day_trader._validate_entry_preflight",
+                   return_value=(10.0, 9.99, 10.0, 0.1)), \
+             patch("bot.day_trader._place_fractional_market_buy",
                    side_effect=RobinhoodMCPError("order rejected")), \
              patch("bot.day_trader._flush_positions"), \
              patch("bot.day_trader._append_position"), \
@@ -973,6 +982,85 @@ class TestResilience(_Base):
             run_once([pos], set())
         self.assertEqual(pos.status, "pending_entry")
         self.assertIn("submission_ambiguous", pos.entry_last_error or "")
+
+    def test_preflight_rejection_returns_manual_watch_to_rearm(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.source = "manual"
+        pos.manual_plan_id = "manual-1"
+        pos.good_til_cancelled = True
+        pos.entry_limit_price = 10.02
+        rejection = EntryPreflightRejected(
+            "ask_above_cap", "TEST ask 10.03 exceeds entry cap 10.02"
+        )
+        with patch(
+            "bot.day_trader._validate_entry_preflight", side_effect=rejection
+        ), patch("bot.day_trader._place_fractional_market_buy") as place:
+            changed = _submit_or_recover_entry(MagicMock(), "acct", pos)
+        self.assertTrue(changed)
+        place.assert_not_called()
+        self.assertEqual(pos.status, "watching")
+        self.assertFalse(pos.armed)
+        self.assertEqual(pos.entry_attempt_no, 1)
+        self.assertEqual(pos.exit_reason, "waiting_rearm_after_ask_above_cap")
+
+    def test_preflight_outage_keeps_watch_armed_for_retry(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.entry_limit_price = 10.02
+        with patch(
+            "bot.day_trader._validate_entry_preflight",
+            side_effect=EntryPreflightUnavailable("quote timeout"),
+        ), patch("bot.day_trader._place_fractional_market_buy") as place:
+            changed = _submit_or_recover_entry(MagicMock(), "acct", pos)
+        self.assertTrue(changed)
+        place.assert_not_called()
+        self.assertEqual(pos.status, "watching")
+        self.assertTrue(pos.armed)
+        self.assertEqual(pos.entry_attempt_no, 0)
+        self.assertIn("preflight_unavailable", pos.entry_last_error or "")
+
+    def test_explicit_broker_rejection_does_not_retry_every_five_seconds(self):
+        from bot.robinhood_mcp_client import RobinhoodMCPError
+        pos = _watching_pos(trigger=10.0)
+        pos.source = "manual"
+        pos.manual_plan_id = "manual-1"
+        pos.good_til_cancelled = True
+        pos.entry_limit_price = 10.02
+        error = RobinhoodMCPError(
+            "'place_equity_order' returned isError: buying power unavailable"
+        )
+        with patch(
+            "bot.day_trader._validate_entry_preflight",
+            return_value=(10.0, 9.99, 10.0, 0.1),
+        ), patch("bot.day_trader._append_position"), patch(
+            "bot.day_trader._place_fractional_market_buy", side_effect=error
+        ) as place:
+            changed = _submit_or_recover_entry(MagicMock(), "acct", pos)
+        self.assertTrue(changed)
+        self.assertEqual(place.call_count, 1)
+        self.assertEqual(pos.status, "watching")
+        self.assertFalse(pos.armed)
+        self.assertEqual(pos.entry_attempt_no, 1)
+        self.assertEqual(pos.exit_reason, "waiting_rearm_after_broker_rejected")
+
+    def test_legacy_nvda_rejection_recovers_even_after_hours(self):
+        pos = _watching_pos(trigger=212.70)
+        pos.ticker = "NVDA"
+        pos.status = "pending_entry"
+        pos.source = "manual"
+        pos.manual_plan_id = "manual-nvda"
+        pos.good_til_cancelled = True
+        pos.entry_limit_price = 213.13
+        pos.entry_submitted_at = "2026-07-15T13:32:14+00:00"
+        pos.entry_last_error = (
+            "submission_ambiguous:'place_equity_order' returned isError: "
+            "dollar_amount is only supported for plain market orders"
+        )
+        _, mocks = self._run([pos], now=ET_AFTER_HOURS, price=212.49)
+        mocks["buy"].assert_not_called()
+        self.assertEqual(pos.status, "watching")
+        self.assertFalse(pos.armed)
+        self.assertEqual(pos.entry_attempt_no, 1)
+        self.assertIsNone(pos.entry_last_error)
 
 
 class TestProtectedEntryAndPolling(unittest.TestCase):
@@ -1125,7 +1213,7 @@ class TestProtectedEntryHelpers(unittest.TestCase):
         make_session.assert_called_once_with("tok")
         get_account.assert_called_once_with(session)
 
-    def test_limit_buy_sends_no_market_order(self):
+    def test_fractional_buy_uses_supported_market_order_shape(self):
         session = MagicMock()
         session.call.side_effect = [
             {"data": {"order": {"id": "order-1", "state": "queued"}}},
@@ -1137,11 +1225,57 @@ class TestProtectedEntryHelpers(unittest.TestCase):
             }]}},
         ]
         with patch("bot.day_trader.time.sleep"):
-            result = _place_limit_buy(session, "acct", "TEST", 20, 10.02, "position-1")
+            result = _place_fractional_market_buy(
+                session, "acct", "TEST", 20, 10.02, "position-1"
+            )
         kwargs = session.call.call_args_list[0].kwargs
-        self.assertEqual(kwargs["type"], "limit")
-        self.assertEqual(kwargs["limit_price"], "10.02")
+        self.assertEqual(kwargs["type"], "market")
+        self.assertEqual(kwargs["dollar_amount"], "20.00")
+        self.assertEqual(kwargs["market_hours"], "regular_hours")
+        self.assertNotIn("limit_price", kwargs)
+        self.assertNotIn("quantity", kwargs)
         self.assertEqual(result.fill_price, 10.01)
+
+    def test_preflight_accepts_price_inside_cap_with_tight_spread(self):
+        session = MagicMock()
+        session.call.return_value = {"data": {"results": [{"quote": {
+            "last_trade_price": "212.77",
+            "bid_price": "212.76",
+            "ask_price": "212.78",
+        }}]}}
+        last, bid, ask, spread = _validate_entry_preflight(
+            session, "NVDA", 212.70, 213.13
+        )
+        self.assertEqual((last, bid, ask), (212.77, 212.76, 212.78))
+        self.assertLess(spread, ENTRY_MAX_SPREAD_PCT)
+
+    def test_preflight_rejects_ask_above_cap(self):
+        session = MagicMock()
+        session.call.return_value = {"data": {"results": [{"quote": {
+            "last_trade_price": "213.10",
+            "bid_price": "213.12",
+            "ask_price": "213.14",
+        }}]}}
+        with self.assertRaises(EntryPreflightRejected) as raised:
+            _validate_entry_preflight(session, "NVDA", 212.70, 213.13)
+        self.assertEqual(raised.exception.reason, "ask_above_cap")
+
+    def test_preflight_rejects_wide_spread(self):
+        session = MagicMock()
+        session.call.return_value = {"data": {"results": [{"quote": {
+            "last_trade_price": "10.01",
+            "bid_price": "9.98",
+            "ask_price": "10.02",
+        }}]}}
+        with self.assertRaises(EntryPreflightRejected) as raised:
+            _validate_entry_preflight(session, "TEST", 10.00, 10.02)
+        self.assertEqual(raised.exception.reason, "spread_too_wide")
+
+    def test_preflight_missing_quote_is_temporarily_unavailable(self):
+        session = MagicMock()
+        session.call.return_value = {"data": {"results": []}}
+        with self.assertRaises(EntryPreflightUnavailable):
+            _validate_entry_preflight(session, "NVDA", 212.70, 213.13)
 
     def test_far_watching_position_uses_slow_poll(self):
         pos = _watching_pos(trigger=10.0)

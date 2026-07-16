@@ -4,10 +4,11 @@ Day-trade engine — fully decoupled from swing trade logic.
 Strategy (all times US/Eastern):
   - Read PLAN signals from logs/signals.jsonl (kind == "PLAN").
   - Poll adaptively (15 s normally, 5 s near a trigger/open position).
-  - When price crosses the trigger, buy with a protected limit order capped
-    slightly above the PLAN trigger; never chase a gap beyond that cap.  Entry
-    orders use a stable idempotency ref and are cancelled if the breakout
-    fails, the order times out, or only a partial fill is obtained.
+  - When price crosses the trigger, immediately re-check the executable ask
+    and spread before placing a $20 fractional market order.  The preflight
+    must remain below the PLAN entry cap; never chase a gap beyond that cap.
+    Entry orders use a stable idempotency ref and are cancelled if the
+    breakout fails, the order times out, or only a partial fill is obtained.
   - Stop-loss management after entry:
       * Initial stop: fill_price × 0.98  (-2 %)
       * Early risk reduction: confirmed +1 % moves the stop to -0.5 %;
@@ -67,6 +68,7 @@ FAR_POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_FAR_POLL_INTERVAL_S", "15"))
 NEAR_POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_NEAR_POLL_INTERVAL_S", "5"))
 NEAR_TRIGGER_PCT = float(os.getenv("DAY_TRADE_NEAR_TRIGGER_PCT", "0.5"))
 ENTRY_LIMIT_OFFSET_PCT = float(os.getenv("DAY_TRADE_ENTRY_LIMIT_OFFSET_PCT", "0.2"))
+ENTRY_MAX_SPREAD_PCT = float(os.getenv("DAY_TRADE_ENTRY_MAX_SPREAD_PCT", "0.2"))
 ENTRY_ORDER_TTL_S = int(os.getenv("DAY_TRADE_ENTRY_ORDER_TTL_S", "30"))
 SCHEDULER_TICK_S = float(os.getenv("DAY_TRADE_SCHEDULER_TICK_S", "1"))
 SIGNALS_LOG = Path("logs/signals.jsonl")
@@ -557,15 +559,69 @@ def _get_agentic_account(session: _MCPSession) -> str:
     return agentic[0]["account_number"]
 
 
-def _place_limit_buy(
+class EntryPreflightRejected(Exception):
+    """A fresh quote no longer meets the protected-entry requirements."""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+
+
+class EntryPreflightUnavailable(Exception):
+    """A fresh executable quote is temporarily unavailable."""
+
+
+def _validate_entry_preflight(
+    session: _MCPSession,
+    ticker: str,
+    trigger_price: float,
+    max_price: float,
+) -> tuple[float, float, float, float]:
+    """Return last/bid/ask/spread after enforcing the final entry guard."""
+    data = session.call("get_equity_quotes", symbols=[ticker])
+    results = data.get("data", {}).get("results", [])
+    if not results:
+        raise EntryPreflightUnavailable(f"No fresh quote for {ticker}")
+    quote = results[0].get("quote") or results[0]
+    try:
+        last = float(quote["last_trade_price"])
+        bid = float(quote["bid_price"])
+        ask = float(quote["ask_price"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise EntryPreflightUnavailable(f"Incomplete fresh quote for {ticker}") from exc
+    if last <= 0 or bid <= 0 or ask <= 0 or ask < bid:
+        raise EntryPreflightUnavailable(
+            f"Invalid fresh quote for {ticker}: last={last} bid={bid} ask={ask}",
+        )
+    midpoint = (ask + bid) / 2
+    spread_pct = (ask - bid) / midpoint * 100
+    if last < trigger_price:
+        raise EntryPreflightRejected(
+            "lost_trigger",
+            f"{ticker} last {last:.4f} fell below trigger {trigger_price:.4f}",
+        )
+    if ask > max_price:
+        raise EntryPreflightRejected(
+            "ask_above_cap",
+            f"{ticker} ask {ask:.4f} exceeds entry cap {max_price:.4f}",
+        )
+    if spread_pct > ENTRY_MAX_SPREAD_PCT:
+        raise EntryPreflightRejected(
+            "spread_too_wide",
+            f"{ticker} spread {spread_pct:.3f}% exceeds {ENTRY_MAX_SPREAD_PCT:.3f}%",
+        )
+    return last, bid, ask, spread_pct
+
+
+def _place_fractional_market_buy(
     session: _MCPSession,
     account_number: str,
     ticker: str,
     usd: float,
-    limit_price: float,
+    max_price: float,
     ref_key: str,
 ) -> OrderResult:
-    """Place a marketable dollar-based limit buy capped at ``limit_price``."""
+    """Place a regular-hours fractional market buy after quote preflight."""
     ref_id = str(uuid.uuid5(
         uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
         f"dayentry:{ref_key}",
@@ -574,12 +630,18 @@ def _place_limit_buy(
         "account_number": account_number,
         "symbol": ticker,
         "side": "buy",
-        "type": "limit",
+        "type": "market",
         "time_in_force": "gfd",
-        "dollar_amount": str(usd),   # API requires string, not number
-        "limit_price": f"{limit_price:.2f}",
+        "market_hours": "regular_hours",
+        "dollar_amount": f"{usd:.2f}",
         "ref_id": ref_id,
     }
+    log.info(
+        "Submitting protected fractional buy for %s: $%.2f market, preflight cap %.2f",
+        ticker,
+        usd,
+        max_price,
+    )
     resp = session.call("place_equity_order", **order_kwargs)
     order_id = resp.get("data", {}).get("order", {}).get("id") or resp.get("id", "")
     state = resp.get("data", {}).get("order", {}).get("state") or resp.get("state", "queued")
@@ -1040,6 +1102,39 @@ def _reset_manual_watch_after_unfilled_entry(pos: DayPosition) -> None:
     )
 
 
+def _end_unsubmitted_entry(pos: DayPosition, reason: str, detail: object) -> None:
+    """End an entry attempt known not to have reached the broker."""
+    if pos.good_til_cancelled and not pos.manual_cancel_requested:
+        _reset_manual_watch_after_unfilled_entry(pos)
+        pos.exit_reason = f"waiting_rearm_after_{reason}"
+    else:
+        pos.status = "expired"
+        pos.exit_reason = f"entry_{reason}"
+        pos.entry_last_error = f"submission_rejected:{detail}"
+    log.warning("Entry not submitted for %s (%s): %s", pos.ticker, reason, detail)
+
+
+def _is_definitive_entry_rejection(error: object) -> bool:
+    """Return whether MCP explicitly rejected the order before acknowledgement."""
+    return "'place_equity_order' returned isError:" in str(error)
+
+
+def _recover_definitive_entry_rejections(positions: list[DayPosition]) -> bool:
+    """Repair legacy rejected entries without waiting for market hours."""
+    changed = False
+    for pos in positions:
+        if (
+            pos.status == "pending_entry"
+            and not pos.buy_order_id
+            and pos.entry_last_error
+            and _is_definitive_entry_rejection(pos.entry_last_error)
+        ):
+            rejection = pos.entry_last_error
+            _end_unsubmitted_entry(pos, "broker_rejected", rejection)
+            changed = True
+    return changed
+
+
 def _apply_entry_order_result(
     session: _MCPSession,
     account_number: str,
@@ -1117,14 +1212,45 @@ def _submit_or_recover_entry(
     """Submit an entry with a stable ref, or recover its acknowledgement."""
     if pos.buy_order_id or pos.entry_limit_price is None:
         return False
+    if pos.entry_last_error and _is_definitive_entry_rejection(pos.entry_last_error):
+        rejection = pos.entry_last_error
+        _end_unsubmitted_entry(pos, "broker_rejected", rejection)
+        return True
     if not pos.entry_submitted_at:
+        try:
+            last, bid, ask, spread_pct = _validate_entry_preflight(
+                session,
+                pos.ticker,
+                float(pos.trigger_price or 0),
+                pos.entry_limit_price,
+            )
+        except EntryPreflightRejected as exc:
+            _end_unsubmitted_entry(pos, exc.reason, exc)
+            return True
+        except Exception as exc:
+            # A quote outage happens before the broker boundary.  Keep the
+            # watch armed and try a fresh preflight later; do not turn it into
+            # an ambiguous pending order.
+            pos.entry_last_error = f"preflight_unavailable:{exc}"
+            log.warning("Entry preflight unavailable for %s: %s", pos.ticker, exc)
+            return True
+        log.info(
+            "ENTRY PREFLIGHT: %s last=%.4f bid=%.4f ask=%.4f spread=%.3f%% cap=%.4f",
+            pos.ticker,
+            last,
+            bid,
+            ask,
+            spread_pct,
+            pos.entry_limit_price,
+        )
         pos.entry_submitted_at = datetime.now(timezone.utc).isoformat()
+        pos.entry_last_error = None
     pos.status = "pending_entry"
     # Persist the intent before crossing the broker boundary.  A restart can
     # safely repeat this call because ``pos.id`` generates the same ref_id.
     _append_position(pos)
     try:
-        result = _place_limit_buy(
+        result = _place_fractional_market_buy(
             session,
             account_number,
             pos.ticker,
@@ -1132,6 +1258,17 @@ def _submit_or_recover_entry(
             pos.entry_limit_price,
             f"{pos.id}:{pos.entry_attempt_no}",
         )
+    except RobinhoodMCPError as exc:
+        if _is_definitive_entry_rejection(exc):
+            _end_unsubmitted_entry(pos, "broker_rejected", exc)
+            return True
+        pos.entry_last_error = f"submission_ambiguous:{exc}"
+        log.error(
+            "Entry acknowledgement missing for %s; stable-ref recovery will retry: %s",
+            pos.ticker,
+            exc,
+        )
+        return True
     except Exception as exc:
         pos.entry_last_error = f"submission_ambiguous:{exc}"
         log.error(
@@ -1146,7 +1283,7 @@ def _submit_or_recover_entry(
     _apply_entry_order_result(session, account_number, pos, result)
     if pos.status == "pending_entry":
         log.info(
-            "Entry order pending for %s at limit %.4f order=%s state=%s",
+            "Entry order pending for %s with preflight cap %.4f order=%s state=%s",
             pos.ticker,
             pos.entry_limit_price,
             result.order_id,
@@ -1231,6 +1368,8 @@ def run_once(
     if _sync_manual_plans(positions):
         _flush_positions(positions)
     if _sync_heat_ideas(positions, now=now):
+        _flush_positions(positions)
+    if _recover_definitive_entry_rejections(positions):
         _flush_positions(positions)
 
     if not _is_market_hours(now):
@@ -1360,7 +1499,7 @@ def run_once(
             # a partial fill that must be sold at EOD.
             continue
 
-        # --- Entry: watching -> protected limit order -> open ---
+        # --- Entry: watching -> quote-gated fractional market order -> open ---
         if pos.status == "watching" and price is not None and pos.trigger_price is not None:
             if not pos.armed:
                 if price < pos.trigger_price:
@@ -1393,7 +1532,7 @@ def run_once(
                     continue
 
                 log.info(
-                    "TRIGGER: %s price=%.4f >= trigger=%.4f — limit buying $%.0f at max %.4f",
+                    "TRIGGER: %s price=%.4f >= trigger=%.4f — preparing protected $%.0f fractional buy with cap %.4f",
                     pos.ticker, price, pos.trigger_price, DAY_TRADE_BUDGET_USD, limit_price,
                 )
                 if _submit_or_recover_entry(session, account_number, pos):
@@ -1599,13 +1738,14 @@ def main() -> None:
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
 
     log.info(
-        "Day trader started. budget=$%.0f poll=%ds/%ds tick=%.1fs near=%.2f%% entry_cap=%.2f%% positions_log=%s",
+        "Day trader started. budget=$%.0f poll=%ds/%ds tick=%.1fs near=%.2f%% entry_cap=%.2f%% max_spread=%.2f%% positions_log=%s",
         DAY_TRADE_BUDGET_USD,
         FAR_POLL_INTERVAL_S,
         NEAR_POLL_INTERVAL_S,
         SCHEDULER_TICK_S,
         NEAR_TRIGGER_PCT,
         ENTRY_LIMIT_OFFSET_PCT,
+        ENTRY_MAX_SPREAD_PCT,
         POSITIONS_LOG,
     )
     positions = _load_positions()
