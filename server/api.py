@@ -39,6 +39,7 @@ from bot.heat_ideas import (
     load_materialized_heat_ideas,
     save_heat_settings,
 )
+from bot.leveraged_etfs import candidate_symbols
 
 log = logging.getLogger("server.api")
 
@@ -723,7 +724,11 @@ def _heat_idea_views(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif idea.get("decision") == "rejected":
             idea["derived_status"] = "rejected"
         elif idea.get("decision") == "approved":
-            idea["derived_status"] = "queued" if enabled else "paused"
+            idea["derived_status"] = (
+                "unsupported_mapping"
+                if not idea.get("mapping_supported")
+                else ("queued" if enabled else "paused")
+            )
         else:
             idea["derived_status"] = "needs_review"
         idea["attachment_urls"] = [
@@ -745,6 +750,8 @@ class HeatIdeaDecisionRequest(BaseModel):
     trigger_price: float
     target_price: float | None = None
     setup: str | None = None
+    direction: str = "long"
+    trigger_operator: str = "above"
 
 
 class HeatSettingsRequest(BaseModel):
@@ -830,6 +837,18 @@ def approve_heat_idea(idea_id: str, request: HeatIdeaDecisionRequest) -> dict[st
     setup = request.setup.strip() if request.setup else None
     if setup and len(setup) > 500:
         raise HTTPException(status_code=422, detail="setup must be 500 characters or less")
+    direction = request.direction.strip().lower()
+    trigger_operator = request.trigger_operator.strip().lower()
+    if direction not in {"long", "short"}:
+        raise HTTPException(status_code=422, detail="direction must be long or short")
+    if trigger_operator not in {"above", "below"}:
+        raise HTTPException(status_code=422, detail="trigger operator must be above or below")
+    candidates = candidate_symbols(ticker, direction)
+    if not candidates:
+        raise HTTPException(
+            status_code=422,
+            detail=f"no P0 leveraged ETF mapping for {ticker} {direction}",
+        )
     append_heat_jsonl(HEAT_DECISIONS_PATH, {
         "idea_id": idea_id,
         "decision": "approved",
@@ -837,6 +856,8 @@ def approve_heat_idea(idea_id: str, request: HeatIdeaDecisionRequest) -> dict[st
         "trigger_price": request.trigger_price,
         "target_price": request.target_price,
         "setup": setup or idea.get("setup") or "Heat breakout watch",
+        "direction": direction,
+        "trigger_operator": trigger_operator,
         "decided_at": datetime.now(timezone.utc).isoformat(),
     })
     return _find_heat_idea(idea_id) or {}

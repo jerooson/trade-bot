@@ -15,7 +15,7 @@ interface Props {
   heatSettings: HeatSettings;
   pnl: DayTradePnl | null;
   serviceRunning: boolean;
-  onManualPlansChanged: () => void;
+  onManualPlansChanged: () => Promise<void>;
 }
 
 export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSettings, pnl, serviceRunning, onManualPlansChanged }: Props) {
@@ -102,7 +102,7 @@ export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSett
 function HeatIdeasTab({ ideas, settings, onChanged }: {
   ideas: HeatIdea[];
   settings: HeatSettings;
-  onChanged: () => void;
+  onChanged: () => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -112,7 +112,7 @@ function HeatIdeasTab({ ideas, settings, onChanged }: {
     setError(null);
     try {
       await setHeatAutoTrading(!settings.auto_trading_enabled);
-      onChanged();
+      await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -129,7 +129,7 @@ function HeatIdeasTab({ ideas, settings, onChanged }: {
               {settings.auto_trading_enabled ? "Auto trading enabled" : "Auto trading paused"}
             </div>
             <div className="mt-1 max-w-3xl text-[11px] leading-5 text-bone-500">
-              Long equity entries only. New watches must arm below the trigger, use the +0.2% entry cap, and inherit the day trader's stop and EOD rules.
+              Source ticker triggers only. Eligible leveraged ETFs are selected at entry from live spread and tradability; option show-and-tell is ignored.
             </div>
           </div>
           <button disabled={busy} onClick={toggle} className={clsx("border px-4 py-2 text-[10px] uppercase tracking-[0.2em] disabled:opacity-40", settings.auto_trading_enabled ? "border-crt-short/50 text-crt-short" : "border-crt-long/50 text-crt-long")}>
@@ -150,11 +150,13 @@ function HeatIdeasTab({ ideas, settings, onChanged }: {
   );
 }
 
-function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => void }) {
+function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => Promise<void> }) {
   const [ticker, setTicker] = useState(idea.ticker ?? "");
   const [trigger, setTrigger] = useState(idea.trigger_price?.toString() ?? "");
   const [target, setTarget] = useState(idea.target_price?.toString() ?? "");
   const [setup, setSetup] = useState(idea.setup ?? idea.text ?? "");
+  const [direction, setDirection] = useState<"long" | "short">(idea.direction ?? "long");
+  const [triggerOperator, setTriggerOperator] = useState<"above" | "below">(idea.trigger_operator ?? "above");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const executed = idea.derived_status === "executed";
@@ -174,8 +176,10 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => vo
         trigger_price: triggerPrice,
         target_price: targetPrice,
         setup: setup.trim() || null,
+        direction,
+        trigger_operator: triggerOperator,
       });
-      onChanged();
+      await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -188,7 +192,7 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => vo
     setError(null);
     try {
       await rejectHeatIdea(idea.id);
-      onChanged();
+      await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -212,6 +216,11 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => vo
       </div>
 
       <p className="mt-3 whitespace-pre-wrap text-[12px] leading-5 text-bone-300">{idea.text}</p>
+      <div className="mt-2 text-[10px] uppercase tracking-[0.14em] text-bone-500">
+        {idea.mapping_supported
+          ? `P0 route: ${idea.leveraged_candidates.join(" / ")}`
+          : "No P0 leveraged ETF route — review only"}
+      </div>
       {idea.reply_text && <p className="mt-2 border-l border-ink-500 pl-3 text-[10px] leading-4 text-bone-500">Reply context: {idea.reply_text}</p>}
 
       {idea.attachment_urls.length > 0 && (
@@ -226,6 +235,20 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => vo
           <Field label="Trigger >" value={trigger} onChange={setTrigger} placeholder="360.00" type="number" span="" />
           <Field label="Target" value={target} onChange={setTarget} placeholder="optional" type="number" span="" />
           <Field label="Setup" value={setup} onChange={setSetup} placeholder="Heat chart breakout" span="" />
+          <label>
+            <span className="mb-1 block text-[9px] uppercase tracking-[0.18em] text-bone-500">Direction</span>
+            <select value={direction} onChange={(e) => setDirection(e.target.value as "long" | "short")} className="h-[38px] w-full border border-ink-500/60 bg-ink-900/50 px-3 text-sm text-bone-100 outline-none">
+              <option value="long">Bullish / long ETF</option>
+              <option value="short">Bearish / inverse ETF</option>
+            </select>
+          </label>
+          <label>
+            <span className="mb-1 block text-[9px] uppercase tracking-[0.18em] text-bone-500">Trigger</span>
+            <select value={triggerOperator} onChange={(e) => setTriggerOperator(e.target.value as "above" | "below")} className="h-[38px] w-full border border-ink-500/60 bg-ink-900/50 px-3 text-sm text-bone-100 outline-none">
+              <option value="above">Crosses above</option>
+              <option value="below">Breaks below</option>
+            </select>
+          </label>
         </div>
       )}
 
@@ -240,7 +263,7 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => vo
   );
 }
 
-function ManualWatchTab({ plans, onChanged }: { plans: ManualDayPlan[]; onChanged: () => void }) {
+function ManualWatchTab({ plans, onChanged }: { plans: ManualDayPlan[]; onChanged: () => Promise<void> }) {
   const [ticker, setTicker] = useState("");
   const [trigger, setTrigger] = useState("");
   const [target, setTarget] = useState("");
@@ -273,7 +296,7 @@ function ManualWatchTab({ plans, onChanged }: { plans: ManualDayPlan[]; onChange
       setTrigger("");
       setTarget("");
       setSetup("");
-      onChanged();
+      await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -286,7 +309,7 @@ function ManualWatchTab({ plans, onChanged }: { plans: ManualDayPlan[]; onChange
     setError(null);
     try {
       await cancelManualDayPlan(plan.id);
-      onChanged();
+      await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -384,7 +407,9 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
             <GridHeader cols={["ticker", "trigger", "setup", "plan age", "status"]} spans={[2,2,4,2,2]} />
             {watching.map((p) => (
               <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
-                <div className="col-span-2 font-editorial text-xl italic text-bone-50">{p.ticker}</div>
+                <div className="col-span-2 font-editorial text-xl italic text-bone-50">
+                  {p.ticker}{p.execution_ticker && <span className="ml-1 text-sm text-crt-long">→ {p.execution_ticker}</span>}
+                </div>
                 <div className="col-span-2 tabular text-sm text-crt-amber">
                   ${p.trigger_price?.toFixed(2) ?? "—"}
                   {p.status === "pending_entry" && p.entry_limit_price != null && (
@@ -418,7 +443,10 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
                 : null;
               return (
                 <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
-                  <div className="col-span-2 font-editorial text-xl italic text-bone-50">{p.ticker}</div>
+                  <div className="col-span-2 font-editorial text-xl italic text-bone-50">
+                    {p.execution_ticker ?? p.ticker}
+                    {p.execution_ticker && <div className="font-mono text-[9px] not-italic text-bone-500">signal {p.ticker}</div>}
+                  </div>
                   <div className="col-span-2 tabular text-sm text-bone-200">${p.fill_price?.toFixed(2) ?? "—"}</div>
                   <div className="col-span-2 tabular text-sm text-crt-short">
                     {p.status === "pending_exit"
@@ -455,7 +483,7 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
             <GridHeader cols={["ticker", "fill", "exit", "p&l $", "p&l %", "reason"]} spans={[2,2,2,2,2,2]} />
             {closed.map((p) => (
               <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
-                <div className="col-span-2 font-editorial text-xl italic text-bone-50">{p.ticker}</div>
+                <div className="col-span-2 font-editorial text-xl italic text-bone-50">{p.execution_ticker ?? p.ticker}</div>
                 <div className="col-span-2 tabular text-sm text-bone-300">${p.fill_price?.toFixed(2) ?? "—"}</div>
                 <div className="col-span-2 tabular text-sm text-bone-300">${p.exit_price?.toFixed(2) ?? "—"}</div>
                 <div className="col-span-2">

@@ -181,6 +181,13 @@ export interface DayTradePosition {
   source?: "discord" | "manual" | "heat";
   manual_plan_id?: string | null;
   heat_idea_id?: string | null;
+  direction?: "long" | "short";
+  trigger_operator?: "above" | "below";
+  execution_ticker?: string | null;
+  execution_leverage?: number | null;
+  execution_spread_pct?: number | null;
+  signal_current_price?: number | null;
+  signal_target_price?: number | null;
   good_til_cancelled?: boolean;
   armed?: boolean;
   plan_received_at: string;
@@ -232,6 +239,10 @@ export interface HeatIdea {
   ticker: string;
   trigger_price: number | null;
   target_price: number | null;
+  direction: "long" | "short" | null;
+  trigger_operator: "above" | "below";
+  mapping_supported: boolean;
+  leveraged_candidates: string[];
   setup: string | null;
   text: string;
   reply_text: string | null;

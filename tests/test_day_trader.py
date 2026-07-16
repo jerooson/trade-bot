@@ -38,11 +38,13 @@ from bot.day_trader import (
     DayPosition,
     EntryPreflightRejected,
     EntryPreflightUnavailable,
+    LeveragedETFSelection,
     _apply_entry_order_result,
     _apply_exit_order_result,
     _get_prices,
     _migrate_stop_policy,
     _position_poll_interval,
+    _select_leveraged_etf,
     _place_fractional_market_buy,
     _start_or_retry_exit,
     _submit_or_recover_entry,
@@ -1065,6 +1067,60 @@ class TestResilience(_Base):
 
 class TestProtectedEntryAndPolling(unittest.TestCase):
 
+    def test_selects_tightest_spread_fractional_leveraged_etf(self):
+        session = MagicMock()
+        session.call.side_effect = [
+            {"data": {"results": [
+                {"symbol": "NVDL", "quote": {
+                    "last_trade_price": "64.00", "bid_price": "63.94",
+                    "ask_price": "64.06", "volume": "2000000",
+                }},
+                {"symbol": "NVDX", "quote": {
+                    "last_trade_price": "25.00", "bid_price": "24.99",
+                    "ask_price": "25.01", "volume": "1500000",
+                }},
+                {"symbol": "NVDU", "quote": {
+                    "last_trade_price": "18.00", "bid_price": "17.99",
+                    "ask_price": "18.01", "volume": "3000000",
+                }},
+            ]}},
+            {"data": {"results": [
+                {"symbol": "NVDL", "tradeable": True, "fractional_tradability": "tradable"},
+                {"symbol": "NVDX", "tradeable": True, "fractional_tradability": "tradable"},
+                {"symbol": "NVDU", "tradeable": True, "fractional_tradability": "tradable"},
+            ]}},
+        ]
+        selected = _select_leveraged_etf(session, "acct", "NVDA", "long")
+        self.assertEqual(selected.ticker, "NVDX")
+        self.assertLess(selected.spread_pct, 0.1)
+
+    def test_heat_entry_buys_and_protects_execution_etf(self):
+        pos = _watching_pos(trigger=150.0)
+        pos.source = "heat"
+        pos.heat_idea_id = "heat-1"
+        pos.entry_limit_price = 150.30
+        selection = LeveragedETFSelection(
+            "NVDL", 2.0, 64.0, 63.99, 64.01, 0.03125, 2_000_000
+        )
+        fill = OrderResult("buy-etf", "filled", 64.0, 0.3125, 20.0)
+        with patch(
+            "bot.day_trader._validate_entry_preflight",
+            return_value=(150.0, 149.99, 150.01, 0.013),
+        ), patch(
+            "bot.day_trader._select_leveraged_etf", return_value=selection
+        ), patch(
+            "bot.day_trader._place_fractional_market_buy", return_value=fill
+        ) as buy, patch(
+            "bot.day_trader._place_stop_order", return_value=None
+        ) as stop, patch("bot.day_trader._append_position"):
+            changed = _submit_or_recover_entry(MagicMock(), "acct", pos)
+        self.assertTrue(changed)
+        self.assertEqual(pos.execution_ticker, "NVDL")
+        self.assertEqual(pos.status, "open")
+        self.assertEqual(buy.call_args.args[2], "NVDL")
+        self.assertEqual(stop.call_args.args[2], "NVDL")
+        self.assertAlmostEqual(pos.stop_price or 0, 62.72)
+
     def test_batch_quotes_use_one_request_for_multiple_tickers(self):
         session = MagicMock()
         session.call.return_value = {"data": {"results": [
@@ -1270,6 +1326,18 @@ class TestProtectedEntryHelpers(unittest.TestCase):
         with self.assertRaises(EntryPreflightRejected) as raised:
             _validate_entry_preflight(session, "TEST", 10.00, 10.02)
         self.assertEqual(raised.exception.reason, "spread_too_wide")
+
+    def test_bearish_preflight_accepts_break_below_inside_floor(self):
+        session = MagicMock()
+        session.call.return_value = {"data": {"results": [{"quote": {
+            "last_trade_price": "149.90",
+            "bid_price": "149.89",
+            "ask_price": "149.91",
+        }}]}}
+        last, _, _, _ = _validate_entry_preflight(
+            session, "NVDA", 150.0, 149.70, "below"
+        )
+        self.assertEqual(last, 149.90)
 
     def test_preflight_missing_quote_is_temporarily_unavailable(self):
         session = MagicMock()

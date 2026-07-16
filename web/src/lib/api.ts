@@ -233,6 +233,8 @@ export async function approveHeatIdea(ideaId: string, input: {
   trigger_price: number;
   target_price: number | null;
   setup: string | null;
+  direction: "long" | "short";
+  trigger_operator: "above" | "below";
 }): Promise<HeatIdea> {
   const res = await fetch(`/api/daytrader/heat-ideas/${ideaId}/approve`, {
     method: "POST",

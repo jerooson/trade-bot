@@ -49,6 +49,7 @@ from bot.heat_ideas import (
     load_materialized_heat_ideas,
 )
 from bot.manual_day_plans import DEFAULT_PATH as MANUAL_PLANS_PATH, load_plans
+from bot.leveraged_etfs import leveraged_candidates, result_by_symbol
 from bot.robinhood_mcp_client import (
     OrderResult,
     RobinhoodMCPError,
@@ -69,6 +70,15 @@ NEAR_POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_NEAR_POLL_INTERVAL_S", "5"))
 NEAR_TRIGGER_PCT = float(os.getenv("DAY_TRADE_NEAR_TRIGGER_PCT", "0.5"))
 ENTRY_LIMIT_OFFSET_PCT = float(os.getenv("DAY_TRADE_ENTRY_LIMIT_OFFSET_PCT", "0.2"))
 ENTRY_MAX_SPREAD_PCT = float(os.getenv("DAY_TRADE_ENTRY_MAX_SPREAD_PCT", "0.2"))
+LEVERAGED_ETF_MAX_SPREAD_PCT = float(
+    os.getenv("DAY_TRADE_LEVERAGED_ETF_MAX_SPREAD_PCT", "0.2")
+)
+LEVERAGED_ETF_MIN_PRICE = float(
+    os.getenv("DAY_TRADE_LEVERAGED_ETF_MIN_PRICE", "5")
+)
+LEVERAGED_ETF_MIN_AVG_VOLUME = float(
+    os.getenv("DAY_TRADE_LEVERAGED_ETF_MIN_AVG_VOLUME", "1000000")
+)
 ENTRY_ORDER_TTL_S = int(os.getenv("DAY_TRADE_ENTRY_ORDER_TTL_S", "30"))
 SCHEDULER_TICK_S = float(os.getenv("DAY_TRADE_SCHEDULER_TICK_S", "1"))
 SIGNALS_LOG = Path("logs/signals.jsonl")
@@ -116,10 +126,21 @@ class DayPosition:
     source: str = "discord"           # discord | manual | heat
     manual_plan_id: str | None = None
     heat_idea_id: str | None = None
+    direction: str = "long"           # long | short (economic direction)
+    trigger_operator: str = "above"   # above | below on the signal ticker
     good_til_cancelled: bool = False
     armed: bool = True
     manual_cancel_requested: bool = False
     entry_attempt_no: int = 0
+
+    # Heat signals can observe one instrument and trade another.  ``ticker``
+    # always remains the source/trigger ticker for backwards compatibility.
+    execution_ticker: str | None = None
+    execution_leverage: float | None = None
+    execution_spread_pct: float | None = None
+    execution_selected_at: str | None = None
+    signal_current_price: float | None = None
+    signal_target_price: float | None = None
 
     # Execution details
     buy_order_id: str | None = None
@@ -420,11 +441,22 @@ def _sync_heat_ideas(
             continue
         idea = by_id.get(pos.heat_idea_id)
         approved = bool(idea and idea.get("decision") == "approved")
-        if enabled and approved:
+        direction = str((idea or {}).get("direction") or "").lower()
+        route_supported = bool(
+            idea
+            and direction in {"long", "short"}
+            and leveraged_candidates(str(idea.get("ticker") or ""), direction)
+        )
+        if enabled and approved and route_supported:
             continue
         if pos.status == "watching":
             pos.status = "expired"
-            pos.exit_reason = "heat_disabled" if not enabled else "heat_rejected"
+            if not enabled:
+                pos.exit_reason = "heat_disabled"
+            elif not approved:
+                pos.exit_reason = "heat_rejected"
+            else:
+                pos.exit_reason = "heat_unsupported_mapping"
             pos.manual_cancel_requested = True
             changed = True
         elif pos.status == "pending_entry" and not pos.manual_cancel_requested:
@@ -467,7 +499,22 @@ def _sync_heat_ideas(
 
         ticker = str(idea.get("ticker", "")).upper()
         trigger = idea.get("trigger_price")
-        if not ticker or trigger is None:
+        direction = str(idea.get("direction") or "").lower()
+        trigger_operator = str(idea.get("trigger_operator") or "above").lower()
+        if (
+            not ticker
+            or trigger is None
+            or direction not in {"long", "short"}
+            or trigger_operator not in {"above", "below"}
+        ):
+            continue
+        if not leveraged_candidates(ticker, direction):
+            log.warning(
+                "Heat idea %s cannot queue: no P0 leveraged ETF route for %s %s",
+                idea_id,
+                ticker,
+                direction,
+            )
             continue
         if any(
             p.ticker == ticker
@@ -479,7 +526,10 @@ def _sync_heat_ideas(
         pos = DayPosition(
             ticker=ticker,
             trigger_price=float(trigger),
-            target_price=(
+            # Heat's target belongs to the source ticker.  If supplied, it is
+            # converted to an ETF-relative target only after the ETF fills.
+            target_price=None,
+            signal_target_price=(
                 float(idea["target_price"])
                 if idea.get("target_price") is not None
                 else None
@@ -489,6 +539,8 @@ def _sync_heat_ideas(
             plan_received_at=created.isoformat(),
             source="heat",
             heat_idea_id=idea_id,
+            direction=direction,
+            trigger_operator=trigger_operator,
             good_til_cancelled=False,
             # Observe price below the trigger before accepting a new breakout.
             armed=False,
@@ -576,6 +628,7 @@ def _validate_entry_preflight(
     ticker: str,
     trigger_price: float,
     max_price: float,
+    trigger_operator: str = "above",
 ) -> tuple[float, float, float, float]:
     """Return last/bid/ask/spread after enforcing the final entry guard."""
     data = session.call("get_equity_quotes", symbols=[ticker])
@@ -595,15 +648,25 @@ def _validate_entry_preflight(
         )
     midpoint = (ask + bid) / 2
     spread_pct = (ask - bid) / midpoint * 100
-    if last < trigger_price:
+    if trigger_operator == "above" and last < trigger_price:
         raise EntryPreflightRejected(
             "lost_trigger",
             f"{ticker} last {last:.4f} fell below trigger {trigger_price:.4f}",
         )
-    if ask > max_price:
+    if trigger_operator == "below" and last > trigger_price:
+        raise EntryPreflightRejected(
+            "lost_trigger",
+            f"{ticker} last {last:.4f} rose above trigger {trigger_price:.4f}",
+        )
+    if trigger_operator == "above" and ask > max_price:
         raise EntryPreflightRejected(
             "ask_above_cap",
             f"{ticker} ask {ask:.4f} exceeds entry cap {max_price:.4f}",
+        )
+    if trigger_operator == "below" and bid < max_price:
+        raise EntryPreflightRejected(
+            "bid_below_floor",
+            f"{ticker} bid {bid:.4f} is below entry floor {max_price:.4f}",
         )
     if spread_pct > ENTRY_MAX_SPREAD_PCT:
         raise EntryPreflightRejected(
@@ -611,6 +674,119 @@ def _validate_entry_preflight(
             f"{ticker} spread {spread_pct:.3f}% exceeds {ENTRY_MAX_SPREAD_PCT:.3f}%",
         )
     return last, bid, ask, spread_pct
+
+
+@dataclass(frozen=True)
+class LeveragedETFSelection:
+    ticker: str
+    leverage: float
+    last: float
+    bid: float
+    ask: float
+    spread_pct: float
+    volume: float | None
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _select_leveraged_etf(
+    session: _MCPSession,
+    account_number: str,
+    source_ticker: str,
+    direction: str,
+) -> LeveragedETFSelection:
+    """Choose the tightest-spread, fractional-tradable P0 ETF candidate."""
+    candidates = leveraged_candidates(source_ticker, direction)
+    if not candidates:
+        raise EntryPreflightRejected(
+            "unsupported_leveraged_mapping",
+            f"No P0 leveraged ETF route for {source_ticker} {direction}",
+        )
+    symbols = [candidate.ticker for candidate in candidates]
+    quote_data = session.call("get_equity_quotes", symbols=symbols)
+    quote_rows = quote_data.get("data", {}).get("results", [])
+    quotes = result_by_symbol(quote_rows, symbols)
+
+    tradability_data = session.call(
+        "get_equity_tradability",
+        account_number=account_number,
+        symbols=symbols,
+    )
+    tradability_rows = tradability_data.get("data", {}).get("results", [])
+    tradability = result_by_symbol(tradability_rows, symbols)
+    if not tradability_rows:
+        raise EntryPreflightUnavailable(
+            f"No tradability response for leveraged ETF candidates {symbols}"
+        )
+
+    eligible: list[LeveragedETFSelection] = []
+    rejected: list[str] = []
+    for candidate in candidates:
+        symbol = candidate.ticker
+        item = quotes.get(symbol)
+        trade = tradability.get(symbol)
+        if item is None or trade is None:
+            rejected.append(f"{symbol}:missing quote/tradability")
+            continue
+        quote = item.get("quote") or item
+        try:
+            last = float(quote["last_trade_price"])
+            bid = float(quote["bid_price"])
+            ask = float(quote["ask_price"])
+        except (KeyError, TypeError, ValueError):
+            rejected.append(f"{symbol}:incomplete quote")
+            continue
+        if last < LEVERAGED_ETF_MIN_PRICE or bid <= 0 or ask < bid:
+            rejected.append(f"{symbol}:invalid/low price")
+            continue
+        midpoint = (ask + bid) / 2
+        spread_pct = (ask - bid) / midpoint * 100
+        if spread_pct > LEVERAGED_ETF_MAX_SPREAD_PCT:
+            rejected.append(f"{symbol}:spread {spread_pct:.3f}%")
+            continue
+        trade_item = trade.get("tradability") or trade
+        if not trade_item.get("tradeable", True):
+            rejected.append(f"{symbol}:not tradeable")
+            continue
+        if trade_item.get("fractional_tradability", "tradable") == "untradable":
+            rejected.append(f"{symbol}:not fractional")
+            continue
+        average_volume = _float_or_none(
+            quote.get("average_volume_30_days")
+            or quote.get("average_volume")
+        )
+        if (
+            average_volume is not None
+            and average_volume < LEVERAGED_ETF_MIN_AVG_VOLUME
+        ):
+            rejected.append(f"{symbol}:avg volume {average_volume:.0f}")
+            continue
+        volume = average_volume or _float_or_none(quote.get("volume"))
+        eligible.append(LeveragedETFSelection(
+            symbol,
+            candidate.leverage,
+            last,
+            bid,
+            ask,
+            spread_pct,
+            volume,
+        ))
+
+    if not eligible:
+        raise EntryPreflightRejected(
+            "no_liquid_leveraged_etf",
+            f"No eligible ETF for {source_ticker} {direction}: {', '.join(rejected)}",
+        )
+    # Spread is the hard execution cost for a $20 order.  Volume is used as a
+    # tie-breaker when Robinhood exposes it; P0 itself is a curated liquid list.
+    eligible.sort(key=lambda row: (row.spread_pct, -(row.volume or 0)))
+    return eligible[0]
 
 
 def _place_fractional_market_buy(
@@ -684,6 +860,82 @@ def _place_fractional_market_buy(
 def _entry_limit_price(trigger_price: float) -> float:
     """Maximum permitted entry price for a PLAN breakout."""
     return round(trigger_price * (1 + ENTRY_LIMIT_OFFSET_PCT / 100), 2)
+
+
+def _entry_guard_price(pos: DayPosition) -> float:
+    multiplier = (
+        1 - ENTRY_LIMIT_OFFSET_PCT / 100
+        if pos.trigger_operator == "below"
+        else 1 + ENTRY_LIMIT_OFFSET_PCT / 100
+    )
+    return round(float(pos.trigger_price or 0) * multiplier, 2)
+
+
+def _trigger_crossed(pos: DayPosition, price: float) -> bool:
+    if pos.trigger_price is None:
+        return False
+    return (
+        price <= pos.trigger_price
+        if pos.trigger_operator == "below"
+        else price >= pos.trigger_price
+    )
+
+
+def _trigger_is_armed(pos: DayPosition, price: float) -> bool:
+    if pos.trigger_price is None:
+        return False
+    return (
+        price > pos.trigger_price
+        if pos.trigger_operator == "below"
+        else price < pos.trigger_price
+    )
+
+
+def _trigger_gapped_past_guard(pos: DayPosition, price: float) -> bool:
+    if pos.entry_limit_price is None:
+        return False
+    return (
+        price < pos.entry_limit_price
+        if pos.trigger_operator == "below"
+        else price > pos.entry_limit_price
+    )
+
+
+def _execution_symbol(pos: DayPosition) -> str:
+    return (pos.execution_ticker or pos.ticker).upper()
+
+
+def _quote_symbols_for_position(pos: DayPosition) -> list[str]:
+    symbols = [pos.ticker.upper()]
+    execution = _execution_symbol(pos)
+    if execution not in symbols:
+        symbols.append(execution)
+    return symbols
+
+
+def _converted_heat_target(pos: DayPosition, fill_price: float) -> float | None:
+    """Convert an underlying target move into an ETF target from its fill."""
+    if (
+        pos.source != "heat"
+        or pos.signal_target_price is None
+        or pos.trigger_price is None
+        or not pos.execution_leverage
+    ):
+        return pos.target_price
+    if pos.direction == "short":
+        source_move = (pos.trigger_price - pos.signal_target_price) / pos.trigger_price
+    else:
+        source_move = (pos.signal_target_price - pos.trigger_price) / pos.trigger_price
+    if source_move <= 0:
+        log.warning(
+            "Ignoring Heat target %.4f for %s %s trigger %.4f: wrong direction",
+            pos.signal_target_price,
+            pos.direction,
+            pos.ticker,
+            pos.trigger_price,
+        )
+        return None
+    return round(fill_price * (1 + source_move * pos.execution_leverage), 4)
 
 
 def _poll_order(
@@ -963,7 +1215,7 @@ def _start_or_retry_exit(
         result = _market_sell_all(
             session,
             account_number,
-            pos.ticker,
+            _execution_symbol(pos),
             remaining,
             ref_key,
         )
@@ -1021,16 +1273,19 @@ def _activate_filled_position(
     pos.status = "open"
     pos.high_water_mark = result.fill_price
     pos.stop_price = round(result.fill_price * (1 - _INITIAL_STOP_PCT / 100), 4)
+    pos.target_price = _converted_heat_target(pos, result.fill_price)
+    execution = _execution_symbol(pos)
     pos.stop_order_id = _place_stop_order(
-        session, account_number, pos.ticker, result.fill_qty, pos.stop_price
+        session, account_number, execution, result.fill_qty, pos.stop_price
     )
     if pos.target_price:
         pos.limit_order_id = _place_limit_sell(
-            session, account_number, pos.ticker, result.fill_qty, pos.target_price
+            session, account_number, execution, result.fill_qty, pos.target_price
         )
     log.info(
-        "Entered %s fill=%.4f stop=%.4f target=%s order=%s",
+        "Entered %s via %s fill=%.4f stop=%.4f target=%s order=%s",
         pos.ticker,
+        execution,
         pos.fill_price,
         pos.stop_price,
         pos.target_price,
@@ -1093,6 +1348,10 @@ def _reset_manual_watch_after_unfilled_entry(pos: DayPosition) -> None:
     pos.entry_filled_qty = 0.0
     pos.entry_filled_value = 0.0
     pos.entry_limit_price = None
+    pos.execution_ticker = None
+    pos.execution_leverage = None
+    pos.execution_spread_pct = None
+    pos.execution_selected_at = None
     pos.exit_reason = None
     pos.entry_attempt_no += 1
     log.info(
@@ -1223,6 +1482,7 @@ def _submit_or_recover_entry(
                 pos.ticker,
                 float(pos.trigger_price or 0),
                 pos.entry_limit_price,
+                pos.trigger_operator,
             )
         except EntryPreflightRejected as exc:
             _end_unsubmitted_entry(pos, exc.reason, exc)
@@ -1235,7 +1495,7 @@ def _submit_or_recover_entry(
             log.warning("Entry preflight unavailable for %s: %s", pos.ticker, exc)
             return True
         log.info(
-            "ENTRY PREFLIGHT: %s last=%.4f bid=%.4f ask=%.4f spread=%.3f%% cap=%.4f",
+            "SIGNAL PREFLIGHT: %s last=%.4f bid=%.4f ask=%.4f spread=%.3f%% guard=%.4f",
             pos.ticker,
             last,
             bid,
@@ -1243,6 +1503,39 @@ def _submit_or_recover_entry(
             spread_pct,
             pos.entry_limit_price,
         )
+        if pos.source == "heat":
+            try:
+                selection = _select_leveraged_etf(
+                    session,
+                    account_number,
+                    pos.ticker,
+                    pos.direction,
+                )
+            except EntryPreflightRejected as exc:
+                _end_unsubmitted_entry(pos, exc.reason, exc)
+                return True
+            except Exception as exc:
+                pos.entry_last_error = f"leveraged_preflight_unavailable:{exc}"
+                log.warning(
+                    "Leveraged ETF preflight unavailable for %s: %s",
+                    pos.ticker,
+                    exc,
+                )
+                return True
+            pos.execution_ticker = selection.ticker
+            pos.execution_leverage = selection.leverage
+            pos.execution_spread_pct = selection.spread_pct
+            pos.execution_selected_at = datetime.now(timezone.utc).isoformat()
+            log.info(
+                "ETF PREFLIGHT: %s %s -> %s last=%.4f bid=%.4f ask=%.4f spread=%.3f%%",
+                pos.ticker,
+                pos.direction,
+                selection.ticker,
+                selection.last,
+                selection.bid,
+                selection.ask,
+                selection.spread_pct,
+            )
         pos.entry_submitted_at = datetime.now(timezone.utc).isoformat()
         pos.entry_last_error = None
     pos.status = "pending_entry"
@@ -1253,7 +1546,7 @@ def _submit_or_recover_entry(
         result = _place_fractional_market_buy(
             session,
             account_number,
-            pos.ticker,
+            _execution_symbol(pos),
             DAY_TRADE_BUDGET_USD,
             pos.entry_limit_price,
             f"{pos.id}:{pos.entry_attempt_no}",
@@ -1265,7 +1558,7 @@ def _submit_or_recover_entry(
         pos.entry_last_error = f"submission_ambiguous:{exc}"
         log.error(
             "Entry acknowledgement missing for %s; stable-ref recovery will retry: %s",
-            pos.ticker,
+            _execution_symbol(pos),
             exc,
         )
         return True
@@ -1273,7 +1566,7 @@ def _submit_or_recover_entry(
         pos.entry_last_error = f"submission_ambiguous:{exc}"
         log.error(
             "Entry acknowledgement missing for %s; stable-ref recovery will retry: %s",
-            pos.ticker,
+            _execution_symbol(pos),
             exc,
         )
         return True
@@ -1284,7 +1577,7 @@ def _submit_or_recover_entry(
     if pos.status == "pending_entry":
         log.info(
             "Entry order pending for %s with preflight cap %.4f order=%s state=%s",
-            pos.ticker,
+            _execution_symbol(pos),
             pos.entry_limit_price,
             result.order_id,
             result.state,
@@ -1321,11 +1614,16 @@ def _position_poll_interval(pos: DayPosition) -> int:
     """Return this ticker's own polling interval without affecting others."""
     if pos.status in ("pending_entry", "open", "pending_exit"):
         return NEAR_POLL_INTERVAL_S
+    watch_price = (
+        pos.signal_current_price
+        if pos.signal_current_price is not None
+        else pos.current_price
+    )
     if (
         pos.status == "watching"
         and pos.trigger_price
-        and pos.current_price is not None
-        and abs(pos.current_price / pos.trigger_price - 1) * 100 <= NEAR_TRIGGER_PCT
+        and watch_price is not None
+        and abs(watch_price / pos.trigger_price - 1) * 100 <= NEAR_TRIGGER_PCT
     ):
         return NEAR_POLL_INTERVAL_S
     return FAR_POLL_INTERVAL_S
@@ -1390,7 +1688,12 @@ def run_once(
         else:
             session = _MCPSession(_load_token())
             account_number = _get_agentic_account(session)
-        prices = _get_prices(session, [pos.ticker for pos in due])
+        quote_symbols = [
+            symbol
+            for pos in due
+            for symbol in _quote_symbols_for_position(pos)
+        ]
+        prices = _get_prices(session, quote_symbols)
         if runtime:
             runtime.record_success()
     except Exception as exc:
@@ -1406,8 +1709,17 @@ def run_once(
     changed = False
 
     for pos in due:
-        price = prices.get(pos.ticker.upper())
+        signal_price = prices.get(pos.ticker.upper())
+        execution = _execution_symbol(pos)
+        price = (
+            prices.get(execution)
+            if pos.status in ("open", "pending_exit")
+            else signal_price
+        )
 
+        if signal_price is not None and pos.signal_current_price != signal_price:
+            pos.signal_current_price = signal_price
+            changed = True
         if price is not None:
             if pos.current_price != price:
                 pos.current_price = price
@@ -1430,7 +1742,9 @@ def run_once(
                 changed = True
 
         if pos.status == "pending_entry" and pos.buy_order_id:
-            result = _poll_order(session, account_number, pos.ticker, pos.buy_order_id)
+            result = _poll_order(
+                session, account_number, _execution_symbol(pos), pos.buy_order_id
+            )
             if result and _apply_entry_order_result(
                 session, account_number, pos, result
             ):
@@ -1442,7 +1756,9 @@ def run_once(
                     cancel_reason = "manual_cancel"
                 elif force_close:
                     cancel_reason = "eod"
-                elif price is not None and pos.trigger_price and price < pos.trigger_price:
+                elif signal_price is not None and pos.trigger_price and not _trigger_crossed(
+                    pos, signal_price
+                ):
                     cancel_reason = "lost_trigger"
                 elif _entry_order_timed_out(pos, now):
                     cancel_reason = "timeout"
@@ -1450,6 +1766,16 @@ def run_once(
                     session, account_number, pos, cancel_reason
                 ):
                     changed = True
+
+        # Polling a pending entry can transition it to open in this same loop.
+        # From that point onward, every risk decision must use the ETF quote,
+        # never the source ticker quote captured at the top of the iteration.
+        if pos.status in ("open", "pending_exit"):
+            execution_price = prices.get(_execution_symbol(pos))
+            price = execution_price
+            if execution_price is not None and pos.current_price != execution_price:
+                pos.current_price = execution_price
+                changed = True
 
         if (
             pos.status == "open"
@@ -1465,7 +1791,7 @@ def run_once(
         if pos.status == "pending_exit":
             if pos.exit_order_id:
                 result = _poll_order(
-                    session, account_number, pos.ticker, pos.exit_order_id
+                    session, account_number, _execution_symbol(pos), pos.exit_order_id
                 )
                 if result is not None and _apply_exit_order_result(pos, result):
                     changed = True
@@ -1500,9 +1826,13 @@ def run_once(
             continue
 
         # --- Entry: watching -> quote-gated fractional market order -> open ---
-        if pos.status == "watching" and price is not None and pos.trigger_price is not None:
+        if (
+            pos.status == "watching"
+            and signal_price is not None
+            and pos.trigger_price is not None
+        ):
             if not pos.armed:
-                if price < pos.trigger_price:
+                if _trigger_is_armed(pos, signal_price):
                     pos.armed = True
                     pos.exit_reason = None
                     changed = True
@@ -1510,17 +1840,21 @@ def run_once(
                         "%s watch armed: %s price=%.4f below trigger=%.4f",
                         pos.source.capitalize(),
                         pos.ticker,
-                        price,
+                        signal_price,
                         pos.trigger_price,
                     )
                 continue
-            if price >= pos.trigger_price:
-                limit_price = _entry_limit_price(pos.trigger_price)
+            if _trigger_crossed(pos, signal_price):
+                limit_price = _entry_guard_price(pos)
                 pos.entry_limit_price = limit_price
-                if price > limit_price:
+                if _trigger_gapped_past_guard(pos, signal_price):
                     log.warning(
-                        "SKIP GAP: %s price=%.4f exceeds max entry %.4f (trigger=%.4f)",
-                        pos.ticker, price, limit_price, pos.trigger_price,
+                        "SKIP GAP: %s price=%.4f passed entry guard %.4f (trigger=%.4f operator=%s)",
+                        pos.ticker,
+                        signal_price,
+                        limit_price,
+                        pos.trigger_price,
+                        pos.trigger_operator,
                     )
                     if pos.good_til_cancelled:
                         pos.armed = False
@@ -1533,7 +1867,11 @@ def run_once(
 
                 log.info(
                     "TRIGGER: %s price=%.4f >= trigger=%.4f — preparing protected $%.0f fractional buy with cap %.4f",
-                    pos.ticker, price, pos.trigger_price, DAY_TRADE_BUDGET_USD, limit_price,
+                    pos.ticker,
+                    signal_price,
+                    pos.trigger_price,
+                    DAY_TRADE_BUDGET_USD,
+                    limit_price,
                 )
                 if _submit_or_recover_entry(session, account_number, pos):
                     changed = True
@@ -1553,7 +1891,7 @@ def run_once(
             # the stop before the broker order status update reached us.
             if pos.stop_order_id:
                 stop_result = _poll_order(
-                    session, account_number, pos.ticker, pos.stop_order_id
+                    session, account_number, _execution_symbol(pos), pos.stop_order_id
                 )
                 if (
                     stop_result
@@ -1618,7 +1956,11 @@ def run_once(
             # Also poll broker limit order if one was placed (for whole-share positions)
             if pos.limit_order_id:
                 try:
-                    od = session.call("get_equity_orders", account_number=account_number, symbol=pos.ticker)
+                    od = session.call(
+                        "get_equity_orders",
+                        account_number=account_number,
+                        symbol=_execution_symbol(pos),
+                    )
                     orders = od.get("data", {}).get("orders", [])
                     tgt_order = next((o for o in orders if o.get("id") == pos.limit_order_id), None)
                     if tgt_order and tgt_order.get("state") == "filled":
@@ -1671,7 +2013,13 @@ def run_once(
                     if pos.stop_order_id:
                         _cancel_order(session, account_number, pos.stop_order_id)
                     if pos.fill_qty:
-                        pos.stop_order_id = _place_stop_order(session, account_number, pos.ticker, pos.fill_qty, new_stop)
+                        pos.stop_order_id = _place_stop_order(
+                            session,
+                            account_number,
+                            _execution_symbol(pos),
+                            pos.fill_qty,
+                            new_stop,
+                        )
                     pos.stop_price = new_stop
                     pos.eod_tightened = True
                     changed = True
@@ -1711,7 +2059,11 @@ def run_once(
                             _cancel_order(session, account_number, pos.stop_order_id)
                         if pos.fill_qty:
                             pos.stop_order_id = _place_stop_order(
-                                session, account_number, pos.ticker, pos.fill_qty, new_stop
+                                session,
+                                account_number,
+                                _execution_symbol(pos),
+                                pos.fill_qty,
+                                new_stop,
                             )
                         pos.stop_price = new_stop
                     pos.confirm_count = 0
@@ -1738,7 +2090,7 @@ def main() -> None:
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
 
     log.info(
-        "Day trader started. budget=$%.0f poll=%ds/%ds tick=%.1fs near=%.2f%% entry_cap=%.2f%% max_spread=%.2f%% positions_log=%s",
+        "Day trader started. budget=$%.0f poll=%ds/%ds tick=%.1fs near=%.2f%% entry_cap=%.2f%% max_spread=%.2f%% etf_spread=%.2f%% etf_min_avg_volume=%.0f positions_log=%s",
         DAY_TRADE_BUDGET_USD,
         FAR_POLL_INTERVAL_S,
         NEAR_POLL_INTERVAL_S,
@@ -1746,6 +2098,8 @@ def main() -> None:
         NEAR_TRIGGER_PCT,
         ENTRY_LIMIT_OFFSET_PCT,
         ENTRY_MAX_SPREAD_PCT,
+        LEVERAGED_ETF_MAX_SPREAD_PCT,
+        LEVERAGED_ETF_MIN_AVG_VOLUME,
         POSITIONS_LOG,
     )
     positions = _load_positions()

@@ -11,7 +11,7 @@ interface DayTradeDataState {
   serviceRunning: boolean;
   loading: boolean;
   error: string | null;
-  refetch: () => void;
+  refetch: () => Promise<void>;
 }
 
 const POLL_INTERVAL_MS = 15_000;

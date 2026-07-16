@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from bot.leveraged_etfs import candidate_symbols
+
 
 HEAT_IDEAS_PATH = Path("logs/heat_ideas.jsonl")
 HEAT_DECISIONS_PATH = Path("state/heat_idea_decisions.jsonl")
@@ -26,6 +28,12 @@ _BLOCKED_TICKERS = {
 }
 _OPTION_RE = re.compile(r"(?:期权|\b(?:call|put|calls|puts)\b|\d+[CP]\b)", re.I)
 _SHORT_RE = re.compile(r"(?:做空|看空|空单|\bshort\b)", re.I)
+_BULLISH_RE = re.compile(r"(?:做多|看多|\b(?:long|bullish)\b)", re.I)
+_BEARISH_RE = re.compile(r"(?:做空|看空|空单|\b(?:short|bearish)\b)", re.I)
+_BELOW_RE = re.compile(
+    r"(?:跌破|低于|below|under|break(?:s|ing)?\s*(?:below|under))",
+    re.I,
+)
 _MANAGEMENT_RE = re.compile(
     r"(?:减仓|止盈|落袋|卖出|清仓|平仓|runner|trim|take\s*profit|sold|sell)",
     re.I,
@@ -49,6 +57,11 @@ _TRIGGER_PATTERNS = (
     re.compile(
         r"\$?([0-9]+(?:\.[0-9]+)?)\s*(?:附近|左右)?\s*"
         r"(?:买入|买了|买点|建仓|做多|bought|buy)",
+        re.I,
+    ),
+    re.compile(
+        r"(?:跌破|低于|below|under|break(?:s|ing)?\s*(?:below|under))"
+        r"[^0-9]{0,18}\$?([0-9]+(?:\.[0-9]+)?)",
         re.I,
     ),
 )
@@ -94,6 +107,15 @@ def _trigger_from(text: str) -> float | None:
     return None
 
 
+def _direction_from(text: str) -> str | None:
+    """Return an unambiguous economic direction, not the option side."""
+    bullish = bool(_BULLISH_RE.search(text or ""))
+    bearish = bool(_BEARISH_RE.search(text or ""))
+    if bullish == bearish:
+        return None
+    return "long" if bullish else "short"
+
+
 def parse_heat_idea(
     text: str,
     *,
@@ -111,23 +133,45 @@ def parse_heat_idea(
     ticker = _ticker_from(body) or _ticker_from(context)
     if not ticker:
         return None
-    if _OPTION_RE.search(body) or _SHORT_RE.search(body):
+    option_message = bool(_OPTION_RE.search(body))
+    if option_message:
+        # Heat's option posts are performance/show-and-tell, not actionable
+        # trade opportunities. Do not surface them as ideas or review items.
         return None
-    if _MANAGEMENT_RE.search(body) and not _ENTRY_INTENT_RE.search(body):
+    if (
+        _MANAGEMENT_RE.search(body)
+        and not _ENTRY_INTENT_RE.search(body)
+    ):
         return None
-    if not _ENTRY_INTENT_RE.search(body):
+    direction = _direction_from(body)
+    if direction is None and _ENTRY_INTENT_RE.search(body):
+        direction = "long"
+    if not _ENTRY_INTENT_RE.search(body) and not _SHORT_RE.search(body):
         return None
 
     trigger = _trigger_from(body)
+    trigger_operator = "below" if _BELOW_RE.search(body) else "above"
+    mapping_supported = bool(direction and candidate_symbols(ticker, direction))
     # Heat explicitly labels some trades as unusually risky. Preserve the
     # parsed level for a fast review, but never auto-approve those messages.
-    auto_eligible = trigger is not None and not _RISK_RE.search(body)
+    # Option posts were already discarded above, so only cash-equity/index
+    # language with a supported execution route can auto-approve.
+    auto_eligible = bool(
+        trigger is not None
+        and direction is not None
+        and mapping_supported
+        and not _RISK_RE.search(body)
+    )
     return {
         "event_type": "idea",
         "id": str(idea_id),
         "ticker": ticker,
         "trigger_price": trigger,
         "target_price": None,
+        "direction": direction,
+        "trigger_operator": trigger_operator,
+        "mapping_supported": mapping_supported,
+        "leveraged_candidates": candidate_symbols(ticker, direction or ""),
         "setup": body[:500] or "Heat chart watch",
         "text": body,
         "reply_text": context[:1000] or None,
@@ -188,7 +232,10 @@ def materialize_heat_ideas(
         decision = latest_decision.get(idea_id)
         if decision:
             idea["decision"] = decision.get("decision")
-            for field in ("ticker", "trigger_price", "target_price", "setup"):
+            for field in (
+                "ticker", "trigger_price", "target_price", "setup",
+                "direction", "trigger_operator",
+            ):
                 if field in decision:
                     idea[field] = decision[field]
             idea["decided_at"] = decision.get("decided_at")
@@ -199,6 +246,11 @@ def materialize_heat_ideas(
         else:
             idea["decision"] = None
             idea["status"] = "needs_review"
+
+        direction = str(idea.get("direction") or "")
+        candidates = candidate_symbols(str(idea.get("ticker") or ""), direction)
+        idea["mapping_supported"] = bool(candidates)
+        idea["leveraged_candidates"] = candidates
 
     return sorted(by_id.values(), key=lambda row: row.get("created_at") or "", reverse=True)
 

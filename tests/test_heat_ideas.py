@@ -57,7 +57,8 @@ def test_heat_parser_uses_reply_ticker_and_ignores_moving_average_numbers():
     assert idea is not None
     assert idea["ticker"] == "TEM"
     assert idea["trigger_price"] == 64.2
-    assert idea["auto_eligible"] is True
+    assert idea["auto_eligible"] is False
+    assert idea["mapping_supported"] is False
 
 
 def test_heat_parser_prefers_actual_buy_ticker_and_reviews_high_risk_trade():
@@ -74,12 +75,35 @@ def test_heat_parser_prefers_actual_buy_ticker_and_reviews_high_risk_trade():
 
 @pytest.mark.parametrize("text", [
     "SPY put 关注突破600",
-    "NVDA 做空，跌破150",
-    "GOOGL 减仓一半",
+    "关注 SPY sell puts",
+    "NVDA 200C +80% nice win",
 ])
-def test_heat_parser_rejects_options_shorts_and_management(text):
+def test_heat_parser_ignores_option_show_and_tell(text):
     assert parse_heat_idea(
-        text, idea_id="3", created_at="2026-07-15T15:00:00+00:00"
+        text,
+        idea_id="option-show",
+        created_at="2026-07-15T15:00:00+00:00",
+    ) is None
+
+
+def test_heat_parser_accepts_explicit_bearish_breakdown_route():
+    idea = parse_heat_idea(
+        "NVDA 做空，跌破150",
+        idea_id="4",
+        created_at="2026-07-15T15:00:00+00:00",
+    )
+    assert idea is not None
+    assert idea["trigger_price"] == 150
+    assert idea["direction"] == "short"
+    assert idea["trigger_operator"] == "below"
+    assert idea["leveraged_candidates"] == ["NVD", "NVDQ"]
+
+
+def test_heat_parser_still_rejects_position_management_only():
+    assert parse_heat_idea(
+        "GOOGL 减仓一半",
+        idea_id="5",
+        created_at="2026-07-15T15:00:00+00:00",
     ) is None
 
 
@@ -106,8 +130,9 @@ def test_day_trader_sync_creates_unarmed_current_day_heat_watch(monkeypatch, wor
     decisions = workspace_tmp / "decisions.jsonl"
     settings = workspace_tmp / "settings.json"
     _write_jsonl(ideas, [{
-        "event_type": "idea", "id": "heat-1", "ticker": "TEM",
-        "trigger_price": 64.2, "target_price": None, "setup": "Heat breakout",
+        "event_type": "idea", "id": "heat-1", "ticker": "NVDA",
+        "trigger_price": 150.2, "target_price": None, "setup": "Heat breakout",
+        "direction": "long", "trigger_operator": "above",
         "auto_eligible": True, "created_at": "2026-07-15T14:00:00+00:00",
     }])
     settings.write_text('{"auto_trading_enabled": true}', encoding="utf-8")
@@ -142,15 +167,36 @@ def test_disabling_heat_expires_only_unfilled_watch(monkeypatch, workspace_tmp):
     assert opened.manual_cancel_requested is False
 
 
+def test_existing_unsupported_heat_watch_is_expired(monkeypatch, workspace_tmp):
+    ideas = workspace_tmp / "heat.jsonl"
+    settings = workspace_tmp / "settings.json"
+    _write_jsonl(ideas, [{
+        "event_type": "idea", "id": "nq-1", "ticker": "NQ",
+        "trigger_price": 29685, "target_price": None,
+        "setup": "29685 买入NQ，20点SL", "auto_eligible": True,
+        "created_at": "2026-07-16T02:48:29+00:00",
+    }])
+    settings.write_text('{"auto_trading_enabled": true}', encoding="utf-8")
+    monkeypatch.setattr(day_trader, "HEAT_IDEAS_PATH", ideas)
+    monkeypatch.setattr(day_trader, "HEAT_DECISIONS_PATH", workspace_tmp / "decisions.jsonl")
+    monkeypatch.setattr(day_trader, "HEAT_SETTINGS_PATH", settings)
+    position = DayPosition(
+        ticker="NQ", source="heat", heat_idea_id="nq-1", status="watching"
+    )
+    assert _sync_heat_ideas([position]) is True
+    assert position.status == "expired"
+    assert position.exit_reason == "heat_unsupported_mapping"
+
+
 def test_heat_api_review_approve_and_toggle(monkeypatch, workspace_tmp):
     ideas = workspace_tmp / "logs" / "heat.jsonl"
     decisions = workspace_tmp / "state" / "decisions.jsonl"
     settings = workspace_tmp / "state" / "settings.json"
     positions = workspace_tmp / "logs" / "positions.jsonl"
     _write_jsonl(ideas, [{
-        "event_type": "idea", "id": "googl-1", "ticker": "GOOGL",
+        "event_type": "idea", "id": "spy-1", "ticker": "SPY",
         "trigger_price": None, "target_price": None, "setup": "chart watch",
-        "text": "关注GOOGL，有可能要突破了", "reply_text": None,
+        "text": "关注SPY，有可能要突破了", "reply_text": None,
         "attachments": [], "auto_eligible": False, "confidence": "review",
         "created_at": "2026-07-15T14:00:00+00:00",
     }])
@@ -162,12 +208,14 @@ def test_heat_api_review_approve_and_toggle(monkeypatch, workspace_tmp):
 
     initial = client.get("/api/daytrader").json()
     assert initial["heat_ideas"][0]["derived_status"] == "needs_review"
-    approved = client.post("/api/daytrader/heat-ideas/googl-1/approve", json={
-        "ticker": "GOOGL", "trigger_price": 360.5,
-        "target_price": 372, "setup": "descending-line breakout",
+    approved = client.post("/api/daytrader/heat-ideas/spy-1/approve", json={
+        "ticker": "SPY", "trigger_price": 660.5,
+        "target_price": 672, "setup": "descending-line breakout",
+        "direction": "long", "trigger_operator": "above",
     })
     assert approved.status_code == 200
-    assert approved.json()["trigger_price"] == 360.5
+    assert approved.json()["trigger_price"] == 660.5
+    assert approved.json()["leveraged_candidates"] == ["SPXL"]
 
     toggled = client.put("/api/daytrader/heat-settings", json={
         "auto_trading_enabled": True,
