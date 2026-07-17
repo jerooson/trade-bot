@@ -60,15 +60,39 @@ P0_LEVERAGED_ETFS: dict[str, dict[str, tuple[LeveragedETF, ...]]] = {
         ),
         "short": (LeveragedETF("MSTZ", 2.0),),
     },
+    "PLTR": {
+        "long": (LeveragedETF("PLTU", 2.0),),
+    },
 }
+
+# These are indexes/futures-style signal symbols, not Robinhood equities that
+# can safely serve as the 1x fallback leg.
+_UNDERLYING_FALLBACK_BLOCKLIST = {"ES", "NDX", "NQ", "RUT", "SPX"}
 
 
 def leveraged_candidates(ticker: str, direction: str) -> tuple[LeveragedETF, ...]:
     return P0_LEVERAGED_ETFS.get(ticker.upper(), {}).get(direction.lower(), ())
 
 
+def execution_candidates(ticker: str, direction: str) -> tuple[LeveragedETF, ...]:
+    """Return preferred ETF routes plus a long-only underlying fallback.
+
+    Heat bearish ideas still require an explicit inverse ETF mapping; the bot
+    never opens a short position in the underlying.  Bullish ideas may buy the
+    source equity when every leveraged candidate is unavailable, illiquid, or
+    not fractional-tradable.
+    """
+    source = ticker.upper()
+    routed = leveraged_candidates(source, direction)
+    if direction.lower() != "long" or source in _UNDERLYING_FALLBACK_BLOCKLIST:
+        return routed
+    if any(candidate.ticker == source for candidate in routed):
+        return routed
+    return (*routed, LeveragedETF(source, 1.0))
+
+
 def candidate_symbols(ticker: str, direction: str) -> list[str]:
-    return [candidate.ticker for candidate in leveraged_candidates(ticker, direction)]
+    return [candidate.ticker for candidate in execution_candidates(ticker, direction)]
 
 
 def quote_symbol(item: dict[str, Any], fallback: str = "") -> str:

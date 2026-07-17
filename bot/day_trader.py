@@ -40,7 +40,7 @@ from typing import Any
 
 from zoneinfo import ZoneInfo
 
-from bot.parser import Signal, SignalKind, parse_message
+from bot.parser import Side, Signal, SignalKind, parse_message
 from bot.heat_ideas import (
     HEAT_DECISIONS_PATH,
     HEAT_IDEAS_PATH,
@@ -49,7 +49,7 @@ from bot.heat_ideas import (
     load_materialized_heat_ideas,
 )
 from bot.manual_day_plans import DEFAULT_PATH as MANUAL_PLANS_PATH, load_plans
-from bot.leveraged_etfs import leveraged_candidates, result_by_symbol
+from bot.leveraged_etfs import execution_candidates, result_by_symbol
 from bot.robinhood_mcp_client import (
     OrderResult,
     RobinhoodMCPError,
@@ -320,6 +320,7 @@ def _load_new_plans(seen_ids: set[str]) -> list[Signal]:
             continue
 
         ticker = d.get("ticker", "").upper()
+        side_raw = str(d.get("side") or "").upper()
         trigger = d.get("trigger")
         target = d.get("target")
         setup = d.get("setup")
@@ -327,10 +328,24 @@ def _load_new_plans(seen_ids: set[str]) -> list[Signal]:
             seen_ids.add(sig_id)
             continue
 
-        from bot.parser import Signal as _Signal, SignalKind as _SK, Side
-        sig = _Signal(
-            kind=_SK.PLAN,
+        # This service buys the underlying for Discord plans; it must never
+        # reinterpret a SHORT alert as a long breakout.  Fail closed when the
+        # side is missing or unsupported instead of relying on dataclass
+        # defaults later in the execution path.
+        if side_raw != Side.LONG.value:
+            log.warning(
+                "Skipping unsupported Discord PLAN: %s side=%s trigger=%s",
+                ticker,
+                side_raw or "missing",
+                trigger,
+            )
+            seen_ids.add(sig_id)
+            continue
+
+        sig = Signal(
+            kind=SignalKind.PLAN,
             ticker=ticker,
+            side=Side.LONG,
             trigger=float(trigger),
             target=float(target) if target is not None else None,
             setup=setup,
@@ -445,7 +460,7 @@ def _sync_heat_ideas(
         route_supported = bool(
             idea
             and direction in {"long", "short"}
-            and leveraged_candidates(str(idea.get("ticker") or ""), direction)
+            and execution_candidates(str(idea.get("ticker") or ""), direction)
         )
         if enabled and approved and route_supported:
             continue
@@ -508,9 +523,9 @@ def _sync_heat_ideas(
             or trigger_operator not in {"above", "below"}
         ):
             continue
-        if not leveraged_candidates(ticker, direction):
+        if not execution_candidates(ticker, direction):
             log.warning(
-                "Heat idea %s cannot queue: no P0 leveraged ETF route for %s %s",
+                "Heat idea %s cannot queue: no supported execution route for %s %s",
                 idea_id,
                 ticker,
                 direction,
@@ -701,12 +716,12 @@ def _select_leveraged_etf(
     source_ticker: str,
     direction: str,
 ) -> LeveragedETFSelection:
-    """Choose the tightest-spread, fractional-tradable P0 ETF candidate."""
-    candidates = leveraged_candidates(source_ticker, direction)
+    """Choose a liquid ETF route, falling back to the underlying for longs."""
+    candidates = execution_candidates(source_ticker, direction)
     if not candidates:
         raise EntryPreflightRejected(
             "unsupported_leveraged_mapping",
-            f"No P0 leveraged ETF route for {source_ticker} {direction}",
+            f"No supported execution route for {source_ticker} {direction}",
         )
     symbols = [candidate.ticker for candidate in candidates]
     quote_data = session.call("get_equity_quotes", symbols=symbols)
@@ -722,7 +737,7 @@ def _select_leveraged_etf(
     tradability = result_by_symbol(tradability_rows, symbols)
     if not tradability_rows:
         raise EntryPreflightUnavailable(
-            f"No tradability response for leveraged ETF candidates {symbols}"
+            f"No tradability response for execution candidates {symbols}"
         )
 
     eligible: list[LeveragedETFSelection] = []
@@ -761,13 +776,19 @@ def _select_leveraged_etf(
             quote.get("average_volume_30_days")
             or quote.get("average_volume")
         )
+        current_volume = _float_or_none(quote.get("volume"))
+        observed_volume = average_volume or current_volume
         if (
-            average_volume is not None
-            and average_volume < LEVERAGED_ETF_MIN_AVG_VOLUME
+            candidate.leverage > 1.0
+            and (
+                observed_volume is None
+                or observed_volume < LEVERAGED_ETF_MIN_AVG_VOLUME
+            )
         ):
-            rejected.append(f"{symbol}:avg volume {average_volume:.0f}")
+            volume_label = f"{observed_volume:.0f}" if observed_volume is not None else "missing"
+            rejected.append(f"{symbol}:volume {volume_label}")
             continue
-        volume = average_volume or _float_or_none(quote.get("volume"))
+        volume = observed_volume
         eligible.append(LeveragedETFSelection(
             symbol,
             candidate.leverage,
@@ -780,12 +801,14 @@ def _select_leveraged_etf(
 
     if not eligible:
         raise EntryPreflightRejected(
-            "no_liquid_leveraged_etf",
-            f"No eligible ETF for {source_ticker} {direction}: {', '.join(rejected)}",
+            "no_liquid_execution_route",
+            f"No eligible execution route for {source_ticker} {direction}: {', '.join(rejected)}",
         )
     # Spread is the hard execution cost for a $20 order.  Volume is used as a
     # tie-breaker when Robinhood exposes it; P0 itself is a curated liquid list.
-    eligible.sort(key=lambda row: (row.spread_pct, -(row.volume or 0)))
+    # Prefer any eligible leveraged route.  The 1x source equity is a fallback,
+    # not a cheaper-spread substitute for the requested leveraged exposure.
+    eligible.sort(key=lambda row: (row.leverage <= 1.0, row.spread_pct, -(row.volume or 0)))
     return eligible[0]
 
 
@@ -1644,6 +1667,16 @@ def run_once(
     # 1. Ingest new PLAN signals.
     new_plans = _load_new_plans(seen_plan_ids)
     for sig in new_plans:
+        # Defence in depth: callers/tests can supply Signal objects without
+        # going through _load_new_plans().  Only explicit LONG Discord plans
+        # are allowed to create an executable DayPosition.
+        if sig.side is not Side.LONG:
+            log.warning(
+                "Ignoring unsupported day-trade PLAN: %s side=%s",
+                sig.ticker,
+                sig.side.value if sig.side else "missing",
+            )
+            continue
         existing = [
             p for p in positions
             if p.ticker == sig.ticker and p.status in ("watching", "pending_entry", "open", "pending_exit")
@@ -1658,6 +1691,8 @@ def run_once(
             setup=sig.setup,
             plan_signal_id=getattr(sig, "message_id", None),
             plan_received_at=sig.received_at.isoformat(),
+            direction="long",
+            trigger_operator="above",
         )
         positions.append(pos)
         _append_position(pos)

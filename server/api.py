@@ -884,7 +884,7 @@ def approve_heat_idea(idea_id: str, request: HeatIdeaDecisionRequest) -> dict[st
     if not candidates:
         raise HTTPException(
             status_code=422,
-            detail=f"no P0 leveraged ETF mapping for {ticker} {direction}",
+            detail=f"no supported execution route for {ticker} {direction}",
         )
     append_heat_jsonl(HEAT_DECISIONS_PATH, {
         "idea_id": idea_id,

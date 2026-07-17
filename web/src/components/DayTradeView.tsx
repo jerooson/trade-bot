@@ -141,14 +141,14 @@ function HeatIdeasTab({ ideas, settings, onChanged }: {
 
   return (
     <div className="space-y-4">
-      <Section title="Heat Automation" subtitle="explicit numeric breakouts auto-queue · chart levels require review">
+      <Section title="Heat Automation" subtitle="explicit levels and confident chart levels auto-queue">
         <div className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
           <div>
             <div className={clsx("text-sm uppercase tracking-[0.18em]", settings.auto_trading_enabled ? "text-crt-long" : "text-crt-short")}>
               {settings.auto_trading_enabled ? "Auto trading enabled" : "Auto trading paused"}
             </div>
             <div className="mt-1 max-w-3xl text-[11px] leading-5 text-bone-500">
-              Source ticker triggers only. Eligible leveraged ETFs are selected at entry from live spread and tradability; option show-and-tell is ignored.
+              Source ticker triggers only. Liquid leveraged ETFs are preferred at entry; bullish ideas fall back to the underlying stock. Option show-and-tell is ignored.
             </div>
           </div>
           <button disabled={busy} onClick={toggle} className={clsx("border px-4 py-2 text-[10px] uppercase tracking-[0.2em] disabled:opacity-40", settings.auto_trading_enabled ? "border-crt-short/50 text-crt-short" : "border-crt-long/50 text-crt-long")}>
@@ -271,8 +271,8 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => Pr
           : ["market_context", "position_update"].includes(idea.classification)
             ? "Context only — no trade approval"
             : idea.mapping_supported
-              ? `P0 route: ${idea.leveraged_candidates.join(" / ")}`
-              : "No P0 leveraged ETF route — review only"}
+              ? `Execution route: ${idea.leveraged_candidates.join(" / ")}`
+              : "No supported execution route — review only"}
       </div>
       {idea.reply_text && <p className="mt-2 border-l border-ink-500 pl-3 text-[10px] leading-4 text-bone-500">Reply context: {idea.reply_text}</p>}
 

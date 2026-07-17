@@ -113,8 +113,9 @@ def test_heat_parser_uses_reply_ticker_and_ignores_moving_average_numbers():
     assert idea is not None
     assert idea["ticker"] == "TEM"
     assert idea["trigger_price"] == 64.2
-    assert idea["auto_eligible"] is False
-    assert idea["mapping_supported"] is False
+    assert idea["auto_eligible"] is True
+    assert idea["mapping_supported"] is True
+    assert idea["leveraged_candidates"] == ["TEM"]
 
 
 def test_heat_parser_prefers_actual_buy_ticker_and_reviews_high_risk_trade():
@@ -302,7 +303,7 @@ def test_heat_api_review_approve_and_toggle(monkeypatch, workspace_tmp):
     })
     assert approved.status_code == 200
     assert approved.json()["trigger_price"] == 660.5
-    assert approved.json()["leveraged_candidates"] == ["SPXL"]
+    assert approved.json()["leveraged_candidates"] == ["SPXL", "SPY"]
 
     toggled = client.put("/api/daytrader/heat-settings", json={
         "auto_trading_enabled": True,

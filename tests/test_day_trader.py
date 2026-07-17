@@ -42,6 +42,7 @@ from bot.day_trader import (
     _apply_entry_order_result,
     _apply_exit_order_result,
     _get_prices,
+    _load_new_plans,
     _migrate_stop_policy,
     _position_poll_interval,
     _select_leveraged_etf,
@@ -292,9 +293,10 @@ class TestEntry(_Base):
         pos = _watching_pos(trigger=10.0)  # already watching
         pos.plan_signal_id = "sig-001"
         # Provide a second plan for same ticker via new_plans
-        from bot.parser import Signal, SignalKind
+        from bot.parser import Side, Signal, SignalKind
         from datetime import timezone
         sig2 = Signal(kind=SignalKind.PLAN, ticker="TEST", trigger=10.0,
+                      side=Side.LONG,
                       received_at=datetime.now(timezone.utc))
         sig2.message_id = "sig-002"  # type: ignore
         positions, m = self._run([pos], price=9.0, new_plans=[sig2])
@@ -893,10 +895,45 @@ class TestPersistence(_Base):
 
 class TestPlanLoading(_Base):
 
+    def test_loader_keeps_long_and_discards_short_or_missing_side(self):
+        """The JSONL boundary fails closed before a Discord plan reaches execution."""
+        received_at = datetime.now(timezone.utc).isoformat()
+        records = [
+            {
+                "kind": "PLAN", "ticker": "KLAC", "side": "SHORT",
+                "trigger": 210.86, "target": 194.0, "received_at": received_at,
+                "discord": {"message_id": "short-1"},
+            },
+            {
+                "kind": "PLAN", "ticker": "MISSING", "side": None,
+                "trigger": 10.0, "received_at": received_at,
+                "discord": {"message_id": "missing-1"},
+            },
+            {
+                "kind": "PLAN", "ticker": "LONG", "side": "LONG",
+                "trigger": 50.0, "received_at": received_at,
+                "discord": {"message_id": "long-1"},
+            },
+        ]
+
+        signals_log = MagicMock()
+        signals_log.exists.return_value = True
+        signals_log.read_text.return_value = "\n".join(
+            json.dumps(record) for record in records
+        )
+        seen_ids: set[str] = set()
+        with patch("bot.day_trader.SIGNALS_LOG", signals_log):
+            plans = _load_new_plans(seen_ids)
+
+        self.assertEqual([plan.ticker for plan in plans], ["LONG"])
+        self.assertEqual(plans[0].side.value, "LONG")
+        self.assertEqual(seen_ids, {"short-1", "missing-1", "long-1"})
+
     def test_new_plan_added_to_positions(self):
         """A new PLAN signal creates a watching DayPosition."""
-        from bot.parser import Signal, SignalKind
+        from bot.parser import Side, Signal, SignalKind
         sig = Signal(kind=SignalKind.PLAN, ticker="NEW", trigger=50.0,
+                     side=Side.LONG,
                      received_at=datetime.now(timezone.utc))
         sig.message_id = "sig-999"  # type: ignore
         positions = []
@@ -905,12 +942,47 @@ class TestPlanLoading(_Base):
         self.assertEqual(positions[0].ticker, "NEW")
         self.assertEqual(positions[0].status, "watching")
 
+    def test_short_plan_never_creates_position_or_order(self):
+        """A Discord SHORT alert must not be reinterpreted as a long buy."""
+        from bot.parser import Side, Signal, SignalKind
+        sig = Signal(
+            kind=SignalKind.PLAN,
+            ticker="KLAC",
+            side=Side.SHORT,
+            trigger=210.86,
+            target=194.0,
+            received_at=datetime.now(timezone.utc),
+        )
+        sig.message_id = "sig-klac-short"  # type: ignore
+
+        positions, mocks = self._run([], new_plans=[sig], price=211.0)
+
+        self.assertEqual(positions, [])
+        mocks["append"].assert_not_called()
+        mocks["buy"].assert_not_called()
+
+    def test_plan_without_explicit_side_fails_closed(self):
+        """Missing direction is unsafe and must not fall back to LONG."""
+        from bot.parser import Signal, SignalKind
+        sig = Signal(
+            kind=SignalKind.PLAN,
+            ticker="UNKNOWN",
+            trigger=50.0,
+            received_at=datetime.now(timezone.utc),
+        )
+
+        positions, mocks = self._run([], new_plans=[sig], price=51.0)
+
+        self.assertEqual(positions, [])
+        mocks["buy"].assert_not_called()
+
     def test_plan_for_already_watching_ticker_skipped(self):
         """Duplicate plan for same ticker doesn't create a second position."""
-        from bot.parser import Signal, SignalKind
+        from bot.parser import Side, Signal, SignalKind
         existing = _watching_pos(trigger=50.0)
         existing.ticker = "DUP"
         sig = Signal(kind=SignalKind.PLAN, ticker="DUP", trigger=51.0,
+                     side=Side.LONG,
                      received_at=datetime.now(timezone.utc))
         sig.message_id = "sig-dup"  # type: ignore
         positions = [existing]
@@ -919,8 +991,9 @@ class TestPlanLoading(_Base):
 
     def test_append_position_called_for_new_plan(self):
         """_append_position is called for each new plan."""
-        from bot.parser import Signal, SignalKind
+        from bot.parser import Side, Signal, SignalKind
         sig = Signal(kind=SignalKind.PLAN, ticker="APP", trigger=50.0,
+                     side=Side.LONG,
                      received_at=datetime.now(timezone.utc))
         sig.message_id = "sig-app"  # type: ignore
         positions = []
@@ -1066,6 +1139,54 @@ class TestResilience(_Base):
 
 
 class TestProtectedEntryAndPolling(unittest.TestCase):
+
+    def test_pltr_prefers_pltu_over_tighter_underlying_fallback(self):
+        session = MagicMock()
+        session.call.side_effect = [
+            {"data": {"results": [
+                {"symbol": "PLTU", "quote": {
+                    "last_trade_price": "32.00", "bid_price": "31.98",
+                    "ask_price": "32.02", "average_volume_30_days": "2000000",
+                }},
+                {"symbol": "PLTR", "quote": {
+                    "last_trade_price": "138.00", "bid_price": "137.99",
+                    "ask_price": "138.01", "average_volume_30_days": "50000000",
+                }},
+            ]}},
+            {"data": {"results": [
+                {"symbol": "PLTU", "tradeable": True, "fractional_tradability": "tradable"},
+                {"symbol": "PLTR", "tradeable": True, "fractional_tradability": "tradable"},
+            ]}},
+        ]
+
+        selected = _select_leveraged_etf(session, "acct", "PLTR", "long")
+
+        self.assertEqual(selected.ticker, "PLTU")
+        self.assertEqual(selected.leverage, 2.0)
+
+    def test_pltr_falls_back_to_underlying_when_pltu_is_illiquid(self):
+        session = MagicMock()
+        session.call.side_effect = [
+            {"data": {"results": [
+                {"symbol": "PLTU", "quote": {
+                    "last_trade_price": "32.00", "bid_price": "31.98",
+                    "ask_price": "32.02", "average_volume_30_days": "500000",
+                }},
+                {"symbol": "PLTR", "quote": {
+                    "last_trade_price": "138.00", "bid_price": "137.99",
+                    "ask_price": "138.01", "average_volume_30_days": "50000000",
+                }},
+            ]}},
+            {"data": {"results": [
+                {"symbol": "PLTU", "tradeable": True, "fractional_tradability": "tradable"},
+                {"symbol": "PLTR", "tradeable": True, "fractional_tradability": "tradable"},
+            ]}},
+        ]
+
+        selected = _select_leveraged_etf(session, "acct", "PLTR", "long")
+
+        self.assertEqual(selected.ticker, "PLTR")
+        self.assertEqual(selected.leverage, 1.0)
 
     def test_selects_tightest_spread_fractional_leveraged_etf(self):
         session = MagicMock()

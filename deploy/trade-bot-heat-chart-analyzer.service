@@ -1,0 +1,19 @@
+[Unit]
+Description=Trade Bot Heat Chart Analyzer
+After=network-online.target docker.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/trade-bot
+Environment=HOME=/home/deploy
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/deploy/trade-bot/.venv/bin/python -u -m bot.heat_chart_analyzer
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
