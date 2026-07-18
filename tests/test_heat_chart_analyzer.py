@@ -116,5 +116,6 @@ def test_successful_analysis_persists_approval_once(workspace_tmp, monkeypatch):
     assert decision["trigger_price"] == 138.9
     assert decision["trigger_operator"] == "above"
     assert decision["source"] == "heat_chart_analyzer"
+    assert decision["good_til_cancelled"] is True
     audit = json.loads(analyses.read_text(encoding="utf-8"))
     assert audit["status"] == "approved"

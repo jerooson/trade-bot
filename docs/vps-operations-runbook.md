@@ -281,9 +281,11 @@ messages are excluded.
 
 The Dashboard Heat switch controls new entries. Turning it off expires or
 cancels only unfilled Heat entries; filled positions retain normal stop,
-target, and EOD management. Heat watches must first observe price below the
-trigger, use the trigger +0.2% entry cap, and default to a maximum of three
-plan lifecycles per market day.
+target, and EOD management. Once approved, a Heat setup is a persistent watch:
+it appears in both **Manual Watches** and **Active Trades**, survives trading-day
+boundaries, and remains until it fills or the operator selects **Cancel Watch**.
+Heat watches must first observe price below the trigger, use the trigger +0.2%
+entry cap, and default to a maximum of three new plan lifecycles per market day.
 
 Runtime files:
 

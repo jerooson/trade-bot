@@ -290,7 +290,7 @@ def materialize_heat_ideas(
             idea["decision"] = decision.get("decision")
             for field in (
                 "ticker", "trigger_price", "target_price", "setup",
-                "direction", "trigger_operator",
+                "direction", "trigger_operator", "good_til_cancelled",
             ):
                 if field in decision:
                     idea[field] = decision[field]
@@ -302,6 +302,12 @@ def materialize_heat_ideas(
         else:
             idea["decision"] = None
             idea["status"] = "needs_review"
+
+        # Approved Heat setups are operator-owned watches, just like Manual
+        # Watches.  Older approvals without this field are upgraded in place.
+        idea["good_til_cancelled"] = bool(
+            idea.get("good_til_cancelled", idea.get("decision") == "approved")
+        )
 
         body = str(idea.get("text") or "")
         reply = str(idea.get("reply_text") or "")

@@ -236,7 +236,62 @@ def test_day_trader_sync_creates_unarmed_current_day_heat_watch(monkeypatch, wor
     assert positions[0].source == "heat"
     assert positions[0].heat_idea_id == "heat-1"
     assert positions[0].armed is False
+    assert positions[0].good_til_cancelled is True
     append.assert_called_once_with(positions[0])
+
+
+def test_day_trader_reactivates_legacy_expired_approved_heat_watch(monkeypatch, workspace_tmp):
+    ideas = workspace_tmp / "heat.jsonl"
+    settings = workspace_tmp / "settings.json"
+    _write_jsonl(ideas, [{
+        "event_type": "idea", "id": "pltr-1", "ticker": "PLTR",
+        "trigger_price": 138.9, "target_price": None,
+        "setup": "Heat breakout", "direction": "long",
+        "trigger_operator": "above", "auto_eligible": True,
+        "created_at": "2026-07-16T14:00:00+00:00",
+    }])
+    settings.write_text('{"auto_trading_enabled": true}', encoding="utf-8")
+    monkeypatch.setattr(day_trader, "HEAT_IDEAS_PATH", ideas)
+    monkeypatch.setattr(day_trader, "HEAT_DECISIONS_PATH", workspace_tmp / "decisions.jsonl")
+    monkeypatch.setattr(day_trader, "HEAT_SETTINGS_PATH", settings)
+    position = DayPosition(
+        ticker="PLTR", source="heat", heat_idea_id="pltr-1",
+        status="expired", exit_reason="eod", good_til_cancelled=False,
+        armed=True,
+    )
+
+    assert _sync_heat_ideas(
+        [position], now=datetime(2026, 7, 17, 10, 0, tzinfo=ET)
+    ) is True
+    assert position.status == "watching"
+    assert position.good_til_cancelled is True
+    assert position.armed is False
+    assert position.exit_reason is None
+    assert position.manual_cancel_requested is False
+
+
+def test_day_trader_does_not_reactivate_expired_heat_watch_with_broker_order(monkeypatch, workspace_tmp):
+    ideas = workspace_tmp / "heat.jsonl"
+    settings = workspace_tmp / "settings.json"
+    _write_jsonl(ideas, [{
+        "event_type": "idea", "id": "pltr-ordered", "ticker": "PLTR",
+        "trigger_price": 138.9, "direction": "long",
+        "trigger_operator": "above", "auto_eligible": True,
+        "created_at": "2026-07-16T14:00:00+00:00",
+    }])
+    settings.write_text('{"auto_trading_enabled": true}', encoding="utf-8")
+    monkeypatch.setattr(day_trader, "HEAT_IDEAS_PATH", ideas)
+    monkeypatch.setattr(day_trader, "HEAT_DECISIONS_PATH", workspace_tmp / "decisions.jsonl")
+    monkeypatch.setattr(day_trader, "HEAT_SETTINGS_PATH", settings)
+    position = DayPosition(
+        ticker="PLTR", source="heat", heat_idea_id="pltr-ordered",
+        status="expired", buy_order_id="broker-order-1",
+        good_til_cancelled=False,
+    )
+
+    assert _sync_heat_ideas([position]) is True
+    assert position.status == "expired"
+    assert position.good_til_cancelled is True
 
 
 def test_disabling_heat_expires_only_unfilled_watch(monkeypatch, workspace_tmp):
@@ -304,6 +359,7 @@ def test_heat_api_review_approve_and_toggle(monkeypatch, workspace_tmp):
     assert approved.status_code == 200
     assert approved.json()["trigger_price"] == 660.5
     assert approved.json()["leveraged_candidates"] == ["SPXL", "SPY"]
+    assert approved.json()["good_til_cancelled"] is True
 
     toggled = client.put("/api/daytrader/heat-settings", json={
         "auto_trading_enabled": True,

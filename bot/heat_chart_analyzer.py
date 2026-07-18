@@ -197,6 +197,7 @@ def analyze_one(
             "setup": idea.get("setup") or "Heat chart watch",
             "direction": str(idea.get("direction") or "long").lower(),
             "trigger_operator": operator,
+            "good_til_cancelled": True,
             "source": "heat_chart_analyzer",
             "analysis_rationale": str(analysis.get("rationale") or "")[:500],
             "decided_at": now,

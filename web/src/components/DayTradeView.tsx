@@ -21,8 +21,16 @@ interface Props {
 
 export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSettings, pnl, serviceRunning, onManualPlansChanged }: Props) {
   const [sub, setSub] = useState<SubTab>("plans");
+  const approvedHeatIdeaIds = new Set(
+    heatIdeas.filter((idea) => idea.decision === "approved").map((idea) => idea.id),
+  );
+  const visiblePositions = positions.filter(
+    (position) => position.source !== "heat"
+      || !position.heat_idea_id
+      || approvedHeatIdeaIds.has(position.heat_idea_id),
+  );
 
-  const openCount = positions.filter((p) => p.status === "open" || p.status === "pending_exit").length;
+  const openCount = visiblePositions.filter((p) => p.status === "open" || p.status === "pending_exit").length;
   const totalPnl = pnl?.total_realized_pnl ?? 0;
 
   return (
@@ -60,7 +68,7 @@ export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSett
       <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatTile
           label="Watching"
-          value={(positions.filter(p => p.status === "watching" || p.status === "pending_entry").length).toString()}
+          value={(visiblePositions.filter(p => p.status === "watching" || p.status === "pending_entry").length).toString()}
           caption="plans / limit orders"
         />
         <StatTile label="Open Trades" value={openCount.toString()} caption="in market" highlight={openCount > 0} />
@@ -93,8 +101,8 @@ export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSett
 
       {sub === "plans" && <SignalsView dash={dash} />}
       {sub === "heat" && <HeatIdeasTab ideas={heatIdeas} settings={heatSettings} onChanged={onManualPlansChanged} />}
-      {sub === "manual" && <ManualWatchTab plans={manualPlans} onChanged={onManualPlansChanged} />}
-      {sub === "active" && <ActiveTab positions={positions} serviceRunning={serviceRunning} />}
+      {sub === "manual" && <ManualWatchTab plans={manualPlans} heatWatches={visiblePositions.filter((p) => p.source === "heat" && (p.status === "watching" || p.status === "pending_entry"))} onChanged={onManualPlansChanged} />}
+      {sub === "active" && <ActiveTab positions={visiblePositions} serviceRunning={serviceRunning} onChanged={onManualPlansChanged} />}
       {sub === "pnl" && <PnlTab pnl={pnl} />}
     </div>
   );
@@ -354,7 +362,7 @@ function HeatIdeaCard({ idea, onChanged }: { idea: HeatIdea; onChanged: () => Pr
   );
 }
 
-function ManualWatchTab({ plans, onChanged }: { plans: ManualDayPlan[]; onChanged: () => Promise<void> }) {
+function ManualWatchTab({ plans, heatWatches, onChanged }: { plans: ManualDayPlan[]; heatWatches: DayTradePosition[]; onChanged: () => Promise<void> }) {
   const [ticker, setTicker] = useState("");
   const [trigger, setTrigger] = useState("");
   const [target, setTarget] = useState("");
@@ -408,6 +416,20 @@ function ManualWatchTab({ plans, onChanged }: { plans: ManualDayPlan[]; onChange
     }
   }
 
+  async function cancelHeat(position: DayTradePosition) {
+    if (!position.heat_idea_id) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await rejectHeatIdea(position.heat_idea_id);
+      await onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <Section title="Add Manual Watch" subtitle="good until executed or cancelled · max 25">
@@ -452,7 +474,25 @@ function ManualWatchTab({ plans, onChanged }: { plans: ManualDayPlan[]; onChange
               </div>
             );
           })}
-          {plans.length === 0 && <div className="px-6 py-10 text-center font-editorial italic text-bone-400">No manual watches yet.</div>}
+          {heatWatches.map((position) => (
+            <div key={position.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3">
+              <div className="col-span-2 font-editorial text-xl italic text-bone-50">
+                {position.ticker}
+                <span className="ml-2 font-mono text-[9px] not-italic uppercase tracking-[0.14em] text-crt-long">Heat</span>
+              </div>
+              <div className="col-span-2 tabular text-sm text-crt-amber">
+                ${position.trigger_price?.toFixed(2) ?? "—"}
+                {position.trigger_price != null && <span className="ml-1 text-[9px] text-bone-500">cap ${(position.trigger_price * 1.002).toFixed(2)}</span>}
+              </div>
+              <div className="col-span-1 tabular text-sm text-bone-300">{position.signal_target_price == null ? "—" : `$${position.signal_target_price.toFixed(2)}`}</div>
+              <div className="col-span-3 truncate text-[11px] text-bone-400">{position.setup ?? "Heat watch"}</div>
+              <div className="col-span-2 text-[9px] uppercase tracking-[0.15em] text-bone-300">{position.status === "pending_entry" ? "entry pending" : position.armed ? "armed" : "waiting rearm"}</div>
+              <div className="col-span-2">
+                <button disabled={busy} onClick={() => cancelHeat(position)} className="border border-crt-short/40 px-2 py-1 text-[9px] uppercase tracking-[0.16em] text-crt-short disabled:opacity-40">Cancel Watch</button>
+              </div>
+            </div>
+          ))}
+          {plans.length === 0 && heatWatches.length === 0 && <div className="px-6 py-10 text-center font-editorial italic text-bone-400">No watches yet.</div>}
         </div>
       </Section>
     </div>
@@ -474,7 +514,28 @@ function Field({ label, value, onChange, placeholder, type = "text", span }: {
 // Active trades tab
 // ---------------------------------------------------------------------------
 
-function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[]; serviceRunning: boolean }) {
+function ActiveTab({ positions, serviceRunning, onChanged }: { positions: DayTradePosition[]; serviceRunning: boolean; onChanged: () => Promise<void> }) {
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function cancelWatch(position: DayTradePosition) {
+    if (!position.manual_plan_id && !position.heat_idea_id) return;
+    setBusyId(position.id);
+    setError(null);
+    try {
+      if (position.source === "heat" && position.heat_idea_id) {
+        await rejectHeatIdea(position.heat_idea_id);
+      } else if (position.manual_plan_id) {
+        await cancelManualDayPlan(position.manual_plan_id);
+      }
+      await onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   if (!serviceRunning) {
     return (
       <div className="border border-dashed border-crt-amber/40 bg-crt-amber/[0.04] px-6 py-12 text-center">
@@ -492,10 +553,11 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
 
   return (
     <>
+      {error && <div className="mb-4 border border-crt-short/50 bg-crt-short/10 px-4 py-3 text-sm text-crt-short">{error}</div>}
       {watching.length > 0 && (
         <Section title="Watching" subtitle="waiting for trigger price to be crossed">
           <div className="flex flex-col">
-            <GridHeader cols={["ticker", "trigger", "setup", "plan age", "status"]} spans={[2,2,4,2,2]} />
+            <GridHeader cols={["ticker", "trigger", "setup", "plan age", "status", "action"]} spans={[2,2,3,2,1,2]} />
             {watching.map((p) => (
               <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
                 <div className="col-span-2 font-editorial text-xl italic text-bone-50">
@@ -507,16 +569,24 @@ function ActiveTab({ positions, serviceRunning }: { positions: DayTradePosition[
                     <span className="ml-1 text-[9px] text-bone-500">cap ${p.entry_limit_price.toFixed(2)}</span>
                   )}
                 </div>
-                <div className="col-span-4 text-[11px] text-bone-400">
+                <div className="col-span-3 text-[11px] text-bone-400">
                   {p.setup ?? "—"}
                   {p.source === "manual" && <span className="ml-2 text-[9px] uppercase tracking-[0.14em] text-crt-amber">manual</span>}
+                  {p.source === "heat" && <span className="ml-2 text-[9px] uppercase tracking-[0.14em] text-crt-long">Heat</span>}
                 </div>
                 <div className="col-span-2 tabular text-[11px] text-bone-500">{relativeTime(p.plan_received_at)}</div>
-                <div className="col-span-2">
+                <div className="col-span-1">
                   <span className="inline-flex items-center gap-1 border border-crt-amber/50 bg-crt-amber/10 px-1.5 py-0.5 text-[9px] uppercase tracking-[0.18em] text-crt-amber">
                     <span className="h-1.5 w-1.5 animate-pulseDot rounded-full bg-crt-amber" />
                     {p.status === "pending_entry" ? "limit pending" : "watching"}
                   </span>
+                </div>
+                <div className="col-span-2">
+                  {(p.manual_plan_id || p.heat_idea_id) && (
+                    <button disabled={busyId === p.id} onClick={() => cancelWatch(p)} className="border border-crt-short/40 px-2 py-1 text-[9px] uppercase tracking-[0.16em] text-crt-short disabled:opacity-40">
+                      {busyId === p.id ? "Cancelling…" : "Cancel Watch"}
+                    </button>
+                  )}
                 </div>
               </div>
             ))}

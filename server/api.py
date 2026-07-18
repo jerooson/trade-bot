@@ -895,6 +895,7 @@ def approve_heat_idea(idea_id: str, request: HeatIdeaDecisionRequest) -> dict[st
         "setup": setup or idea.get("setup") or "Heat breakout watch",
         "direction": direction,
         "trigger_operator": trigger_operator,
+        "good_til_cancelled": True,
         "decided_at": datetime.now(timezone.utc).isoformat(),
     })
     return _find_heat_idea(idea_id) or {}

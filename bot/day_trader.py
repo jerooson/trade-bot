@@ -438,7 +438,7 @@ def _sync_heat_ideas(
     *,
     now: datetime | None = None,
 ) -> bool:
-    """Create current-session watches from approved Heat ideas.
+    """Create and maintain persistent watches from approved Heat ideas.
 
     The settings switch controls creation and unfilled entries only.  Turning
     it off never abandons an already-open position; normal stop/EOD management
@@ -462,7 +462,27 @@ def _sync_heat_ideas(
             and direction in {"long", "short"}
             and execution_candidates(str(idea.get("ticker") or ""), direction)
         )
+        persistent = bool(idea and idea.get("good_til_cancelled", True))
         if enabled and approved and route_supported:
+            if pos.good_til_cancelled != persistent:
+                pos.good_til_cancelled = persistent
+                changed = True
+            # Legacy Heat watches expired at EOD. Reactivate only clean,
+            # unfilled watches; submitted/partial orders keep their lifecycle.
+            if (
+                persistent
+                and pos.status == "expired"
+                and not pos.buy_order_id
+                and not pos.fill_qty
+                and pos.entry_filled_qty <= 0
+            ):
+                pos.status = "watching"
+                pos.exit_reason = None
+                pos.manual_cancel_requested = False
+                pos.entry_cancel_requested_at = None
+                pos.entry_cancel_reason = None
+                pos.armed = False
+                changed = True
             continue
         if pos.status == "watching":
             pos.status = "expired"
@@ -556,7 +576,7 @@ def _sync_heat_ideas(
             heat_idea_id=idea_id,
             direction=direction,
             trigger_operator=trigger_operator,
-            good_til_cancelled=False,
+            good_til_cancelled=bool(idea.get("good_til_cancelled", True)),
             # Observe price below the trigger before accepting a new breakout.
             armed=False,
         )
