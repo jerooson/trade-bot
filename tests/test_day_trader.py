@@ -55,6 +55,7 @@ from bot.day_trader import (
     _validate_entry_preflight,
     run_once,
 )
+from bot.leveraged_etfs import LeveragedETF
 from bot.robinhood_mcp_client import OrderResult
 
 # ---------------------------------------------------------------------------
@@ -1251,13 +1252,13 @@ class TestProtectedEntryAndPolling(unittest.TestCase):
         self.assertEqual(selected.ticker, "PLTU")
         self.assertEqual(selected.leverage, 2.0)
 
-    def test_pltr_falls_back_to_underlying_when_pltu_is_illiquid(self):
+    def test_curated_pltu_does_not_require_quote_volume(self):
         session = MagicMock()
         session.call.side_effect = [
             {"data": {"results": [
                 {"symbol": "PLTU", "quote": {
                     "last_trade_price": "32.00", "bid_price": "31.98",
-                    "ask_price": "32.02", "average_volume_30_days": "500000",
+                    "ask_price": "32.02",
                 }},
                 {"symbol": "PLTR", "quote": {
                     "last_trade_price": "138.00", "bid_price": "137.99",
@@ -1272,8 +1273,68 @@ class TestProtectedEntryAndPolling(unittest.TestCase):
 
         selected = _select_leveraged_etf(session, "acct", "PLTR", "long")
 
-        self.assertEqual(selected.ticker, "PLTR")
-        self.assertEqual(selected.leverage, 1.0)
+        self.assertEqual(selected.ticker, "PLTU")
+        self.assertEqual(selected.leverage, 2.0)
+        self.assertEqual(selected.liquidity_basis, "curated_liquid_route")
+
+    def test_spxl_missing_quote_volume_still_routes_spy_to_spxl(self):
+        session = MagicMock()
+        session.call.side_effect = [
+            {"data": {"results": [
+                {"symbol": "SPXL", "quote": {
+                    "last_trade_price": "271.31", "bid_price": "271.30",
+                    "ask_price": "271.39",
+                }},
+                {"symbol": "SPY", "quote": {
+                    "last_trade_price": "748.61", "bid_price": "748.61",
+                    "ask_price": "748.63",
+                }},
+            ]}},
+            {"data": {"results": [
+                {"symbol": "SPXL", "tradeable": True, "fractional_tradability": "tradable"},
+                {"symbol": "SPY", "tradeable": True, "fractional_tradability": "tradable"},
+            ]}},
+        ]
+
+        with self.assertLogs("bot.day_trader", level="INFO") as logs:
+            selected = _select_leveraged_etf(session, "acct", "SPY", "long")
+
+        self.assertEqual(selected.ticker, "SPXL")
+        self.assertIsNone(selected.volume)
+        self.assertEqual(selected.liquidity_basis, "curated_liquid_route")
+        self.assertIn("selected=SPXL", "\n".join(logs.output))
+        self.assertIn("volume=missing", "\n".join(logs.output))
+
+    def test_non_curated_leveraged_route_still_requires_volume(self):
+        session = MagicMock()
+        session.call.side_effect = [
+            {"data": {"results": [
+                {"symbol": "NVDU", "quote": {
+                    "last_trade_price": "18.00", "bid_price": "17.99",
+                    "ask_price": "18.01",
+                }},
+                {"symbol": "NVDA", "quote": {
+                    "last_trade_price": "190.00", "bid_price": "189.99",
+                    "ask_price": "190.01",
+                }},
+            ]}},
+            {"data": {"results": [
+                {"symbol": "NVDU", "tradeable": True, "fractional_tradability": "tradable"},
+                {"symbol": "NVDA", "tradeable": True, "fractional_tradability": "tradable"},
+            ]}},
+        ]
+
+        with patch(
+            "bot.day_trader.execution_candidates",
+            return_value=(
+                LeveragedETF("NVDU", 2.0),
+                LeveragedETF("NVDA", 1.0),
+            ),
+        ):
+            selected = _select_leveraged_etf(session, "acct", "NVDA", "long")
+
+        self.assertEqual(selected.ticker, "NVDA")
+        self.assertEqual(selected.liquidity_basis, "underlying_fallback")
 
     def test_selects_tightest_spread_fractional_leveraged_etf(self):
         session = MagicMock()

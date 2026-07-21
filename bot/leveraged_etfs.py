@@ -17,6 +17,29 @@ class LeveragedETF:
     leverage: float
 
 
+# Robinhood's equity-quote response does not consistently expose volume.  The
+# products below are deliberately curated high-liquidity routes, so a missing
+# or stale volume field must not disqualify them.  They still have to pass the
+# live spread, tradability, fractional-trading, and minimum-price checks.
+# Less-established products continue to require observed volume at preflight.
+VERIFIED_LIQUID_ETFS = frozenset({
+    "SPXL",
+    "SPXS",
+    "TQQQ",
+    "SQQQ",
+    "TNA",
+    "TZA",
+    "SOXL",
+    "SOXS",
+    "TSLL",
+    "NVDL",
+    "NVDX",
+    "MSTU",
+    "MSTX",
+    "PLTU",
+})
+
+
 P0_LEVERAGED_ETFS: dict[str, dict[str, tuple[LeveragedETF, ...]]] = {
     "SPY": {
         "long": (LeveragedETF("SPXL", 3.0),),
@@ -72,6 +95,11 @@ _UNDERLYING_FALLBACK_BLOCKLIST = {"ES", "NDX", "NQ", "RUT", "SPX"}
 
 def leveraged_candidates(ticker: str, direction: str) -> tuple[LeveragedETF, ...]:
     return P0_LEVERAGED_ETFS.get(ticker.upper(), {}).get(direction.lower(), ())
+
+
+def has_verified_liquidity(ticker: str) -> bool:
+    """Return whether the route may tolerate unavailable quote volume."""
+    return ticker.upper() in VERIFIED_LIQUID_ETFS
 
 
 def execution_candidates(ticker: str, direction: str) -> tuple[LeveragedETF, ...]:

@@ -287,6 +287,15 @@ boundaries, and remains until it fills or the operator selects **Cancel Watch**.
 Heat watches must first observe price below the trigger, use the trigger +0.2%
 entry cap, and default to a maximum of three new plan lifecycles per market day.
 
+Leveraged ETF routing uses a curated high-liquidity allowlist for established
+products such as SPXL, TQQQ, SOXL, TSLL, NVDL, MSTU, and PLTU. Robinhood quote
+responses may omit volume, so allowlisted routes do not require that field;
+they still must pass live spread, minimum-price, tradability, and fractional-
+trading checks. Less-established leveraged products continue to require at
+least the configured observed-volume threshold. Each trigger writes the chosen
+route, liquidity basis, spread, volume availability, and rejected candidates
+to the day-trader log.
+
 Discord day-trade plans received during a regular session remain eligible
 through the following trading session when they do not fill. A carried plan
 starts the next session unarmed: if price gaps above the trigger and the +0.2%

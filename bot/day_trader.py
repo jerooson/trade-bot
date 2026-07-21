@@ -49,7 +49,11 @@ from bot.heat_ideas import (
     load_materialized_heat_ideas,
 )
 from bot.manual_day_plans import DEFAULT_PATH as MANUAL_PLANS_PATH, load_plans
-from bot.leveraged_etfs import execution_candidates, result_by_symbol
+from bot.leveraged_etfs import (
+    execution_candidates,
+    has_verified_liquidity,
+    result_by_symbol,
+)
 from bot.robinhood_mcp_client import (
     OrderResult,
     RobinhoodMCPError,
@@ -726,6 +730,7 @@ class LeveragedETFSelection:
     ask: float
     spread_pct: float
     volume: float | None
+    liquidity_basis: str = "observed_volume"
 
 
 def _float_or_none(value: object) -> float | None:
@@ -804,8 +809,12 @@ def _select_leveraged_etf(
         )
         current_volume = _float_or_none(quote.get("volume"))
         observed_volume = average_volume or current_volume
+        verified_liquidity = (
+            candidate.leverage > 1.0 and has_verified_liquidity(symbol)
+        )
         if (
             candidate.leverage > 1.0
+            and not verified_liquidity
             and (
                 observed_volume is None
                 or observed_volume < LEVERAGED_ETF_MIN_AVG_VOLUME
@@ -815,6 +824,12 @@ def _select_leveraged_etf(
             rejected.append(f"{symbol}:volume {volume_label}")
             continue
         volume = observed_volume
+        if candidate.leverage <= 1.0:
+            liquidity_basis = "underlying_fallback"
+        elif verified_liquidity:
+            liquidity_basis = "curated_liquid_route"
+        else:
+            liquidity_basis = "observed_volume"
         eligible.append(LeveragedETFSelection(
             symbol,
             candidate.leverage,
@@ -823,6 +838,7 @@ def _select_leveraged_etf(
             ask,
             spread_pct,
             volume,
+            liquidity_basis,
         ))
 
     if not eligible:
@@ -835,7 +851,20 @@ def _select_leveraged_etf(
     # Prefer any eligible leveraged route.  The 1x source equity is a fallback,
     # not a cheaper-spread substitute for the requested leveraged exposure.
     eligible.sort(key=lambda row: (row.leverage <= 1.0, row.spread_pct, -(row.volume or 0)))
-    return eligible[0]
+    selected = eligible[0]
+    log.info(
+        "ETF ROUTE EVALUATED: %s %s candidates=%s selected=%s "
+        "liquidity=%s volume=%s spread=%.3f%% rejected=%s",
+        source_ticker,
+        direction,
+        symbols,
+        selected.ticker,
+        selected.liquidity_basis,
+        f"{selected.volume:.0f}" if selected.volume is not None else "missing",
+        selected.spread_pct,
+        rejected or "none",
+    )
+    return selected
 
 
 def _place_fractional_market_buy(
