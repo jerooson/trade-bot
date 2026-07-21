@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import clsx from "clsx";
-import type { DayTradePosition, DayTradePnl, HeatIdea, HeatSettings, ManualDayPlan } from "../lib/types";
+import type { DayTradePosition, DayTradePnl, HeatIdea, HeatSettings, ManualDayPlan, Signal } from "../lib/types";
 import { approveHeatIdea, cancelManualDayPlan, createManualDayPlan, rejectHeatIdea, setHeatAutoTrading } from "../lib/api";
 import { SignalsView, type DashLike } from "./SignalsView";
 import { relativeTime } from "../lib/format";
@@ -102,7 +102,7 @@ export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSett
       {sub === "plans" && <SignalsView dash={dash} />}
       {sub === "heat" && <HeatIdeasTab ideas={heatIdeas} settings={heatSettings} onChanged={onManualPlansChanged} />}
       {sub === "manual" && <ManualWatchTab plans={manualPlans} heatWatches={visiblePositions.filter((p) => p.source === "heat" && (p.status === "watching" || p.status === "pending_entry"))} onChanged={onManualPlansChanged} />}
-      {sub === "active" && <ActiveTab positions={visiblePositions} serviceRunning={serviceRunning} onChanged={onManualPlansChanged} />}
+      {sub === "active" && <ActiveTab positions={visiblePositions} heatIdeas={heatIdeas} signals={dash.signals} serviceRunning={serviceRunning} onChanged={onManualPlansChanged} />}
       {sub === "pnl" && <PnlTab pnl={pnl} />}
     </div>
   );
@@ -514,7 +514,105 @@ function Field({ label, value, onChange, placeholder, type = "text", span }: {
 // Active trades tab
 // ---------------------------------------------------------------------------
 
-function ActiveTab({ positions, serviceRunning, onChanged }: { positions: DayTradePosition[]; serviceRunning: boolean; onChanged: () => Promise<void> }) {
+type TradeOrigin = {
+  label: string;
+  author: string | null;
+  channel: string | null;
+  reference: string | null;
+  tone: "heat" | "manual" | "discord";
+};
+
+function tradeOrigin(position: DayTradePosition, heatIdeas: HeatIdea[], signals: Signal[]): TradeOrigin {
+  if (position.source === "heat") {
+    const idea = heatIdeas.find((item) => item.id === position.heat_idea_id);
+    return {
+      label: "Heat",
+      author: idea?.discord?.author_name ?? "heat2030",
+      channel: idea?.discord?.channel_name ?? null,
+      reference: position.heat_idea_id ? `idea ${position.heat_idea_id}` : null,
+      tone: "heat",
+    };
+  }
+  if (position.source === "manual") {
+    return {
+      label: "Manual",
+      author: "Dashboard watch",
+      channel: null,
+      reference: position.manual_plan_id ? `plan ${position.manual_plan_id}` : null,
+      tone: "manual",
+    };
+  }
+  const signal = signals.find((item) => String(item.discord?.message_id ?? "") === String(position.plan_signal_id ?? ""));
+  return {
+    label: "Discord plan",
+    author: signal?.discord?.author_name ?? null,
+    channel: signal?.discord?.channel_name ?? null,
+    reference: position.plan_signal_id ? `message ${position.plan_signal_id}` : null,
+    tone: "discord",
+  };
+}
+
+function SourceBadge({ origin }: { origin: TradeOrigin }) {
+  return (
+    <span className={clsx(
+      "inline-flex border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.16em]",
+      origin.tone === "heat" && "border-crt-long/50 bg-crt-long/10 text-crt-long",
+      origin.tone === "manual" && "border-crt-amber/50 bg-crt-amber/10 text-crt-amber",
+      origin.tone === "discord" && "border-bone-500/50 bg-bone-500/10 text-bone-300",
+    )}>
+      {origin.label}
+    </span>
+  );
+}
+
+function formatTradeTime(value: string | null | undefined): string {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(date);
+}
+
+function triggerCondition(position: DayTradePosition): string {
+  const operator = position.trigger_operator === "below" ? "<=" : ">=";
+  const trigger = position.trigger_price == null ? "—" : `$${position.trigger_price.toFixed(2)}`;
+  return `${position.ticker} ${operator} ${trigger}`;
+}
+
+function originDetail(origin: TradeOrigin): string {
+  return [origin.author, origin.channel, origin.reference].filter(Boolean).join(" · ") || origin.label;
+}
+
+function TradeMetric({ label, value, valueClass }: { label: string; value: string; valueClass?: string }) {
+  return (
+    <div>
+      <div className="text-[8px] uppercase tracking-[0.18em] text-bone-600">{label}</div>
+      <div className={clsx("mt-0.5 whitespace-nowrap tabular text-sm text-bone-300", valueClass)}>{value}</div>
+    </div>
+  );
+}
+
+function TradeDetail({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <span className="uppercase tracking-[0.14em] text-bone-600">{label}</span>
+      <div className="mt-0.5 tabular leading-relaxed text-bone-400">{value}</div>
+    </div>
+  );
+}
+
+function ActiveTab({ positions, heatIdeas, signals, serviceRunning, onChanged }: {
+  positions: DayTradePosition[];
+  heatIdeas: HeatIdea[];
+  signals: Signal[];
+  serviceRunning: boolean;
+  onChanged: () => Promise<void>;
+}) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -558,71 +656,97 @@ function ActiveTab({ positions, serviceRunning, onChanged }: { positions: DayTra
         <Section title="Watching" subtitle="waiting for trigger price to be crossed">
           <div className="flex flex-col">
             <GridHeader cols={["ticker", "trigger", "setup", "plan age", "status", "action"]} spans={[2,2,3,2,1,2]} />
-            {watching.map((p) => (
-              <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
-                <div className="col-span-2 font-editorial text-xl italic text-bone-50">
-                  {p.ticker}{p.execution_ticker && <span className="ml-1 text-sm text-crt-long">→ {p.execution_ticker}</span>}
+            {watching.map((p) => {
+              const origin = tradeOrigin(p, heatIdeas, signals);
+              return (
+                <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
+                  <div className="col-span-2">
+                    <div className="font-editorial text-xl italic text-bone-50">
+                      {p.ticker}{p.execution_ticker && <span className="ml-1 text-sm text-crt-long">→ {p.execution_ticker}</span>}
+                    </div>
+                    <div className="mt-1"><SourceBadge origin={origin} /></div>
+                  </div>
+                  <div className="col-span-2 tabular text-sm text-crt-amber">
+                    {triggerCondition(p)}
+                    {p.status === "pending_entry" && p.entry_limit_price != null && (
+                      <div className="mt-1 text-[9px] text-bone-500">entry cap ${p.entry_limit_price.toFixed(2)}</div>
+                    )}
+                  </div>
+                  <div className="col-span-3 text-[11px] leading-relaxed text-bone-400">
+                    <div>{p.setup ?? "—"}</div>
+                    <div className="mt-1 text-[9px] text-bone-600">{originDetail(origin)}</div>
+                  </div>
+                  <div className="col-span-2 tabular text-[11px] text-bone-500" title={formatTradeTime(p.plan_received_at)}>{relativeTime(p.plan_received_at)}</div>
+                  <div className="col-span-1">
+                    <span className="inline-flex items-center gap-1 border border-crt-amber/50 bg-crt-amber/10 px-1.5 py-0.5 text-[9px] uppercase tracking-[0.18em] text-crt-amber">
+                      <span className="h-1.5 w-1.5 animate-pulseDot rounded-full bg-crt-amber" />
+                      {p.status === "pending_entry" ? "limit pending" : p.armed === false ? "waiting rearm" : "watching"}
+                    </span>
+                  </div>
+                  <div className="col-span-2">
+                    {(p.manual_plan_id || p.heat_idea_id) && (
+                      <button disabled={busyId === p.id} onClick={() => cancelWatch(p)} className="border border-crt-short/40 px-2 py-1 text-[9px] uppercase tracking-[0.16em] text-crt-short disabled:opacity-40">
+                        {busyId === p.id ? "Cancelling…" : "Cancel Watch"}
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <div className="col-span-2 tabular text-sm text-crt-amber">
-                  ${p.trigger_price?.toFixed(2) ?? "—"}
-                  {p.status === "pending_entry" && p.entry_limit_price != null && (
-                    <span className="ml-1 text-[9px] text-bone-500">cap ${p.entry_limit_price.toFixed(2)}</span>
-                  )}
-                </div>
-                <div className="col-span-3 text-[11px] text-bone-400">
-                  {p.setup ?? "—"}
-                  {p.source === "manual" && <span className="ml-2 text-[9px] uppercase tracking-[0.14em] text-crt-amber">manual</span>}
-                  {p.source === "heat" && <span className="ml-2 text-[9px] uppercase tracking-[0.14em] text-crt-long">Heat</span>}
-                </div>
-                <div className="col-span-2 tabular text-[11px] text-bone-500">{relativeTime(p.plan_received_at)}</div>
-                <div className="col-span-1">
-                  <span className="inline-flex items-center gap-1 border border-crt-amber/50 bg-crt-amber/10 px-1.5 py-0.5 text-[9px] uppercase tracking-[0.18em] text-crt-amber">
-                    <span className="h-1.5 w-1.5 animate-pulseDot rounded-full bg-crt-amber" />
-                    {p.status === "pending_entry" ? "limit pending" : "watching"}
-                  </span>
-                </div>
-                <div className="col-span-2">
-                  {(p.manual_plan_id || p.heat_idea_id) && (
-                    <button disabled={busyId === p.id} onClick={() => cancelWatch(p)} className="border border-crt-short/40 px-2 py-1 text-[9px] uppercase tracking-[0.16em] text-crt-short disabled:opacity-40">
-                      {busyId === p.id ? "Cancelling…" : "Cancel Watch"}
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Section>
       )}
 
       {open.length > 0 && (
-        <Section title="Open Positions" subtitle="in market — stop loss / broker exit tracking active">
+        <Section title="Open Positions" subtitle="in market — every position includes its source and entry thesis">
           <div className="flex flex-col">
-            <GridHeader cols={["ticker", "fill", "stop", "high", "p&l est.", "since"]} spans={[2,2,2,2,2,2]} />
             {open.map((p) => {
               const pnlEst = p.fill_price && p.current_price
                 ? ((p.current_price - p.fill_price) / p.fill_price * 100)
                 : null;
+              const origin = tradeOrigin(p, heatIdeas, signals);
+              const executionTicker = p.execution_ticker ?? p.ticker;
               return (
-                <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
-                  <div className="col-span-2 font-editorial text-xl italic text-bone-50">
-                    {p.execution_ticker ?? p.ticker}
-                    {p.execution_ticker && <div className="font-mono text-[9px] not-italic text-bone-500">signal {p.ticker}</div>}
+                <div key={p.id} className="border-b border-ink-500/30 px-4 py-4 hover:bg-ink-800/30">
+                  <div className="flex flex-col justify-between gap-4 md:flex-row md:items-start">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-editorial text-2xl italic text-bone-50">{executionTicker}</span>
+                        {executionTicker !== p.ticker && <span className="font-mono text-[10px] text-bone-500">signal {p.ticker}</span>}
+                        <SourceBadge origin={origin} />
+                        <span className={clsx(
+                          "border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.16em]",
+                          p.status === "pending_exit"
+                            ? "border-crt-short/50 bg-crt-short/10 text-crt-short"
+                            : "border-crt-long/50 bg-crt-long/10 text-crt-long",
+                        )}>
+                          {p.status === "pending_exit" ? "exiting" : "open"}
+                        </span>
+                      </div>
+                      <div className="mt-1 text-[10px] text-bone-500">{originDetail(origin)}</div>
+                    </div>
+                    <div className="grid grid-cols-3 gap-x-6 gap-y-2 md:grid-cols-5">
+                      <TradeMetric label="Fill" value={p.fill_price == null ? "—" : `$${p.fill_price.toFixed(2)}`} />
+                      <TradeMetric label="Current" value={p.current_price == null ? "—" : `$${p.current_price.toFixed(2)}`} />
+                      <TradeMetric label="P&L est." value={pnlEst == null ? "—" : `${pnlEst >= 0 ? "+" : ""}${pnlEst.toFixed(2)}%`} valueClass={pnlEst == null ? undefined : pnlEst >= 0 ? "text-crt-long" : "text-crt-short"} />
+                      <TradeMetric label="Stop" value={p.status === "pending_exit" ? `selling · ${p.exit_reason ?? "exit"}` : p.stop_price == null ? "—" : `$${p.stop_price.toFixed(2)}`} valueClass="text-crt-short" />
+                      <TradeMetric label="High" value={p.high_water_mark == null ? "—" : `$${p.high_water_mark.toFixed(2)}`} />
+                    </div>
                   </div>
-                  <div className="col-span-2 tabular text-sm text-bone-200">${p.fill_price?.toFixed(2) ?? "—"}</div>
-                  <div className="col-span-2 tabular text-sm text-crt-short">
-                    {p.status === "pending_exit"
-                      ? `selling · ${p.exit_reason ?? "exit"}`
-                      : `$${p.stop_price?.toFixed(2) ?? "—"}`}
+
+                  <div className="mt-4 border border-ink-500/35 bg-ink-900/35 px-3 py-3">
+                    <div className="text-[9px] uppercase tracking-[0.22em] text-crt-amber">Why this trade</div>
+                    <div className="mt-1 text-sm leading-relaxed text-bone-200">{p.setup ?? "No setup note was supplied."}</div>
+                    <div className="mt-3 grid gap-x-6 gap-y-2 text-[10px] md:grid-cols-4">
+                      <TradeDetail label="Trigger" value={triggerCondition(p)} />
+                      <TradeDetail label="Plan received" value={formatTradeTime(p.plan_received_at)} />
+                      <TradeDetail label="Entered" value={formatTradeTime(p.entered_at)} />
+                      <TradeDetail
+                        label="Execution"
+                        value={`${p.ticker} signal → ${executionTicker}${p.execution_leverage ? ` (${p.execution_leverage.toFixed(0)}x)` : ""}${p.entry_limit_price != null ? ` · cap $${p.entry_limit_price.toFixed(2)}` : ""}`}
+                      />
+                    </div>
                   </div>
-                  <div className="col-span-2 tabular text-sm text-bone-400">${p.high_water_mark?.toFixed(2) ?? "—"}</div>
-                  <div className="col-span-2">
-                    {pnlEst != null ? (
-                      <span className={clsx("tabular text-sm font-medium", pnlEst >= 0 ? "text-crt-long" : "text-crt-short")}>
-                        {pnlEst >= 0 ? "+" : ""}{pnlEst.toFixed(2)}%
-                      </span>
-                    ) : <span className="text-bone-500">—</span>}
-                  </div>
-                  <div className="col-span-2 tabular text-[11px] text-bone-500">{relativeTime(p.entered_at)}</div>
                 </div>
               );
             })}
@@ -639,27 +763,45 @@ function ActiveTab({ positions, serviceRunning, onChanged }: { positions: DayTra
       )}
 
       {closed.length > 0 && (
-        <Section title="Closed Today" subtitle="completed day trades">
+        <Section title="Closed Today" subtitle="completed day trades — source and thesis retained for review">
           <div className="flex flex-col">
-            <GridHeader cols={["ticker", "fill", "exit", "p&l $", "p&l %", "reason"]} spans={[2,2,2,2,2,2]} />
-            {closed.map((p) => (
-              <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
-                <div className="col-span-2 font-editorial text-xl italic text-bone-50">{p.execution_ticker ?? p.ticker}</div>
-                <div className="col-span-2 tabular text-sm text-bone-300">${p.fill_price?.toFixed(2) ?? "—"}</div>
-                <div className="col-span-2 tabular text-sm text-bone-300">${p.exit_price?.toFixed(2) ?? "—"}</div>
-                <div className="col-span-2">
-                  <span className={clsx("tabular text-sm font-medium", (p.realized_pnl ?? 0) >= 0 ? "text-crt-long" : "text-crt-short")}>
-                    {(p.realized_pnl ?? 0) >= 0 ? "+" : ""}${p.realized_pnl?.toFixed(2) ?? "0.00"}
-                  </span>
+            <GridHeader cols={["ticker / source", "trade reason", "fill → exit", "p&l $", "p&l %", "exit"]} spans={[2,3,2,2,1,2]} />
+            {closed.map((p) => {
+              const origin = tradeOrigin(p, heatIdeas, signals);
+              const executionTicker = p.execution_ticker ?? p.ticker;
+              return (
+                <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
+                  <div className="col-span-2">
+                    <div className="font-editorial text-xl italic text-bone-50">{executionTicker}</div>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                      <SourceBadge origin={origin} />
+                      {executionTicker !== p.ticker && <span className="text-[9px] text-bone-600">signal {p.ticker}</span>}
+                    </div>
+                  </div>
+                  <div className="col-span-3 text-[11px] leading-relaxed text-bone-400">
+                    <div>{p.setup ?? "—"}</div>
+                    <div className="mt-1 text-[9px] text-bone-600">{triggerCondition(p)}</div>
+                  </div>
+                  <div className="col-span-2 tabular text-sm text-bone-300">
+                    ${p.fill_price?.toFixed(2) ?? "—"} → ${p.exit_price?.toFixed(2) ?? "—"}
+                  </div>
+                  <div className="col-span-2">
+                    <span className={clsx("tabular text-sm font-medium", (p.realized_pnl ?? 0) >= 0 ? "text-crt-long" : "text-crt-short")}>
+                      {(p.realized_pnl ?? 0) >= 0 ? "+" : ""}${p.realized_pnl?.toFixed(2) ?? "0.00"}
+                    </span>
+                  </div>
+                  <div className="col-span-1">
+                    <span className={clsx("tabular text-sm", (p.realized_pnl_pct ?? 0) >= 0 ? "text-crt-long" : "text-crt-short")}>
+                      {(p.realized_pnl_pct ?? 0) >= 0 ? "+" : ""}{p.realized_pnl_pct?.toFixed(2) ?? "0.00"}%
+                    </span>
+                  </div>
+                  <div className="col-span-2">
+                    <div className="tabular text-[10px] uppercase tracking-[0.18em] text-bone-500">{p.exit_reason ?? "—"}</div>
+                    <div className="mt-1 text-[9px] text-bone-600">{formatTradeTime(p.closed_at)}</div>
+                  </div>
                 </div>
-                <div className="col-span-2">
-                  <span className={clsx("tabular text-sm", (p.realized_pnl_pct ?? 0) >= 0 ? "text-crt-long" : "text-crt-short")}>
-                    {(p.realized_pnl_pct ?? 0) >= 0 ? "+" : ""}{p.realized_pnl_pct?.toFixed(2) ?? "0.00"}%
-                  </span>
-                </div>
-                <div className="col-span-2 tabular text-[10px] uppercase tracking-[0.18em] text-bone-500">{p.exit_reason ?? "—"}</div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Section>
       )}
