@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bot.day_trader import (
     DAY_TRADE_BUDGET_USD,
     _CONFIRM_POLLS,
+    _FIRST_MILESTONE_CONFIRM_POLLS,
     _INITIAL_STOP_PCT,
     _STOP_POLICY_VERSION,
     _TRAILING_MILESTONES,
@@ -43,6 +44,7 @@ from bot.day_trader import (
     _apply_exit_order_result,
     _get_prices,
     _load_new_plans,
+    _recover_legacy_discord_carryovers,
     _migrate_stop_policy,
     _position_poll_interval,
     _select_leveraged_etf,
@@ -594,6 +596,70 @@ class TestForceClose(_Base):
         self.assertEqual(pos.status, "expired")
         m["sell"].assert_not_called()
 
+    def test_in_session_discord_plan_carries_through_next_session(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.discord_carry_sessions_remaining = 1
+
+        self._run([pos], now=ET_FORCE_CLOSE, price=9.0)
+
+        self.assertEqual(pos.status, "watching")
+        self.assertFalse(pos.armed)
+        self.assertEqual(pos.discord_carry_sessions_remaining, 0)
+        self.assertEqual(pos.discord_carry_from_date, "2026-06-16")
+        self.assertEqual(pos.exit_reason, "waiting_next_session")
+
+    def test_carried_discord_plan_expires_at_following_session_eod(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.discord_carry_from_date = "2026-06-15"
+
+        self._run([pos], now=ET_FORCE_CLOSE, price=9.0)
+
+        self.assertEqual(pos.status, "expired")
+        self.assertEqual(pos.exit_reason, "eod")
+
+    def test_repeated_force_close_poll_does_not_consume_carry_window(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.discord_carry_from_date = "2026-06-16"
+        pos.exit_reason = "waiting_next_session"
+
+        self._run([pos], now=ET_FORCE_CLOSE, price=9.0)
+
+        self.assertEqual(pos.status, "watching")
+
+    def test_carried_discord_gap_waits_for_rearm_instead_of_chasing(self):
+        pos = _watching_pos(trigger=10.0)
+        pos.armed = False
+        pos.discord_carry_from_date = "2026-06-15"
+
+        _, first = self._run([pos], now=ET_MARKET_OPEN, price=10.5)
+        self.assertEqual(pos.status, "watching")
+        self.assertFalse(pos.armed)
+        first["buy"].assert_not_called()
+
+        self._run([pos], now=ET_MARKET_OPEN, price=9.99)
+        self.assertTrue(pos.armed)
+        _, breakout = self._run([pos], now=ET_MARKET_OPEN, price=10.01)
+        self.assertEqual(pos.status, "open")
+        breakout["buy"].assert_called_once()
+
+    def test_legacy_previous_session_discord_watch_is_recovered_once(self):
+        pos = _watching_pos(trigger=904.0)
+        pos.ticker = "MU"
+        pos.status = "expired"
+        pos.plan_received_at = "2026-06-15T13:44:43+00:00"
+
+        changed = _recover_legacy_discord_carryovers(
+            [pos], datetime(2026, 6, 16, 10, 0, tzinfo=ET_MARKET_OPEN.tzinfo)
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(pos.status, "watching")
+        self.assertFalse(pos.armed)
+        self.assertEqual(pos.discord_carry_from_date, "2026-06-15")
+        self.assertFalse(_recover_legacy_discord_carryovers(
+            [pos], datetime(2026, 6, 16, 10, 0, tzinfo=ET_MARKET_OPEN.tzinfo)
+        ))
+
     def test_no_force_close_before_350pm(self):
         """Before 3:50 pm, open positions are NOT force-closed."""
         pos = _open_pos(fill=10.0, stop=9.8, qty=2.5)
@@ -725,27 +791,30 @@ class TestEodTighten(_Base):
 
 class TestTrailingStop(_Base):
 
-    def test_first_milestone_confirm_count_increments(self):
-        """First time price hits +1%, confirm_count goes to 1 (not yet upgraded)."""
+    def test_first_milestone_upgrades_on_first_poll(self):
+        """The +1% risk-reduction milestone needs only one 5-second poll."""
         fill = 10.0
         pos = _open_pos(fill=fill, stop=fill * 0.98, qty=2.0)
         threshold = fill * (1 + _TRAILING_MILESTONES[0][0] / 100)  # +1%
         positions, m = self._run([pos], price=threshold)
-        self.assertEqual(pos.confirm_count, 1)
-        self.assertEqual(pos.stop_price, round(fill * 0.98, 4))  # not yet upgraded
+        self.assertEqual(_FIRST_MILESTONE_CONFIRM_POLLS, 1)
+        self.assertEqual(pos.confirm_count, 0)
+        self.assertEqual(pos.milestone_idx, 1)
+        self.assertEqual(pos.stop_price, round(fill * 0.995, 4))
 
-    def test_second_confirm_upgrades_stop(self):
-        """After CONFIRM_POLLS consecutive polls at +1%, stop is upgraded."""
+    def test_later_milestone_still_requires_second_confirm(self):
+        """The +2% and later milestones retain two-poll confirmation."""
         fill = 10.0
-        lock_in_pct = _TRAILING_MILESTONES[0][1]  # -0.5%
-        pos = _open_pos(fill=fill, stop=fill * 0.98, qty=2.0,
+        lock_in_pct = _TRAILING_MILESTONES[1][1]
+        pos = _open_pos(fill=fill, stop=fill * 0.995, qty=2.0,
+                        milestone_idx=1,
                         confirm_count=_CONFIRM_POLLS - 1,
-                        confirm_milestone_idx=0)
-        threshold = fill * (1 + _TRAILING_MILESTONES[0][0] / 100)
+                        confirm_milestone_idx=1)
+        threshold = fill * (1 + _TRAILING_MILESTONES[1][0] / 100)
         positions, m = self._run([pos], price=threshold + 0.01)
         expected_new_stop = round(fill * (1 + lock_in_pct / 100), 4)
         self.assertAlmostEqual(pos.stop_price, expected_new_stop, places=4)
-        self.assertEqual(pos.milestone_idx, 1)
+        self.assertEqual(pos.milestone_idx, 2)
         self.assertEqual(pos.confirm_count, 0)
 
     def test_dip_resets_confirm_count(self):
@@ -934,13 +1003,31 @@ class TestPlanLoading(_Base):
         from bot.parser import Side, Signal, SignalKind
         sig = Signal(kind=SignalKind.PLAN, ticker="NEW", trigger=50.0,
                      side=Side.LONG,
-                     received_at=datetime.now(timezone.utc))
+                     received_at=ET_MARKET_OPEN)
         sig.message_id = "sig-999"  # type: ignore
         positions = []
         self._run(positions, new_plans=[sig], price=49.0)
         self.assertEqual(len(positions), 1)
         self.assertEqual(positions[0].ticker, "NEW")
         self.assertEqual(positions[0].status, "watching")
+        self.assertEqual(positions[0].discord_carry_sessions_remaining, 1)
+
+    def test_after_hours_plan_is_for_next_session_only(self):
+        from bot.parser import Side, Signal, SignalKind
+        sig = Signal(
+            kind=SignalKind.PLAN,
+            ticker="NEXT",
+            trigger=50.0,
+            side=Side.LONG,
+            received_at=ET_AFTER_HOURS,
+        )
+        sig.message_id = "sig-next"  # type: ignore
+        positions = []
+
+        self._run(positions, new_plans=[sig], price=49.0)
+
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0].discord_carry_sessions_remaining, 0)
 
     def test_short_plan_never_creates_position_or_order(self):
         """A Discord SHORT alert must not be reinterpreted as a long buy."""

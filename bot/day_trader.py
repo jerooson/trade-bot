@@ -34,7 +34,7 @@ import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -100,8 +100,9 @@ _TRAILING_MILESTONES = [
     (21.0, 18.0),
 ]
 _CONFIRM_POLLS = 2       # number of consecutive polls needed to confirm milestone
+_FIRST_MILESTONE_CONFIRM_POLLS = 1
 _INITIAL_STOP_PCT = 2.0
-_STOP_POLICY_VERSION = 2
+_STOP_POLICY_VERSION = 3
 _EOD_TIGHT_HOUR = 15     # 3 pm ET
 _EOD_TIGHT_MINUTE = 30
 _FORCE_CLOSE_HOUR = 15
@@ -132,6 +133,11 @@ class DayPosition:
     armed: bool = True
     manual_cancel_requested: bool = False
     entry_attempt_no: int = 0
+    # Discord plans received during a regular session remain eligible through
+    # the following session.  ``discord_carry_from_date`` prevents repeated
+    # force-close polls from consuming that next-session window immediately.
+    discord_carry_sessions_remaining: int = 0
+    discord_carry_from_date: str | None = None
 
     # Heat signals can observe one instrument and trade another.  ``ticker``
     # always remains the source/trigger ticker for backwards compatibility.
@@ -1299,6 +1305,69 @@ def _is_market_hours(now: datetime) -> bool:
     return (9, 30) <= (now.hour, now.minute) <= (16, 0)
 
 
+def _previous_weekday(value: date) -> date:
+    previous = value - timedelta(days=1)
+    while previous.weekday() >= 5:
+        previous -= timedelta(days=1)
+    return previous
+
+
+def _recover_legacy_discord_carryovers(
+    positions: list[DayPosition],
+    now: datetime,
+) -> bool:
+    """Restore yesterday's clean EOD-expired Discord watches once.
+
+    This migration covers plans such as MU 904 that expired under the legacy
+    same-session policy immediately before this feature was deployed.  It
+    never restores a submitted, filled, cancelled, or gap-rejected entry.
+    """
+    previous_session = _previous_weekday(now.date())
+    changed = False
+    for pos in positions:
+        if (
+            pos.source != "discord"
+            or pos.status != "expired"
+            or pos.discord_carry_from_date is not None
+            or pos.buy_order_id
+            or pos.fill_qty
+            or pos.entry_filled_qty > 0
+            or pos.manual_cancel_requested
+            or pos.exit_reason not in (None, "eod")
+        ):
+            continue
+        try:
+            received = datetime.fromisoformat(
+                pos.plan_received_at.replace("Z", "+00:00")
+            )
+            if received.tzinfo is None:
+                received = received.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if received.astimezone(ET).date() != previous_session:
+            continue
+        if any(
+            other.id != pos.id
+            and other.ticker == pos.ticker
+            and other.status in ("watching", "pending_entry", "open", "pending_exit")
+            for other in positions
+        ):
+            continue
+        pos.status = "watching"
+        pos.armed = False
+        pos.exit_reason = None
+        pos.discord_carry_sessions_remaining = 0
+        pos.discord_carry_from_date = previous_session.isoformat()
+        changed = True
+        log.info(
+            "Recovered prior-session Discord watch: %s trigger=%.4f valid through %s",
+            pos.ticker,
+            pos.trigger_price or 0,
+            now.date().isoformat(),
+        )
+    return changed
+
+
 def _activate_filled_position(
     session: _MCPSession,
     account_number: str,
@@ -1713,6 +1782,9 @@ def run_once(
             plan_received_at=sig.received_at.isoformat(),
             direction="long",
             trigger_operator="above",
+            discord_carry_sessions_remaining=(
+                1 if _is_market_hours(sig.received_at.astimezone(ET)) else 0
+            ),
         )
         positions.append(pos)
         _append_position(pos)
@@ -1721,6 +1793,8 @@ def run_once(
     if _sync_manual_plans(positions):
         _flush_positions(positions)
     if _sync_heat_ideas(positions, now=now):
+        _flush_positions(positions)
+    if _recover_legacy_discord_carryovers(positions, now):
         _flush_positions(positions)
     if _recover_definitive_entry_rejections(positions):
         _flush_positions(positions)
@@ -1869,9 +1943,26 @@ def run_once(
 
         # --- Expire watching plans at EOD ---
         if force_close and pos.status == "watching":
-            if not pos.good_til_cancelled:
-                pos.status = "expired"
-                changed = True
+            if pos.good_til_cancelled:
+                continue
+            if pos.source == "discord":
+                today = now.date().isoformat()
+                if pos.discord_carry_sessions_remaining > 0:
+                    pos.discord_carry_sessions_remaining -= 1
+                    pos.discord_carry_from_date = today
+                    pos.armed = False
+                    pos.exit_reason = "waiting_next_session"
+                    changed = True
+                    log.info(
+                        "Carrying unfilled Discord plan %s into next session",
+                        pos.ticker,
+                    )
+                    continue
+                if pos.discord_carry_from_date == today:
+                    continue
+            pos.status = "expired"
+            pos.exit_reason = pos.exit_reason or "eod"
+            changed = True
             continue
 
         if force_close and pos.status == "pending_entry":
@@ -2100,7 +2191,12 @@ def run_once(
                     pos.confirm_milestone_idx = eligible_idx
                     pos.confirm_count = 1
 
-                if pos.confirm_count >= _CONFIRM_POLLS:
+                required_polls = (
+                    _FIRST_MILESTONE_CONFIRM_POLLS
+                    if eligible_idx == 0
+                    else _CONFIRM_POLLS
+                )
+                if pos.confirm_count >= required_polls:
                     threshold_pct, lock_in_pct = milestones[eligible_idx]
                     new_stop = round(
                         pos.fill_price * (1 + lock_in_pct / 100), 4

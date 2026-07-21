@@ -287,6 +287,16 @@ boundaries, and remains until it fills or the operator selects **Cancel Watch**.
 Heat watches must first observe price below the trigger, use the trigger +0.2%
 entry cap, and default to a maximum of three new plan lifecycles per market day.
 
+Discord day-trade plans received during a regular session remain eligible
+through the following trading session when they do not fill. A carried plan
+starts the next session unarmed: if price gaps above the trigger and the +0.2%
+entry cap, the bot waits for price to return below the trigger and break out
+again instead of chasing. It expires at the following session's close.
+
+The day-trade stop policy starts at -2%. Its first risk-reduction milestone
+uses one 5-second observation (`+1% -> -0.5% stop`); milestones from +2% onward
+still require two consecutive 5-second observations.
+
 Runtime files:
 
 - `logs/heat_ideas.jsonl` — append-only ideas and chart updates
