@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,7 +14,11 @@ from bot.executor import (
     VirtualBook,
     decide,
     _fraction_of,
+    reconcile_book_from_reviews,
+    replay_history,
 )
+from bot.shadow_reviewer import validate_proposal, ShadowConfig
+from bot.swing_parser import parse_swing
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +237,91 @@ def test_add_updates_avg_price(book, config):
     assert pos.avg_price == pytest.approx(105.88, abs=0.05)
 
 
+@pytest.mark.parametrize(
+    ("raw", "initial_fraction", "expected_ticker", "expected_usd"),
+    [
+        (
+            """🚨 正股加仓
+股票: ARM
+操作: 🔵 买入加仓 (做多)
+价格: $287.00 → 均价: $318.50
+仓位: +1/2 → full
+止损: 无
+止损类型: 立即
+Posted by: Will
+""",
+            0.5,
+            "ARM",
+            10.0,
+        ),
+        (
+            """🚨 正股加仓
+股票: GOOGL
+操作: 🔵 买入加仓 (做多)
+价格: $319.00 → 均价: $333.50
+仓位: +1/3 → 2/3
+止损: 无
+止损类型: 立即
+Posted by: Will
+""",
+            1 / 3,
+            "GOOG",
+            6.6666,
+        ),
+        (
+            """🚨 正股加仓
+股票: DDOG
+操作: 🔵 买入加仓 (做多)
+价格: $245.48 → 均价: $238.15
+仓位: +1/4 → 3/8
+止损: $223.50
+止损类型: 立即
+Posted by: Will
+""",
+            1 / 8,
+            "DDOG",
+            5.0,
+        ),
+    ],
+)
+def test_real_add_messages_pass_parser_executor_and_shadow_validation(
+    raw, initial_fraction, expected_ticker, expected_usd, book, config
+):
+    parsed = parse_swing(raw)
+    assert parsed is not None
+    decide(
+        _entry(
+            expected_ticker,
+            price=parsed.price,
+            fraction=initial_fraction,
+            size=str(initial_fraction),
+        ),
+        book,
+        config,
+    )
+
+    decision = decide(parsed.to_dict(), book, config)
+
+    assert decision.action == "BUY"
+    assert decision.ticker == expected_ticker
+    assert decision.usd_amount == pytest.approx(expected_usd, abs=0.0001)
+    ok, reason, validated_usd = validate_proposal(
+        decision.to_dict(),
+        ShadowConfig(
+            orders_path=Path("orders.jsonl"),
+            ledger_path=Path("reviews.jsonl"),
+            codex_command="codex",
+            budget_per_ticker=20,
+            max_age_s=300,
+            poll_interval_s=1,
+            codex_timeout_s=120,
+            place_orders=True,
+        ),
+    )
+    assert ok, reason
+    assert validated_usd == pytest.approx(expected_usd, abs=0.0001)
+
+
 # ---------------------------------------------------------------------------
 # REDUCE tests.
 # ---------------------------------------------------------------------------
@@ -316,6 +407,87 @@ def test_book_summary_reflects_decisions(book, config):
     assert snap["summary"]["open_tickers"] == 2
     assert snap["summary"]["total_deployed_usd"] == pytest.approx(30.0)
     assert snap["summary"]["available_usd"] == pytest.approx(70.0)
+
+
+def test_skipped_real_add_is_removed_during_replay_and_live_reconciliation(
+    tmp_path, book, config
+):
+    entry = _entry("DDOG", price=223.5, fraction=1 / 8, size="1/8")
+    entry["discord"] = {"message_id": 1}
+    add = _add("DDOG", fraction=3 / 8, size="+1/4 → 3/8", price=245.48)
+    add["discord"] = {"message_id": 2}
+
+    swings = tmp_path / "swings.jsonl"
+    ledger = tmp_path / "reviews.jsonl"
+    swings.write_text(
+        "\n".join(json.dumps(row) for row in (entry, add)) + "\n",
+        encoding="utf-8",
+    )
+    ledger.write_text(
+        json.dumps(
+            {
+                "dedupe_key": "2:DDOG:ADD",
+                "status": "SKIPPED",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    cfg = replace(
+        config,
+        swing_live_path=swings,
+        swing_history_path=tmp_path / "history.jsonl",
+        review_ledger_path=ledger,
+    )
+
+    decide(entry, book, cfg)
+    decide(add, book, cfg)
+    assert book.positions["DDOG"].deployed_usd == pytest.approx(7.5)
+
+    changed = reconcile_book_from_reviews(cfg, book)
+
+    assert changed
+    assert book.positions["DDOG"].deployed_usd == pytest.approx(2.5)
+
+    restarted = VirtualBook(
+        mode=cfg.mode,
+        budget_per_ticker=cfg.budget_per_ticker,
+        max_open_tickers=cfg.max_open_tickers,
+    )
+    replay_history(cfg, restarted)
+    assert restarted.positions["DDOG"].deployed_usd == pytest.approx(2.5)
+
+
+def test_unverified_broker_outcome_remains_provisionally_applied(tmp_path, config):
+    entry = _entry("DDOG", price=223.5, fraction=1 / 8, size="1/8")
+    entry["discord"] = {"message_id": 1}
+    add = _add("DDOG", fraction=3 / 8, size="+1/4 → 3/8", price=245.48)
+    add["discord"] = {"message_id": 2}
+    swings = tmp_path / "swings.jsonl"
+    ledger = tmp_path / "reviews.jsonl"
+    swings.write_text(
+        "\n".join(json.dumps(row) for row in (entry, add)) + "\n",
+        encoding="utf-8",
+    )
+    ledger.write_text(
+        json.dumps({"dedupe_key": "2:DDOG:ADD", "status": "UNVERIFIED"}) + "\n",
+        encoding="utf-8",
+    )
+    cfg = replace(
+        config,
+        swing_live_path=swings,
+        swing_history_path=tmp_path / "history.jsonl",
+        review_ledger_path=ledger,
+    )
+    restarted = VirtualBook(
+        mode=cfg.mode,
+        budget_per_ticker=cfg.budget_per_ticker,
+        max_open_tickers=cfg.max_open_tickers,
+    )
+
+    replay_history(cfg, restarted)
+
+    assert restarted.positions["DDOG"].deployed_usd == pytest.approx(7.5)
 
 
 def test_replay_then_live_doesnt_double_count(book, config):

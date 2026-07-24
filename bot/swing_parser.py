@@ -162,7 +162,8 @@ def _parse_side(value: str) -> Side | None:
 
 def _parse_position_fraction(value: str | None) -> float | None:
     """
-    Convert "1/2" -> 0.5, "3/4" -> 0.75, "+1/4 -> 3/4" -> 0.75 (the new total).
+    Convert "1/2" -> 0.5, "full" -> 1.0, and
+    "+1/4 -> 3/4" -> 0.75 (the new total).
 
     For deltas like "+1/4" or arrows like "1/2 -> 7/8" we return the FINAL
     fraction (right-hand side of the arrow if present, or the fraction after
@@ -176,6 +177,8 @@ def _parse_position_fraction(value: str | None) -> float | None:
         text = text.split("->", 1)[1]
     # Strip a leading "+" or "-".
     text = text.lstrip("+-")
+    if text.casefold() in {"full", "fullposition", "100%"}:
+        return 1.0
     m = re.match(r"^(\d+)/(\d+)$", text)
     if not m:
         return None

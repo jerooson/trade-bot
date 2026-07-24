@@ -37,6 +37,26 @@ def test_add_nvda_with_arrow():
     assert a.is_actionable
 
 
+def test_add_arm_full_position_maps_to_one():
+    text = """🚨 正股加仓
+股票: ARM
+操作: 🔵 买入加仓 (做多)
+价格: $287.00 → 均价: $318.50
+仓位: +1/2 → full
+止损: 无
+止损类型: 立即
+
+Posted by: Will
+"""
+    a = parse_swing(text)
+    assert a is not None
+    assert a.kind is ActionKind.ADD
+    assert a.ticker == "ARM"
+    assert a.position_size == "+1/2 → full"
+    assert a.position_fraction == 1.0
+    assert a.is_actionable
+
+
 def test_reduce_infq():
     a = parse_swing(f.REDUCE)
     assert a is not None

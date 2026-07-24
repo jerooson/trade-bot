@@ -92,6 +92,9 @@ class ExecutorConfig:
     # Skip any historical action whose received_at is <= this cutoff when
     # replaying at startup. None means replay everything (default).
     replay_from: datetime | None
+    # Final broker-review outcomes used to keep the virtual book aligned with
+    # orders that were actually placed.
+    review_ledger_path: Path = Path("./logs/robinhood_shadow_reviews.jsonl")
 
     @property
     def is_dry_run(self) -> bool:
@@ -128,6 +131,12 @@ def load_config() -> ExecutorConfig:
         swing_history_path=SWING_HISTORY_PATH,
         notify_after=datetime.now(timezone.utc),
         replay_from=_parse_iso_cutoff(os.environ.get("EXECUTOR_REPLAY_FROM")),
+        review_ledger_path=Path(
+            os.environ.get(
+                "SHADOW_REVIEW_LEDGER_PATH",
+                "./logs/robinhood_shadow_reviews.jsonl",
+            )
+        ),
     )
 
 
@@ -216,6 +225,15 @@ ACTIONABLE_KINDS: set[str] = {
     ActionKind.CLOSE.value,
     ActionKind.STOP_TRIGGER.value,
     ActionKind.STOP_UPDATE.value,
+}
+
+# These final shadow-review statuses mean no broker order was placed.  PENDING
+# remains provisionally applied to avoid double buying while its broker state
+# is uncertain; PLACED remains applied.
+_NON_PLACEMENT_REVIEW_STATUSES = {
+    "SKIPPED",
+    "FAILED",
+    "REVIEWED",
 }
 
 # Labels that mean "stop at my average cost" (breakeven).
@@ -641,7 +659,33 @@ def _parse_action_dt(ts: str) -> datetime | None:
     return dt
 
 
-def replay_history(config: ExecutorConfig, book: VirtualBook) -> None:
+def _action_dedupe_key(action: dict[str, Any]) -> str:
+    """Build the same stable signal key used by the shadow reviewer."""
+    ticker = str(action.get("ticker") or "").upper()
+    kind = str(action.get("kind") or "")
+    message_id = (action.get("discord") or {}).get("message_id")
+    if message_id is None:
+        return ""
+    return f"{message_id}:{ticker}:{kind}"
+
+
+def _load_review_outcomes(path: Path) -> dict[str, str]:
+    """Return the latest review status for every stable signal key."""
+    outcomes: dict[str, str] = {}
+    for row in _read_jsonl(path):
+        key = str(row.get("dedupe_key") or "")
+        status = str(row.get("status") or "").upper()
+        if key and status:
+            outcomes[key] = status
+    return outcomes
+
+
+def replay_history(
+    config: ExecutorConfig,
+    book: VirtualBook,
+    *,
+    review_outcomes: dict[str, str] | None = None,
+) -> None:
     """Read history + live files chronologically, apply each action silently.
 
     If ``config.replay_from`` is set, actions whose ``received_at`` is at or
@@ -662,7 +706,13 @@ def replay_history(config: ExecutorConfig, book: VirtualBook) -> None:
 
     applied = 0
     skipped_pre_cutoff = 0
+    skipped_unplaced = 0
     cutoff = config.replay_from
+    outcomes = (
+        review_outcomes
+        if review_outcomes is not None
+        else _load_review_outcomes(config.review_ledger_path)
+    )
     for a in actions:
         if a.get("kind") not in ACTIONABLE_KINDS:
             continue
@@ -671,6 +721,10 @@ def replay_history(config: ExecutorConfig, book: VirtualBook) -> None:
             if ts is not None and ts <= cutoff:
                 skipped_pre_cutoff += 1
                 continue
+        status = outcomes.get(_action_dedupe_key(a))
+        if status in _NON_PLACEMENT_REVIEW_STATUSES:
+            skipped_unplaced += 1
+            continue
         # Mutate the book; discard the Decision (we don't log replay decisions).
         decide(a, book, config)
         applied += 1
@@ -687,12 +741,35 @@ def replay_history(config: ExecutorConfig, book: VirtualBook) -> None:
         )
     else:
         log.info(
-            "replay: applied %d actions (of %d total), book now has %d open positions: %s",
+            "replay: applied %d actions, skipped %d unplaced (of %d total), "
+            "book now has %d open positions: %s",
             applied,
+            skipped_unplaced,
             len(actions),
             book.open_count,
             sorted(book.positions),
         )
+
+
+def reconcile_book_from_reviews(
+    config: ExecutorConfig,
+    book: VirtualBook,
+) -> bool:
+    """Rebuild positions after a terminal review says an order was not placed."""
+    before = {ticker: position.to_dict() for ticker, position in book.positions.items()}
+    rebuilt = VirtualBook(
+        mode=book.mode,
+        budget_per_ticker=book.budget_per_ticker,
+        max_open_tickers=book.max_open_tickers,
+        started_at=book.started_at,
+        last_decision_at=book.last_decision_at,
+        decisions_total=book.decisions_total,
+    )
+    replay_history(config, rebuilt)
+    book.positions = rebuilt.positions
+    book.last_processed_at = rebuilt.last_processed_at
+    after = {ticker: position.to_dict() for ticker, position in book.positions.items()}
+    return before != after
 
 
 def write_book(book: VirtualBook, path: Path) -> None:
@@ -822,6 +899,9 @@ def run(config: ExecutorConfig) -> None:
     log.info("decisions   -> %s", config.orders_path)
     log.info("watching    -> %s", config.swing_live_path)
 
+    # Start the review tail before replay so a final outcome appended during
+    # startup is either included by replay or remains after this byte offset.
+    review_tail = TailReader(config.review_ledger_path, start_at_end=True)
     replay_history(config, book)
     write_book(book, config.book_path)
 
@@ -874,6 +954,21 @@ def run(config: ExecutorConfig) -> None:
 
                 if book_dirty:
                     write_book(book, config.book_path)
+
+            review_records = review_tail.read_new_records()
+            needs_reconciliation = any(
+                str(row.get("status") or "").upper()
+                in _NON_PLACEMENT_REVIEW_STATUSES
+                for row in review_records
+            )
+            if needs_reconciliation:
+                changed = reconcile_book_from_reviews(config, book)
+                write_book(book, config.book_path)
+                log.warning(
+                    "broker review reported an unplaced order; virtual book "
+                    "reconciled%s",
+                    " with position changes" if changed else "",
+                )
             time.sleep(config.poll_interval_s)
 
     write_book(book, config.book_path)

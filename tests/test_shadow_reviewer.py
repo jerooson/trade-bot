@@ -18,6 +18,7 @@ from bot.shadow_reviewer import (
     review_one,
     validate_proposal,
 )
+from bot.robinhood_mcp_client import OrderResult, RobinhoodMCPError
 
 
 def _config(place_orders: bool = True) -> ShadowConfig:
@@ -48,7 +49,7 @@ def _proposal(kind: str, action: str, usd: float) -> dict:
             "delta_size": "1/4",
             "message_id": 123,
         },
-        "book_before": {"ticker_position": {"deployed_usd": 20}},
+        "book_before": {"ticker_position": {"deployed_usd": 5}},
     }
 
 
@@ -77,11 +78,35 @@ def test_reduce_caps_expected_amount_at_virtual_holding():
     assert expected == 3
 
 
-def test_rejects_add_and_close():
-    for kind, action in (("ADD", "BUY"), ("CLOSE", "SELL")):
-        ok, reason, _ = validate_proposal(_proposal(kind, action, 5), _config())
-        assert not ok
-        assert "ENTRY" in reason
+def test_add_verifies_increment_not_target_total():
+    cases = (
+        (1.0, 10.0, 10.0),       # ARM: 1/2 -> full
+        (2 / 3, 6.6667, 6.6666), # GOOG: 1/3 -> 2/3
+        (3 / 8, 2.5, 5.0),       # DDOG: 1/8 -> 3/8
+    )
+    for target_fraction, deployed, proposal_usd in cases:
+        p = _proposal("ADD", "BUY", proposal_usd)
+        p["signal"]["position_fraction"] = target_fraction
+        p["book_before"]["ticker_position"]["deployed_usd"] = deployed
+        ok, reason, expected = validate_proposal(p, _config())
+        assert ok, reason
+        assert expected == proposal_usd
+
+
+def test_add_rejects_target_total_as_increment():
+    p = _proposal("ADD", "BUY", 13.3333)
+    p["signal"]["position_fraction"] = 2 / 3
+    p["book_before"]["ticker_position"]["deployed_usd"] = 6.6667
+    ok, reason, expected = validate_proposal(p, _config())
+    assert not ok
+    assert expected == 6.6666
+    assert "mismatch" in reason
+
+
+def test_close_verifies_proposal_amount():
+    ok, reason, expected = validate_proposal(_proposal("CLOSE", "SELL", 5), _config())
+    assert ok, reason
+    assert expected == 5
 
 
 def test_rejects_incorrect_proportional_amount():
@@ -234,12 +259,12 @@ def test_review_one_skipped_for_ineligible_proposal(tmp_path):
         codex_timeout_s=120,
         place_orders=True,
     )
-    record = review_one(_proposal("ADD", "BUY", 5), cfg, _append_pending=False)
+    record = review_one(_proposal("ADD", "REJECT", 5), cfg, _append_pending=False)
     assert record.status == "SKIPPED"
     assert not cfg.ledger_path.exists()
 
 
-def test_review_one_placed_when_tag_present(tmp_path):
+def test_review_one_placed_when_direct_mcp_returns_order(tmp_path):
     broker_id = "11111111-2222-3333-4444-555555555555"
     p = _proposal("ENTRY", "BUY", 5)
     cfg = ShadowConfig(
@@ -251,16 +276,19 @@ def test_review_one_placed_when_tag_present(tmp_path):
         poll_interval_s=1,
         codex_timeout_s=120,
         place_orders=True,
+        pnl_path=tmp_path / "pnl.jsonl",
     )
-    stdout = f"All checks passed.\nBROKER_ORDER_ID={broker_id}\nORDER_STATE=new"
-    with patch("bot.shadow_reviewer.invoke_codex", return_value=_make_result(0, stdout=stdout)):
+    result = OrderResult(broker_id, "new", 100.0, 0.05, 5.0)
+    with patch(
+        "bot.shadow_reviewer.robinhood_mcp_client.place_order",
+        return_value=result,
+    ):
         record = review_one(p, cfg, _append_pending=False)
     assert record.status == "PLACED"
     assert record.broker_order_id == broker_id
 
 
-def test_review_one_unverified_when_no_tag(tmp_path):
-    """A free UUID in output must not produce PLACED."""
+def test_review_one_unverified_when_direct_mcp_errors(tmp_path):
     p = _proposal("ENTRY", "BUY", 5)
     cfg = ShadowConfig(
         orders_path=tmp_path / "orders.jsonl",
@@ -272,15 +300,17 @@ def test_review_one_unverified_when_no_tag(tmp_path):
         codex_timeout_s=120,
         place_orders=True,
     )
-    # session/correlation UUIDs in output but no BROKER_ORDER_ID= tag
-    stdout = 'session=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee {"id":"bbbbbbbb-cccc-dddd-eeee-ffffffffffff"}'
-    with patch("bot.shadow_reviewer.invoke_codex", return_value=_make_result(0, stdout=stdout)):
+    with patch(
+        "bot.shadow_reviewer.robinhood_mcp_client.place_order",
+        side_effect=RobinhoodMCPError("test broker error"),
+    ):
         record = review_one(p, cfg, _append_pending=False)
     assert record.status == "UNVERIFIED"
     assert record.broker_order_id is None
+    assert "test broker error" in record.rationale
 
 
-def test_review_one_failed_on_nonzero_exit(tmp_path):
+def test_review_one_unverified_on_unexpected_direct_mcp_error(tmp_path):
     cfg = ShadowConfig(
         orders_path=tmp_path / "orders.jsonl",
         ledger_path=tmp_path / "ledger.jsonl",
@@ -291,9 +321,13 @@ def test_review_one_failed_on_nonzero_exit(tmp_path):
         codex_timeout_s=120,
         place_orders=True,
     )
-    with patch("bot.shadow_reviewer.invoke_codex", return_value=_make_result(1, stderr="err")):
+    with patch(
+        "bot.shadow_reviewer.robinhood_mcp_client.place_order",
+        side_effect=RuntimeError("unexpected"),
+    ):
         record = review_one(_proposal("ENTRY", "BUY", 5), cfg, _append_pending=False)
-    assert record.status == "FAILED"
+    assert record.status == "UNVERIFIED"
+    assert "unexpected" in record.rationale
 
 
 def test_review_one_reviewed_status_when_placement_disabled(tmp_path):
@@ -317,7 +351,7 @@ def test_review_one_reviewed_status_when_placement_disabled(tmp_path):
 # PENDING ledger entry (crash safety)
 # ---------------------------------------------------------------------------
 
-def test_review_one_writes_pending_before_codex(tmp_path):
+def test_review_one_writes_pending_before_direct_mcp(tmp_path):
     broker_id = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
     p = _proposal("ENTRY", "BUY", 5)
     cfg = ShadowConfig(
@@ -329,9 +363,13 @@ def test_review_one_writes_pending_before_codex(tmp_path):
         poll_interval_s=1,
         codex_timeout_s=120,
         place_orders=True,
+        pnl_path=tmp_path / "pnl.jsonl",
     )
-    stdout = f"BROKER_ORDER_ID={broker_id}\nORDER_STATE=new"
-    with patch("bot.shadow_reviewer.invoke_codex", return_value=_make_result(0, stdout=stdout)):
+    result = OrderResult(broker_id, "new", 100.0, 0.05, 5.0)
+    with patch(
+        "bot.shadow_reviewer.robinhood_mcp_client.place_order",
+        return_value=result,
+    ):
         review_one(p, cfg, _append_pending=True)
 
     lines = cfg.ledger_path.read_text().splitlines()

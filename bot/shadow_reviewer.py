@@ -1,8 +1,8 @@
 """
 Event-triggered Robinhood order executor.
 
-Watches the DRY_RUN executor's proposed-orders JSONL and invokes Codex CLI for
-fresh accepted ENTRY and REDUCE decisions.
+Watches the DRY_RUN executor's proposed-orders JSONL and processes fresh
+accepted ENTRY/ADD buys and REDUCE/CLOSE/STOP_TRIGGER sells.
 
 When SHADOW_REVIEW_PLACE_ORDERS=true (must be explicit; an absent or empty
 value defaults to *false* for fail-safe behavior), Codex verifies the Agentic
@@ -68,16 +68,16 @@ _BROKER_ORDER_TAG_RE = re.compile(
 class ShadowConfig:
     orders_path: Path
     ledger_path: Path
-    pnl_path: Path
-    swings_path: Path
-    book_path: Path
     codex_command: str
     budget_per_ticker: float
     max_age_s: float
     poll_interval_s: float
     codex_timeout_s: float
     place_orders: bool
-    stop_check_interval_s: float  # how often to poll swing stop-losses
+    pnl_path: Path = Path("./logs/trade_pnl.jsonl")
+    swings_path: Path = Path("./logs/swings.jsonl")
+    book_path: Path = Path("./logs/virtual_book.json")
+    stop_check_interval_s: float = 60.0  # how often to poll swing stop-losses
 
 
 @dataclass
@@ -209,11 +209,30 @@ def _append_record(record: ShadowRecord, path: Path) -> None:
 def _expected_usd(proposal: dict[str, Any], budget: float) -> float | None:
     signal = proposal.get("signal") or {}
     kind = proposal.get("signal_kind")
-    if kind in _BUY_KINDS:  # ENTRY or ADD
+    if kind == "ENTRY":
         fraction = signal.get("position_fraction")
         if not isinstance(fraction, (int, float)) or fraction <= 0:
             return None
         return round(budget * float(fraction), 4)
+    if kind == "ADD":
+        # ADD's position_fraction is Will's target total position, not the
+        # incremental amount to buy.  Independently recompute the delta from
+        # the immutable pre-decision snapshot so validation matches executor
+        # sizing without trusting the proposal's usd_amount.
+        fraction = signal.get("position_fraction")
+        before = (proposal.get("book_before") or {}).get("ticker_position") or {}
+        deployed = before.get("deployed_usd")
+        if (
+            not isinstance(fraction, (int, float))
+            or fraction <= 0
+            or not isinstance(deployed, (int, float))
+            or deployed < 0
+        ):
+            return None
+        target_usd = budget * float(fraction)
+        remaining_room = max(0.0, budget - float(deployed))
+        delta_usd = min(max(0.0, target_usd - float(deployed)), remaining_room)
+        return round(delta_usd, 4)
     if kind == "REDUCE":
         fraction = _fraction_of(signal.get("delta_size"))
         before = (proposal.get("book_before") or {}).get("ticker_position") or {}
@@ -445,14 +464,17 @@ def review_one(
             result = robinhood_mcp_client.place_order(proposal, expected)
         except robinhood_mcp_client.RobinhoodMCPError as exc:
             return ShadowRecord(
-                status="FAILED",
-                rationale=f"direct MCP error: {exc}",
+                status="UNVERIFIED",
+                rationale=f"direct MCP outcome requires broker reconciliation: {exc}",
                 **base,
             )
         except Exception as exc:  # noqa: BLE001
             return ShadowRecord(
-                status="FAILED",
-                rationale=f"direct MCP unexpected error: {exc}",
+                status="UNVERIFIED",
+                rationale=(
+                    "direct MCP unexpected outcome requires broker "
+                    f"reconciliation: {exc}"
+                ),
                 **base,
             )
 

@@ -12,20 +12,28 @@ credentials belong to the `deploy` user. It tails:
 logs/proposed_orders.jsonl
 ```
 
-It trades only:
+It trades only fresh accepted:
 
-- fresh accepted `ENTRY` + `BUY` proposals
-- fresh accepted `REDUCE` + `SELL` proposals
+- `ENTRY` and `ADD` + `BUY` proposals
+- `REDUCE`, `CLOSE`, and `STOP_TRIGGER` + `SELL` proposals
 
-It skips `ADD`, `CLOSE`, `STOP_TRIGGER`, rejected proposals, stale proposals,
-shorts, and malformed sizing.
+It skips rejected proposals, stale proposals, shorts, and malformed sizing.
 
 Before Codex is invoked, the worker independently verifies:
 
 - `ENTRY`: `$20 * position_fraction`
+- `ADD`: `$20 * target position_fraction - pre-order deployed amount`
 - `REDUCE`: `$20 * delta_fraction`, capped at the virtual amount held
 - amount is positive and no greater than `$20`
-- `REDUCE` has a positive share quantity
+- sell proposals have a positive share quantity
+
+The executor also reads the final shadow-review ledger. `PLACED` and `PENDING`
+orders remain provisionally represented in the virtual book. A final
+`SKIPPED`, review-only `FAILED`, or review-only `REVIEWED` result causes the
+book to rebuild from signal history while excluding that unplaced order. An
+`UNVERIFIED` direct-broker outcome remains provisionally represented until
+manual broker reconciliation, preventing a duplicate order when placement may
+have succeeded but its response was lost. The same filtering runs at startup.
 
 Codex then checks the Agentic account, actual positions, buying power, ticker
 tradability, and calls `place_equity_order` (review is skipped). Each proposal

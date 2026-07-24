@@ -257,6 +257,13 @@ View recent Codex/Robinhood shadow reviews:
 tail -n 20 logs/robinhood_shadow_reviews.jsonl
 ```
 
+Swing `ADD` signals treat the right side of the size arrow as the target total
+allocation. The live buy amount is only the incremental difference from the
+pre-signal virtual allocation. The executor consumes final shadow-review
+outcomes and rebuilds `virtual_book.json` after an order is definitively
+skipped or a review-only operation fails, including during startup replay.
+Ambiguous direct-broker outcomes remain provisional until reconciled.
+
 Check the host-side shadow reviewer:
 
 ```bash
