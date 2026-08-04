@@ -139,6 +139,7 @@ class _Base(unittest.TestCase):
         positions,
         now=ET_MARKET_OPEN,
         price=10.0,
+        prices=None,
         buy_result=None,
         new_plans=None,
         manual_plans=None,
@@ -149,6 +150,8 @@ class _Base(unittest.TestCase):
                 order_id="buy-001", state="filled",
                 fill_price=price, fill_qty=2.0, fill_usd=price * 2,
             )
+        if prices is None:
+            prices = {"TEST": price}
         if manual_plans is None:
             manual_plans = [
                 {
@@ -169,7 +172,7 @@ class _Base(unittest.TestCase):
              patch("bot.day_trader._load_token", return_value="tok") as m_tok, \
              patch("bot.day_trader._MCPSession", return_value=MagicMock()) as m_sess, \
              patch("bot.day_trader._get_agentic_account", return_value="acct") as m_acct, \
-             patch("bot.day_trader._get_prices", return_value={"TEST": price}) as m_price, \
+             patch("bot.day_trader._get_prices", return_value=prices) as m_price, \
              patch("bot.day_trader._validate_entry_preflight", return_value=(price, price, price, 0.0)) as m_preflight, \
              patch("bot.day_trader._place_fractional_market_buy", return_value=buy_result) as m_buy, \
              patch("bot.day_trader._place_stop_order", return_value="stop-001") as m_stop, \
@@ -1363,11 +1366,13 @@ class TestProtectedEntryAndPolling(unittest.TestCase):
         self.assertEqual(selected.ticker, "NVDX")
         self.assertLess(selected.spread_pct, 0.1)
 
-    def test_heat_entry_buys_and_protects_execution_etf(self):
+    def test_heat_entry_buys_and_protects_on_underlying(self):
         pos = _watching_pos(trigger=150.0)
+        pos.ticker = "NVDA"
         pos.source = "heat"
         pos.heat_idea_id = "heat-1"
         pos.entry_limit_price = 150.30
+        pos.signal_current_price = 150.10
         selection = LeveragedETFSelection(
             "NVDL", 2.0, 64.0, 63.99, 64.01, 0.03125, 2_000_000
         )
@@ -1386,9 +1391,12 @@ class TestProtectedEntryAndPolling(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(pos.execution_ticker, "NVDL")
         self.assertEqual(pos.status, "open")
+        self.assertEqual(pos.risk_basis, "underlying")
         self.assertEqual(buy.call_args.args[2], "NVDL")
-        self.assertEqual(stop.call_args.args[2], "NVDL")
-        self.assertAlmostEqual(pos.stop_price or 0, 62.72)
+        stop.assert_not_called()
+        self.assertAlmostEqual(pos.signal_entry_price or 0, 150.10)
+        self.assertAlmostEqual(pos.stop_price or 0, round(150.10 * 0.98, 4))
+        self.assertIsNone(pos.stop_order_id)
 
     def test_batch_quotes_use_one_request_for_multiple_tickers(self):
         session = MagicMock()
@@ -1626,6 +1634,90 @@ class TestProtectedEntryHelpers(unittest.TestCase):
 
     def test_open_position_uses_fast_poll_for_risk_management(self):
         self.assertEqual(_position_poll_interval(_open_pos()), NEAR_POLL_INTERVAL_S)
+
+
+class TestUnderlyingRiskForLeveragedETF(_Base):
+    """SMH→SOXL style routes must trail/stop on the underlying, not the ETF."""
+
+    @staticmethod
+    def _leveraged_open(
+        *,
+        underlying: str = "SMH",
+        etf: str = "SOXL",
+        signal_entry: float = 568.12,
+        etf_fill: float = 134.3435,
+        stop: float | None = None,
+        qty: float = 0.148872,
+    ) -> DayPosition:
+        if stop is None:
+            stop = round(signal_entry * (1 - _INITIAL_STOP_PCT / 100), 4)
+        return DayPosition(
+            ticker=underlying,
+            status="open",
+            source="heat",
+            direction="long",
+            trigger_price=568.0,
+            trigger_operator="above",
+            execution_ticker=etf,
+            execution_leverage=3.0,
+            signal_entry_price=signal_entry,
+            signal_current_price=signal_entry,
+            risk_basis="underlying",
+            fill_price=etf_fill,
+            fill_qty=qty,
+            stop_price=stop,
+            high_water_mark=signal_entry,
+            current_price=etf_fill,
+            entered_at=datetime.now(timezone.utc).isoformat(),
+            plan_received_at=datetime.now(timezone.utc).isoformat(),
+            heat_idea_id="heat-smh",
+        )
+
+    def test_soxl_noise_does_not_trail_or_stop_when_smh_flat(self):
+        """Replay of 2026-08-04: SOXL +1.3%/-0.65% while SMH stayed inside ±0.5%."""
+        pos = self._leveraged_open()
+        prices = {"SMH": 567.08, "SOXL": 133.55}
+        positions, m = self._run([pos], prices=prices, price=133.55)
+        self.assertEqual(pos.status, "open")
+        m["sell"].assert_not_called()
+        self.assertEqual(pos.milestone_idx, 0)
+        self.assertAlmostEqual(pos.stop_price or 0, round(568.12 * 0.98, 4))
+
+    def test_underlying_plus_one_percent_trails_on_smh(self):
+        pos = self._leveraged_open()
+        smh = 568.12 * 1.011
+        prices = {"SMH": smh, "SOXL": 136.0}
+        positions, m = self._run([pos], prices=prices, price=136.0)
+        self.assertEqual(pos.status, "open")
+        self.assertEqual(pos.milestone_idx, 1)
+        self.assertAlmostEqual(pos.stop_price or 0, round(568.12 * 0.995, 4))
+        m["stop"].assert_not_called()
+
+    def test_underlying_stop_exits_even_if_etf_still_green(self):
+        pos = self._leveraged_open()
+        smh_stop = round(568.12 * 0.98, 4) - 0.01
+        prices = {"SMH": smh_stop, "SOXL": 135.0}
+        positions, m = self._run([pos], prices=prices, price=135.0)
+        self.assertEqual(pos.status, "closed")
+        self.assertEqual(pos.exit_reason, "stop")
+        m["sell"].assert_called()
+        self.assertEqual(m["sell"].call_args.args[2], "SOXL")
+
+    def test_legacy_etf_stop_rebases_onto_underlying(self):
+        pos = self._leveraged_open(stop=133.6718)
+        pos.risk_basis = None
+        pos.signal_entry_price = None
+        pos.signal_current_price = None
+        pos.stop_policy_version = 3
+        pos.stop_order_id = "legacy-etf-stop"
+        prices = {"SMH": 569.0, "SOXL": 135.5}
+        positions, m = self._run([pos], prices=prices, price=135.5)
+        self.assertEqual(pos.risk_basis, "underlying")
+        self.assertAlmostEqual(pos.signal_entry_price or 0, 568.0)
+        self.assertAlmostEqual(pos.stop_price or 0, round(568.0 * 0.98, 4))
+        self.assertIsNone(pos.stop_order_id)
+        m["cancel"].assert_any_call(unittest.mock.ANY, "acct", "legacy-etf-stop")
+        self.assertEqual(pos.status, "open")
 
 
 if __name__ == "__main__":

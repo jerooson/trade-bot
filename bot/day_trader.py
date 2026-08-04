@@ -10,11 +10,16 @@ Strategy (all times US/Eastern):
     Entry orders use a stable idempotency ref and are cancelled if the
     breakout fails, the order times out, or only a partial fill is obtained.
   - Stop-loss management after entry:
-      * Initial stop: fill_price × 0.98  (-2 %)
+      * Initial stop: risk_anchor × 0.98  (-2 %)
       * Early risk reduction: confirmed +1 % moves the stop to -0.5 %;
         confirmed +2 % moves it to +0.2 %; confirmed +3 % locks +0.5 %.
       * Larger moves keep the existing stepped trail (+6 % locks +3 %,
         +9 % locks +6 %, and so on).
+      * When Heat routes into a leveraged ETF (e.g. SMH → SOXL), the risk
+        anchor / stop / trail / target are evaluated on the underlying
+        ("本尊") quote. The ETF is only the execution vehicle; broker
+        stop/limit orders on the ETF are skipped so leverage noise cannot
+        fire risk levels meant for the underlying.
   - Will's target: if PLAN has a target price, place a limit sell at that level
     immediately after entry (in addition to the stop).
   - EOD tightening: after 3:30 pm ET, tighten trailing to current × 0.99.
@@ -106,11 +111,13 @@ _TRAILING_MILESTONES = [
 _CONFIRM_POLLS = 2       # number of consecutive polls needed to confirm milestone
 _FIRST_MILESTONE_CONFIRM_POLLS = 1
 _INITIAL_STOP_PCT = 2.0
-_STOP_POLICY_VERSION = 3
+_STOP_POLICY_VERSION = 4
 _EOD_TIGHT_HOUR = 15     # 3 pm ET
 _EOD_TIGHT_MINUTE = 30
 _FORCE_CLOSE_HOUR = 15
 _FORCE_CLOSE_MINUTE = 50
+_RISK_BASIS_UNDERLYING = "underlying"
+_RISK_BASIS_EXECUTION = "execution"
 
 
 # ------------------------------------------------------------------
@@ -151,6 +158,12 @@ class DayPosition:
     execution_selected_at: str | None = None
     signal_current_price: float | None = None
     signal_target_price: float | None = None
+    # Underlying quote captured at ETF fill time; used as trail/stop anchor
+    # whenever risk_basis == "underlying".
+    signal_entry_price: float | None = None
+    # "underlying" for leveraged ETF routes; "execution" when we trade the
+    # signal ticker itself. Older records may leave this None.
+    risk_basis: str | None = None
 
     # Execution details
     buy_order_id: str | None = None
@@ -983,6 +996,97 @@ def _execution_symbol(pos: DayPosition) -> str:
     return (pos.execution_ticker or pos.ticker).upper()
 
 
+def _uses_underlying_risk(pos: DayPosition) -> bool:
+    """True when we execute a different symbol than the signal ticker."""
+    if pos.risk_basis == _RISK_BASIS_UNDERLYING:
+        return True
+    if pos.risk_basis == _RISK_BASIS_EXECUTION:
+        return False
+    return _execution_symbol(pos) != pos.ticker.upper()
+
+
+def _risk_anchor_price(pos: DayPosition) -> float | None:
+    """Basis price for stop / trail percentages."""
+    if _uses_underlying_risk(pos):
+        for candidate in (
+            pos.signal_entry_price,
+            pos.signal_current_price,
+            pos.trigger_price,
+        ):
+            if candidate is not None and candidate > 0:
+                return float(candidate)
+        return None
+    if pos.fill_price is not None and pos.fill_price > 0:
+        return float(pos.fill_price)
+    return None
+
+
+def _risk_mark_price(
+    pos: DayPosition,
+    *,
+    execution_price: float | None,
+    signal_price: float | None,
+) -> float | None:
+    """Live price used for stop / trail / target decisions."""
+    if _uses_underlying_risk(pos):
+        if signal_price is not None:
+            return float(signal_price)
+        if pos.signal_current_price is not None:
+            return float(pos.signal_current_price)
+        return None
+    if execution_price is not None:
+        return float(execution_price)
+    return None
+
+
+def _stop_level_from_lock_in(anchor: float, lock_in_pct: float, *, short: bool) -> float:
+    """Map a lock-in percent onto a stop price for long or short underlying risk."""
+    if short:
+        return round(anchor * (1 - lock_in_pct / 100), 4)
+    return round(anchor * (1 + lock_in_pct / 100), 4)
+
+
+def _initial_stop_price(anchor: float, *, short: bool) -> float:
+    if short:
+        return round(anchor * (1 + _INITIAL_STOP_PCT / 100), 4)
+    return round(anchor * (1 - _INITIAL_STOP_PCT / 100), 4)
+
+
+def _stop_hit(pos: DayPosition, risk_price: float) -> bool:
+    if not pos.stop_price:
+        return False
+    if pos.direction == "short" and _uses_underlying_risk(pos):
+        return risk_price >= pos.stop_price
+    return risk_price <= pos.stop_price
+
+
+def _target_hit(pos: DayPosition, risk_price: float) -> bool:
+    if not pos.target_price:
+        return False
+    if pos.direction == "short" and _uses_underlying_risk(pos):
+        return risk_price <= pos.target_price
+    return risk_price >= pos.target_price
+
+
+def _favorable_extreme_update(pos: DayPosition, risk_price: float) -> bool:
+    """Track the best favorable risk-mark; returns True when it moved."""
+    if pos.direction == "short" and _uses_underlying_risk(pos):
+        if pos.high_water_mark is None or risk_price < pos.high_water_mark:
+            pos.high_water_mark = risk_price
+            return True
+        return False
+    if pos.high_water_mark is None or risk_price > pos.high_water_mark:
+        pos.high_water_mark = risk_price
+        return True
+    return False
+
+
+def _milestone_reached(pos: DayPosition, anchor: float, risk_price: float, threshold_pct: float) -> bool:
+    if pos.direction == "short" and _uses_underlying_risk(pos):
+        return risk_price <= anchor * (1 - threshold_pct / 100)
+    return risk_price >= anchor * (1 + threshold_pct / 100)
+
+
 def _quote_symbols_for_position(pos: DayPosition) -> list[str]:
     symbols = [pos.ticker.upper()]
     execution = _execution_symbol(pos)
@@ -992,7 +1096,14 @@ def _quote_symbols_for_position(pos: DayPosition) -> list[str]:
 
 
 def _converted_heat_target(pos: DayPosition, fill_price: float) -> float | None:
-    """Convert an underlying target move into an ETF target from its fill."""
+    """Resolve the managed target price after an entry fill.
+
+    Leveraged ETF routes keep the underlying Heat target (risk is judged on
+    the 本尊). Direct / non-Heat targets stay unchanged. Legacy Heat ETF
+    conversion only applies when risk remains on the execution symbol.
+    """
+    if _uses_underlying_risk(pos):
+        return pos.signal_target_price if pos.signal_target_price is not None else pos.target_price
     if (
         pos.source != "heat"
         or pos.signal_target_price is None
@@ -1412,10 +1523,47 @@ def _activate_filled_position(
     pos.fill_qty = result.fill_qty
     pos.entered_at = datetime.now(timezone.utc).isoformat()
     pos.status = "open"
-    pos.high_water_mark = result.fill_price
-    pos.stop_price = round(result.fill_price * (1 - _INITIAL_STOP_PCT / 100), 4)
-    pos.target_price = _converted_heat_target(pos, result.fill_price)
     execution = _execution_symbol(pos)
+    short = pos.direction == "short"
+    uses_underlying = execution != pos.ticker.upper()
+    pos.risk_basis = (
+        _RISK_BASIS_UNDERLYING if uses_underlying else _RISK_BASIS_EXECUTION
+    )
+
+    if uses_underlying:
+        anchor = pos.signal_current_price or pos.trigger_price
+        if anchor is None or anchor <= 0:
+            log.error(
+                "Cannot arm underlying risk for %s via %s: missing signal entry price",
+                pos.ticker,
+                execution,
+            )
+            return False
+        pos.signal_entry_price = float(anchor)
+        pos.high_water_mark = float(anchor)
+        pos.stop_price = _initial_stop_price(float(anchor), short=short)
+        pos.target_price = _converted_heat_target(pos, result.fill_price)
+        # Broker stop/limit prices are ETF-denominated; do not place them when
+        # risk levels are expressed in underlying terms.
+        pos.stop_order_id = None
+        pos.limit_order_id = None
+        log.info(
+            "Entered %s via %s fill=%.4f underlying_entry=%.4f stop=%.4f target=%s "
+            "(risk on underlying; broker stop/limit skipped) order=%s",
+            pos.ticker,
+            execution,
+            pos.fill_price,
+            pos.signal_entry_price,
+            pos.stop_price,
+            pos.target_price,
+            pos.buy_order_id,
+        )
+        return True
+
+    pos.signal_entry_price = None
+    pos.high_water_mark = result.fill_price
+    pos.stop_price = _initial_stop_price(result.fill_price, short=False)
+    pos.target_price = _converted_heat_target(pos, result.fill_price)
     pos.stop_order_id = _place_stop_order(
         session, account_number, execution, result.fill_qty, pos.stop_price
     )
@@ -1493,6 +1641,8 @@ def _reset_manual_watch_after_unfilled_entry(pos: DayPosition) -> None:
     pos.execution_leverage = None
     pos.execution_spread_pct = None
     pos.execution_selected_at = None
+    pos.signal_entry_price = None
+    pos.risk_basis = None
     pos.exit_reason = None
     pos.entry_attempt_no += 1
     log.info(
@@ -1727,26 +1877,66 @@ def _submit_or_recover_entry(
 
 
 def _migrate_stop_policy(pos: DayPosition) -> bool:
-    """Map an older position to the first new milestone that raises its stop."""
+    """Upgrade older open positions onto the current stop / risk-basis policy."""
+    changed = False
+    short = pos.direction == "short" and _uses_underlying_risk(pos)
+
+    # Leveraged routes that still carry ETF-denominated stops must rebase onto
+    # the underlying before any trail math runs.
+    if _uses_underlying_risk(pos) and pos.risk_basis != _RISK_BASIS_UNDERLYING:
+        # Prefer the breakout trigger as the reconstructed entry when the
+        # original underlying fill quote was never persisted.
+        anchor = None
+        for candidate in (
+            pos.signal_entry_price,
+            pos.trigger_price,
+            pos.signal_current_price,
+        ):
+            if candidate is not None and candidate > 0:
+                anchor = float(candidate)
+                break
+        if anchor is not None:
+            pos.signal_entry_price = float(anchor)
+            pos.risk_basis = _RISK_BASIS_UNDERLYING
+            pos.stop_price = _initial_stop_price(float(anchor), short=short)
+            pos.high_water_mark = float(
+                pos.signal_current_price or anchor
+            )
+            pos.milestone_idx = 0
+            pos.confirm_count = 0
+            pos.confirm_milestone_idx = None
+            if pos.signal_target_price is not None:
+                pos.target_price = pos.signal_target_price
+            changed = True
+            log.info(
+                "Rebased leveraged risk for %s onto underlying entry=%.4f stop=%.4f",
+                pos.ticker,
+                pos.signal_entry_price,
+                pos.stop_price,
+            )
+
     if pos.stop_policy_version >= _STOP_POLICY_VERSION:
-        return False
+        return changed
+
     current_stop = float(pos.stop_price or 0)
-    fill_price = float(pos.fill_price or 0)
-    if fill_price > 0:
+    anchor = _risk_anchor_price(pos) or float(pos.fill_price or 0)
+    if anchor > 0:
         pos.milestone_idx = len(_TRAILING_MILESTONES)
         for idx, (_, lock_in_pct) in enumerate(_TRAILING_MILESTONES):
-            candidate = round(fill_price * (1 + lock_in_pct / 100), 4)
-            if candidate > current_stop:
+            candidate = _stop_level_from_lock_in(anchor, lock_in_pct, short=short)
+            raises_stop = candidate > current_stop if not short else candidate < current_stop
+            if raises_stop:
                 pos.milestone_idx = idx
                 break
     pos.confirm_count = 0
     pos.confirm_milestone_idx = None
     pos.stop_policy_version = _STOP_POLICY_VERSION
     log.info(
-        "Migrated stop policy for %s; current stop=%.4f next milestone=%d",
+        "Migrated stop policy for %s; current stop=%.4f next milestone=%d risk_basis=%s",
         pos.ticker,
         current_stop,
         pos.milestone_idx,
+        pos.risk_basis or ("underlying" if _uses_underlying_risk(pos) else "execution"),
     )
     return True
 
@@ -1926,14 +2116,14 @@ def run_once(
                     changed = True
 
         # Polling a pending entry can transition it to open in this same loop.
-        # From that point onward, every risk decision must use the ETF quote,
-        # never the source ticker quote captured at the top of the iteration.
+        # Keep ``current_price`` on the execution symbol for PnL/display; risk
+        # decisions below may use the underlying mark instead.
         if pos.status in ("open", "pending_exit"):
             execution_price = prices.get(_execution_symbol(pos))
-            price = execution_price
             if execution_price is not None and pos.current_price != execution_price:
                 pos.current_price = execution_price
                 changed = True
+            price = execution_price
 
         if (
             pos.status == "open"
@@ -2053,18 +2243,32 @@ def run_once(
             continue
 
         # --- Open position management ---
-        if pos.status == "open" and price is not None and pos.fill_price:
+        risk_price = _risk_mark_price(
+            pos,
+            execution_price=price,
+            signal_price=signal_price,
+        )
+        if pos.status == "open" and risk_price is not None and pos.fill_price:
             if _migrate_stop_policy(pos):
                 changed = True
+                risk_price = _risk_mark_price(
+                    pos,
+                    execution_price=price,
+                    signal_price=signal_price,
+                ) or risk_price
 
-            # Update high-water mark
-            if pos.high_water_mark is None or price > pos.high_water_mark:
-                pos.high_water_mark = price
+            anchor = _risk_anchor_price(pos)
+            if anchor is None:
+                log.warning("Open %s missing risk anchor; skipping risk checks", pos.ticker)
+                continue
 
-            # A broker-managed stop owns the exit while it remains active.
-            # Never place a second market sell simply because the quote crossed
-            # the stop before the broker order status update reached us.
-            if pos.stop_order_id:
+            short = pos.direction == "short" and _uses_underlying_risk(pos)
+            if _favorable_extreme_update(pos, risk_price):
+                changed = True
+
+            # Broker-managed stops only for execution-risk positions. Leveraged
+            # underlying-risk routes skip broker stops so ETF noise cannot fire.
+            if pos.stop_order_id and not _uses_underlying_risk(pos):
                 stop_result = _poll_order(
                     session, account_number, _execution_symbol(pos), pos.stop_order_id
                 )
@@ -2094,7 +2298,7 @@ def run_once(
                     )
                     pos.stop_order_id = None
                     changed = True
-                elif pos.stop_price and price <= pos.stop_price:
+                elif _stop_hit(pos, risk_price):
                     pos.status = "pending_exit"
                     pos.exit_reason = "stop"
                     pos.exit_requested_at = datetime.now(timezone.utc).isoformat()
@@ -2102,34 +2306,42 @@ def run_once(
                     pos.stop_order_id = None
                     changed = True
                     continue
+            elif pos.stop_order_id and _uses_underlying_risk(pos):
+                _cancel_order(session, account_number, pos.stop_order_id)
+                pos.stop_order_id = None
+                changed = True
 
-            # Check if stop was hit (for Robinhood-managed stop orders we
-            # detect this by polling the order status, but as a safety net
-            # we also check price directly).
-            if pos.stop_price and price <= pos.stop_price:
-                log.info("Stop triggered for %s price=%.4f stop=%.4f — market selling", pos.ticker, price, pos.stop_price)
+            if _stop_hit(pos, risk_price):
+                log.info(
+                    "Stop triggered for %s risk_price=%.4f stop=%.4f anchor=%.4f basis=%s — market selling %s",
+                    pos.ticker,
+                    risk_price,
+                    pos.stop_price,
+                    anchor,
+                    pos.risk_basis or ("underlying" if _uses_underlying_risk(pos) else "execution"),
+                    _execution_symbol(pos),
+                )
                 if _start_or_retry_exit(session, account_number, pos, "stop"):
                     changed = True
                 continue
 
-            # Bot-managed target check: sell when price hits Will's target.
-            # (Robinhood rejects limit orders on fractional qty, so we monitor
-            # the target via price polling and market-sell when hit.)
             if (
                 pos.target_price
-                and price >= pos.target_price
+                and _target_hit(pos, risk_price)
                 and not pos.limit_order_id
             ):
                 log.info(
-                    "Target hit for %s: price=%.4f >= target=%.4f — market selling",
-                    pos.ticker, price, pos.target_price,
+                    "Target hit for %s: risk_price=%.4f reaches target=%.4f — market selling %s",
+                    pos.ticker,
+                    risk_price,
+                    pos.target_price,
+                    _execution_symbol(pos),
                 )
                 if _start_or_retry_exit(session, account_number, pos, "target"):
                     changed = True
                 continue
 
-            # Also poll broker limit order if one was placed (for whole-share positions)
-            if pos.limit_order_id:
+            if pos.limit_order_id and not _uses_underlying_risk(pos):
                 try:
                     od = session.call(
                         "get_equity_orders",
@@ -2139,7 +2351,7 @@ def run_once(
                     orders = od.get("data", {}).get("orders", [])
                     tgt_order = next((o for o in orders if o.get("id") == pos.limit_order_id), None)
                     if tgt_order and tgt_order.get("state") == "filled":
-                        fill_p = float(tgt_order.get("average_price") or price)
+                        fill_p = float(tgt_order.get("average_price") or price or 0)
                         fill_q = float(
                             tgt_order.get("cumulative_quantity")
                             or pos.fill_qty
@@ -2168,7 +2380,7 @@ def run_once(
                         )
                         pos.limit_order_id = None
                         changed = True
-                    elif pos.target_price and price >= pos.target_price:
+                    elif _target_hit(pos, risk_price):
                         pos.status = "pending_exit"
                         pos.exit_reason = "target"
                         pos.exit_requested_at = datetime.now(timezone.utc).isoformat()
@@ -2178,16 +2390,34 @@ def run_once(
                         continue
                 except Exception as exc:
                     log.warning("Could not check target order for %s: %s", pos.ticker, exc)
+            elif pos.limit_order_id and _uses_underlying_risk(pos):
+                _cancel_order(session, account_number, pos.limit_order_id)
+                pos.limit_order_id = None
+                changed = True
 
-            # EOD trailing tighten (3:30 pm)
             if eod_tighten and not pos.eod_tightened:
-                new_stop = round(price * 0.99, 4)
-                if new_stop > (pos.stop_price or 0):
-                    log.info("EOD tighten %s: stop %.4f → %.4f", pos.ticker, pos.stop_price or 0, new_stop)
-                    # Cancel old stop and place new tighter one
+                new_stop = (
+                    round(risk_price * 1.01, 4)
+                    if short
+                    else round(risk_price * 0.99, 4)
+                )
+                improves = (
+                    new_stop < (pos.stop_price or float("inf"))
+                    if short
+                    else new_stop > (pos.stop_price or 0)
+                )
+                if improves:
+                    log.info(
+                        "EOD tighten %s: stop %.4f → %.4f (basis=%s)",
+                        pos.ticker,
+                        pos.stop_price or 0,
+                        new_stop,
+                        pos.risk_basis or ("underlying" if _uses_underlying_risk(pos) else "execution"),
+                    )
                     if pos.stop_order_id:
                         _cancel_order(session, account_number, pos.stop_order_id)
-                    if pos.fill_qty:
+                        pos.stop_order_id = None
+                    if pos.fill_qty and not _uses_underlying_risk(pos):
                         pos.stop_order_id = _place_stop_order(
                             session,
                             account_number,
@@ -2198,14 +2428,13 @@ def run_once(
                     pos.stop_price = new_stop
                     pos.eod_tightened = True
                     changed = True
-                continue  # Don't do trailing stop after EOD tighten
+                continue
 
-            # Stepped trailing stop (normal hours)
             milestones = _TRAILING_MILESTONES
             eligible_idx: int | None = None
             for idx in range(pos.milestone_idx, len(milestones)):
                 threshold_pct, _ = milestones[idx]
-                if price >= pos.fill_price * (1 + threshold_pct / 100):
+                if _milestone_reached(pos, anchor, risk_price, threshold_pct):
                     eligible_idx = idx
                 else:
                     break
@@ -2227,17 +2456,30 @@ def run_once(
                 )
                 if pos.confirm_count >= required_polls:
                     threshold_pct, lock_in_pct = milestones[eligible_idx]
-                    new_stop = round(
-                        pos.fill_price * (1 + lock_in_pct / 100), 4
+                    new_stop = _stop_level_from_lock_in(
+                        anchor, lock_in_pct, short=short
                     )
-                    if new_stop > (pos.stop_price or 0):
+                    improves = (
+                        new_stop < (pos.stop_price or float("inf"))
+                        if short
+                        else new_stop > (pos.stop_price or 0)
+                    )
+                    if improves:
                         log.info(
-                            "Trail stop upgrade %s: +%.0f%% confirmed → stop %.4f → %.4f",
-                            pos.ticker, threshold_pct, pos.stop_price or 0, new_stop
+                            "Trail stop upgrade %s: +%.0f%% confirmed → stop %.4f → %.4f "
+                            "(anchor=%.4f basis=%s)",
+                            pos.ticker,
+                            threshold_pct,
+                            pos.stop_price or 0,
+                            new_stop,
+                            anchor,
+                            pos.risk_basis
+                            or ("underlying" if _uses_underlying_risk(pos) else "execution"),
                         )
                         if pos.stop_order_id:
                             _cancel_order(session, account_number, pos.stop_order_id)
-                        if pos.fill_qty:
+                            pos.stop_order_id = None
+                        if pos.fill_qty and not _uses_underlying_risk(pos):
                             pos.stop_order_id = _place_stop_order(
                                 session,
                                 account_number,
