@@ -116,6 +116,22 @@ def test_open_and_missing_data_are_reported_not_summed(report):
     assert all(r["ticker"] != "SNOW" for r in report["swing"]["sells"])
 
 
+def test_reconciled_fill_row_supersedes_the_fill_less_original():
+    records = [
+        {"timestamp": "2026-06-16T16:16:17+00:00", "ticker": "SNOW", "kind": "ENTRY", "action": "BUY",
+         "order_id": "b1", "fill_price": 238.6199, "fill_qty": 0.027952},
+        {"timestamp": "2026-09-02T20:09:01+00:00", "ticker": "SNOW", "kind": "REDUCE", "action": "SELL",
+         "order_id": "s1", "fill_price": None, "fill_qty": None, "realized_pnl": None},
+        {"timestamp": "2026-09-02T20:09:01+00:00", "ticker": "SNOW", "kind": "REDUCE", "action": "SELL",
+         "order_id": "s1", "fill_price": 380.13, "fill_qty": 0.010549, "fill_usd": 4.01,
+         "realized_pnl": 1.4928, "reconciled": "manual"},
+    ]
+    report = performance.build_report(positions=[], pnl_records=records, review_rows=[])
+    assert report["swing"]["all_time"]["count"] == 1
+    assert report["swing"]["all_time"]["net"] == pytest.approx(1.4928, abs=1e-3)
+    assert not any(o["kind"] == "swing_sell_without_fill" for o in report["omissions"])
+
+
 def test_unreconciled_day_exit_without_matching_sale_is_an_omission():
     positions = [{
         "id": "day-x", "ticker": "SPY", "execution_ticker": "SPXL", "source": "heat",

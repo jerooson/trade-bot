@@ -125,6 +125,21 @@ def swing_ledger_rows(
     cost basis) are listed in omissions rather than counted as zero.
     """
     ordered = sorted(pnl_records, key=lambda r: str(r.get("timestamp") or ""))
+    # A manual reconciliation appends a second row for the same broker order
+    # carrying the fill; the original fill-less row is then superseded.
+    filled_order_ids = {
+        str(r.get("order_id"))
+        for r in ordered
+        if r.get("order_id") and float(r.get("fill_qty") or 0.0) > 0
+    }
+    ordered = [
+        r for r in ordered
+        if not (
+            r.get("order_id")
+            and float(r.get("fill_qty") or 0.0) <= 0
+            and str(r.get("order_id")) in filled_order_ids
+        )
+    ]
     owned: dict[str, float] = defaultdict(float)
     avg_cost: dict[str, float] = defaultdict(float)
     sells: list[dict[str, Any]] = []
