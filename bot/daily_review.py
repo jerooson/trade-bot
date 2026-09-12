@@ -415,24 +415,28 @@ def _pad(text: str, width: int) -> str:
 
 
 def _table_fields(name: str, head: str, cols: list[str], rows: list[list[Any]], widths: list[int]) -> list[dict[str, Any]]:
-    """A monospace table split across embed fields (each value <= 1024 chars)."""
-    header = " ".join(_pad(c, w) for c, w in zip(cols, widths))
+    """A monospace table split across embed fields (each value <= 1024 chars).
+
+    Discord's monospace font does not render CJK at exactly two ASCII cells,
+    so the column legend lives in the head line instead of a header row, and
+    callers keep alignment-sensitive columns ASCII (or fixed-length CJK).
+    """
+    legend = " · ".join(cols)
+    head = (head + "\n" if head else "") + f"_{legend}_"
     lines = [" ".join(_pad(str(c), w) for c, w in zip(row, widths)).rstrip() for row in rows]
     out: list[dict[str, Any]] = []
     chunk: list[str] = []
-    budget = 1000 - len(head) - len(header) - 12
+    budget = 1000 - len(head) - 12
     for ln in lines:
         if sum(len(x) + 1 for x in chunk) + len(ln) > budget:
             out.append({"name": name if not out else f"{name} (续)",
-                        "value": (head + "\n" if not out else "") + "```\n" + header + "\n" + "\n".join(chunk) + "\n```",
+                        "value": (head + "\n" if not out else "") + "```\n" + "\n".join(chunk) + "\n```",
                         "inline": False})
             chunk = []
         chunk.append(ln)
-    body = ("```\n" + header + "\n" + "\n".join(chunk) + "\n```") if (chunk or not out) else ""
-    if not rows:
-        body = ""
+    body = ("```\n" + "\n".join(chunk) + "\n```") if chunk else ""
     out.append({"name": name if not out else f"{name} (续)",
-                "value": ((head + "\n") if not out else "") + body or "无", "inline": False})
+                "value": ((head + "\n") if not out else "") + (body or "（无）"), "inline": False})
     return out
 
 
@@ -444,7 +448,7 @@ def _when(x: dict[str, Any], day: str) -> str:
 
 def _level(x: dict[str, Any]) -> str:
     if x.get("trigger") is None:
-        return "图" if x.get("attachments") else "无价位"
+        return "(img)" if x.get("attachments") else "-"
     return f"{'>' if x.get('operator') != 'below' else '<'}{x['trigger']:.2f}"
 
 
@@ -489,14 +493,14 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
     rows_ = []
     for t in d["closed"]:
         via = t["execution"] if (t["leverage"] or 1) == 1 else f"{t['execution']}x{t['leverage']:.0f}"
-        rows_.append([t["ticker"], via, {"heat": "Heat", "discord": "主频道", "manual": "手动"}.get(t["source"], t["source"]),
-                      f"{t['entered']}-{t['exit']}", {"eod": "收盘", "stop": "止损", "target": "目标", "manual": "手动"}.get(t["exit_reason"], str(t["exit_reason"])),
+        rows_.append([t["ticker"], via, {"heat": "heat", "discord": "main", "manual": "manual"}.get(t["source"], t["source"]),
+                      f"{t['entered']}-{t['exit']}", {"eod": "收盘", "stop": "止损", "target": "目标", "manual": "手动"}.get(t["exit_reason"], "其他"),
                       _sign(t["pnl_usd"], True), _sign(t["pnl_pct"])])
     for t in d["open"]:
-        rows_.append([t["ticker"], t["execution"] or "", "", t["entered"], {"pending_exit": "平仓中", "open": "持仓中", "unreconciled": "待对账"}.get(t["status"], t["status"]), "", ""])
+        rows_.append([t["ticker"], t["execution"] or "", "", t["entered"], {"pending_exit": "平仓", "open": "持仓", "unreconciled": "对账"}.get(t["status"], "其他"), "", ""])
     for t in d["failed"]:
         rows_.append([t["ticker"], "", "", "", "失败", "", ""])
-    fields += _table_fields("📈 日内交易", head, ["票", "执行", "来源", "进-出", "原因", "盈亏", "%"], rows_, widths=[5, 8, 5, 11, 5, 7, 7])
+    fields += _table_fields("📈 日内交易", head, ["票", "执行标的", "来源", "进-出", "原因", "盈亏", "%"], rows_, widths=[5, 8, 6, 11, 4, 7, 7])
     if d["still_watching"]:
         fields.append(_field("👀 挂单等待", [", ".join(f"{w['ticker']}@{w['trigger']:.2f} ({w['source']})" for w in d["still_watching"][:10])]))
 
@@ -513,10 +517,10 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
     os_ = o["summary"]
     opt_head = f"开仓 {len(o['opened'])} · 平仓 {os_['n']} · 平均 {_sign(os_['avg_pct'])} · {_sign(os_['usd'], True)} · 持仓 {o['open_now']} / 盯盘 {o['watching_now']}"
     opt_rows = [[x["time"], x["ticker"], x["contract"], "开仓", f"@{x['price']}", ""] for x in o["opened"]]
-    opt_rows += [[x["time"], x["ticker"], "", {"eod": "收盘", "stop_30pct": "止损-30%", "stop_level": "破位止损",
-                                               "trim_half_50pct": "减半", "trim_runner_100pct": "留runner", "trim_runner_target": "到目标"}.get(x["exit_reason"], x["exit_reason"]),
-                  _sign(x["realized_pct"]), f"最高{_sign(x['max_gain_pct'])}"] for x in o["closed"]]
-    fields += _table_fields("🎯 期权影子（纸面）", opt_head, ["时间", "票", "合约", "动作", "结果", "备注"], opt_rows, widths=[5, 5, 16, 8, 8, 12])
+    opt_rows += [[x["time"], x["ticker"], "", {"eod": "收盘", "stop_30pct": "止损", "stop_level": "破位",
+                                               "trim_half_50pct": "减半", "trim_runner_100pct": "跑者", "trim_runner_target": "目标"}.get(x["exit_reason"], "其他"),
+                  _sign(x["realized_pct"]), f"max {_sign(x['max_gain_pct'])}"] for x in o["closed"]]
+    fields += _table_fields("🎯 期权影子（纸面）", opt_head, ["时间", "票", "合约", "动作", "结果", "最高浮盈"], opt_rows, widths=[5, 5, 16, 4, 8, 12])
 
     sw_head = f"信号 {len(sw['signals'])} · 审核 " + (", ".join(f"{k} {v}" for k, v in sw["reviews_by_status"].items()) or "无") + f" · 成交 {sw['fills']}"
     sw_rows = [[p["ticker"], p["kind"], f"${p['usd']}"] for p in sw["placed"]]
@@ -524,7 +528,7 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
 
     t = r.get("totals") or {}
     tot_rows = []
-    for k, label in (("day", "日内"), ("swing", "Swing")):
+    for k, label in (("day", "日内"), ("swing", "波段")):
         v = t.get(k) or {}
         if isinstance(v, dict) and v.get("count"):
             tot_rows.append([label, str(v["count"]), _sign(v.get("net"), True), f"{v['wins'] / v['count'] * 100:.0f}%", str(v.get("profit_factor"))])

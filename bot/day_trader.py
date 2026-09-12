@@ -661,11 +661,33 @@ def _sync_heat_ideas(
                 direction,
             )
             continue
-        if any(
-            p.ticker == ticker
-            and p.status in ("watching", "pending_entry", "open", "pending_exit")
-            for p in positions
-        ):
+        # A newer Heat level for the same ticker supersedes an older Heat watch
+        # that has not fired yet (his "TSLA 370" replaces last month's
+        # "TSLA 280").  Anything with an order or shares in flight, and any
+        # non-Heat watch, still blocks the new watch.
+        blocked = False
+        for p in positions:
+            if p.ticker != ticker or p.status not in ("watching", "pending_entry", "open", "pending_exit"):
+                continue
+            stale_heat_watch = (
+                p.source == "heat"
+                and p.status == "watching"
+                and not p.buy_order_id
+                and not p.fill_qty
+                and p.entry_filled_qty <= 0
+            )
+            if stale_heat_watch:
+                p.status = "expired"
+                p.exit_reason = "heat_superseded"
+                p.manual_cancel_requested = True
+                changed = True
+                log.info(
+                    "Heat watch %s@%.2f superseded by idea %s@%.2f",
+                    ticker, p.trigger_price or 0.0, idea_id, float(trigger),
+                )
+            else:
+                blocked = True
+        if blocked:
             continue
 
         pos = DayPosition(
