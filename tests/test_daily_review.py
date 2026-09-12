@@ -79,3 +79,18 @@ def test_email_not_configured(monkeypatch):
 def test_discord_not_configured(monkeypatch):
     monkeypatch.delenv("REVIEW_DISCORD_WEBHOOK", raising=False)
     assert dr.send_discord("s", "# x\n\n## Heat feed\n- a", "x.md") == "discord not configured"
+
+
+def test_discord_embeds_respect_limits(tmp_path):
+    from pathlib import Path
+    r = json.loads(Path("logs/reviews/2026-09-02.json").read_text(encoding="utf-8")) if Path("logs/reviews/2026-09-02.json").exists() else None
+    if r is None:
+        p = dr.Paths(tmp_path)
+        r = dr.build(date(2026, 9, 2), p)
+    embeds = dr.discord_embeds(r)
+    e = embeds[0]
+    assert e["title"].startswith("📊")
+    assert len(e["fields"]) <= 25
+    assert all(len(f["value"]) <= 1024 and len(f["name"]) <= 256 for f in e["fields"])
+    total = len(e["title"]) + sum(len(f["name"]) + len(f["value"]) for f in e["fields"]) + len(e.get("description", ""))
+    assert total <= 6000

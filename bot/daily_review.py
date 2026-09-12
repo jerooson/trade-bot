@@ -387,20 +387,118 @@ def send_email(subject: str, body_md: str) -> str | None:
     return None
 
 
-def send_discord(subject: str, body_md: str, filename: str) -> str | None:
-    """Post the review to a Discord webhook (REVIEW_DISCORD_WEBHOOK): short text plus the markdown as a file."""
+def _field(name: str, lines: list[str], limit: int = 1000) -> dict[str, Any]:
+    text = ""
+    for ln in lines:
+        if len(text) + len(ln) + 1 > limit:
+            text += "\n…"
+            break
+        text += ("\n" if text else "") + ln
+    return {"name": name, "value": text or "无", "inline": False}
+
+
+def _sign(v: Any, money: bool = False) -> str:
+    if not isinstance(v, (int, float)):
+        return "-"
+    sign = "+" if v >= 0 else "-"
+    return f"{sign}{'$' if money else ''}{abs(v):.2f}{'' if money else '%'}"
+
+
+def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
+    """Render the structured review as Discord embeds (Chinese, numbers first)."""
+    d, h, o, sw, hl = r["day_trades"], r["heat"], r["option_shadow"], r["swing"], r["health"]
+    s = d["summary"]
+    pnl = s["pnl_usd"]
+    color = 0x3BA55D if pnl > 0 else 0xED4245 if pnl < 0 else 0x5865F2
+    fields: list[dict[str, Any]] = []
+
+    trade_lines = [f"**{s['n']} 笔** · 盈亏 **{_sign(pnl, True)}** · 胜率 {s['win_rate'] if s['win_rate'] is not None else '-'}% · 平均 {_sign(s['avg_pct'])}"]
+    for t in d["closed"]:
+        via = f"{t['execution']}" + (f" x{t['leverage']:.0f}" if (t["leverage"] or 1) != 1 else "")
+        trade_lines.append(f"{'🟢' if (t['pnl_usd'] or 0) > 0 else '🔴'} **{t['ticker']}** ({via}, {t['source']}) {t['entered']}→{t['exit']} {t['exit_reason']} {_sign(t['pnl_usd'], True)} ({_sign(t['pnl_pct'])})")
+    for t in d["open"]:
+        trade_lines.append(f"⏳ **{t['ticker']}** {t['status']}" + (f" — {t['error'][:80]}" if t["error"] else ""))
+    for t in d["failed"]:
+        trade_lines.append(f"❌ **{t['ticker']}** {t['status']} — {str(t['error'])[:80]}")
+    if d["still_watching"]:
+        trade_lines.append("👀 挂单等待: " + ", ".join(f"{w['ticker']}@{w['trigger']:.2f}" for w in d["still_watching"][:8]))
+    fields.append(_field("📈 日内交易", trade_lines))
+
+    heat_lines = [f"{h['count']} 条 · 自动批准 {len(h['approved'])} · 待审 {len(h['needs_review'])} · 期权帖 {len(h['option_posts'])}"]
+    for i in h["approved"]:
+        heat_lines.append(f"✅ {i['time']} **{i['ticker']}** {i['direction']} {i['operator']} {i['trigger']:.2f} — {i['text'][:60]}")
+    for i in h["needs_review"][:6]:
+        heat_lines.append(f"📝 {i['time']} **{i['ticker']}**{' 🖼' if i['attachments'] else ''} — {i['text'][:60]}")
+    fields.append(_field("🔥 Heat 信号", heat_lines))
+
+    icon = {"traded": "✅", "watching": "⏳", "not_approved": "📝", "no_watch": "⚠️", "entry_failed": "❌", "unsupported": "🚫"}
+    rec_lines = []
+    for x in r["heat_vs_bot"]:
+        key = next((k for k in icon if x["outcome"].startswith(k)), "•")
+        rec_lines.append(f"{icon.get(key, '•')} {x['time']} **{x['ticker']}** {x['trigger'] if x['trigger'] is not None else ''} → {x['outcome'][:50]}")
+    fields.append(_field("🔍 Heat 说 / bot 做", rec_lines or ["无"]))
+
+    dp = r["discord_plans_recorded"]
+    if dp["count"]:
+        fields.append(_field("📋 主频道信号（只记录）", [", ".join(f"{p['ticker']}@{p['trigger']}" for p in dp["rows"][:12])]))
+
+    os_ = o["summary"]
+    opt_lines = [f"开仓 {len(o['opened'])} · 平仓 {os_['n']} · 平均 {_sign(os_['avg_pct'])} · {_sign(os_['usd'], True)} · 现在持仓 {o['open_now']} / 盯盘 {o['watching_now']}"]
+    for x in o["opened"]:
+        opt_lines.append(f"🟦 {x['time']} {x['ticker']} {x['contract']} @ {x['price']}")
+    for x in o["closed"]:
+        opt_lines.append(f"{'🟢' if x['realized_pct'] > 0 else '🔴'} {x['time']} {x['ticker']} {x['exit_reason']} {_sign(x['realized_pct'])} (最高 {_sign(x['max_gain_pct'])})")
+    fields.append(_field("🎯 期权影子（纸面）", opt_lines))
+
+    sw_lines = [f"信号 {len(sw['signals'])} · 审核 " + (", ".join(f"{k} {v}" for k, v in sw["reviews_by_status"].items()) or "无") + f" · 成交 {sw['fills']}"]
+    for p in sw["placed"]:
+        sw_lines.append(f"• {p['ticker']} {p['kind']} ${p['usd']}")
+    fields.append(_field("🌊 Swing", sw_lines))
+
+    t = r.get("totals") or {}
+    tot = []
+    for k, label in (("day", "日内"), ("swing", "Swing")):
+        v = t.get(k) or {}
+        if isinstance(v, dict) and v.get("count"):
+            tot.append(f"{label}: {v['count']} 笔 · 净 {_sign(v.get('net'), True)} · 胜率 {v['wins'] / v['count'] * 100:.0f}% · PF {v.get('profit_factor')}")
+    if isinstance(t.get("combined"), dict):
+        tot.append(f"合计已实现 {_sign(t['combined'].get('combined_realized'), True)}")
+    fields.append(_field("Σ 累计", tot or ["-"]))
+
+    health = []
+    hb = hl["day_trader_heartbeat_age_min"]
+    health.append(("✅" if isinstance(hb, (int, float)) and hb < 5 else "⚠️") + f" 日内服务心跳 {hb if hb is not None else '-'} 分钟前")
+    if hl["unreconciled"]:
+        health.append("⚠️ 未对账仓位: " + ", ".join(hl["unreconciled"]))
+    if hl["stuck_pending"]:
+        health.append("⚠️ 卡住的挂单: " + ", ".join(hl["stuck_pending"]))
+    if r.get("narrative_error"):
+        health.append(f"ℹ️ {r['narrative_error']}")
+    fields.append(_field("🩺 健康", health))
+
+    embed = {"title": f"📊 每日复盘 {r['date']}", "color": color, "fields": fields,
+             "footer": {"text": "详细表格见附件 · dashboard → Review"}}
+    if r.get("narrative"):
+        embed["description"] = r["narrative"][:2000]
+    return [embed]
+
+
+def send_discord(subject: str, body_md: str, filename: str, report: dict[str, Any] | None = None) -> str | None:
+    """Post the review to a Discord webhook (REVIEW_DISCORD_WEBHOOK): embed card plus the markdown as a file."""
     import os
     import httpx
     url = os.getenv("REVIEW_DISCORD_WEBHOOK", "").strip()
     if not url:
         return "discord not configured"
-    # Discord messages cap at 2000 chars: send the head inline, the full page as an attachment.
-    head = body_md.split("\n## Heat feed", 1)[0].strip()
-    content = f"**{subject}**\n{head}"[:1900]
+    if report:
+        payload: dict[str, Any] = {"embeds": discord_embeds(report)}
+    else:
+        payload = {"content": f"**{subject}**"}
     try:
-        r = httpx.post(url, data={"content": content}, files={"file": (filename, body_md.encode("utf-8"), "text/markdown")}, timeout=30)
+        r = httpx.post(url, data={"payload_json": json.dumps(payload, ensure_ascii=False)},
+                       files={"file": (filename, body_md.encode("utf-8"), "text/markdown")}, timeout=30)
         if r.status_code >= 300:
-            return f"discord failed: {r.status_code} {r.text[:120]}"
+            return f"discord failed: {r.status_code} {r.text[:160]}"
     except httpx.HTTPError as exc:
         return f"discord failed: {exc}"[:200]
     return None
@@ -419,7 +517,7 @@ def write(day: date, paths: Paths | None = None, *, with_narrative: bool = False
     if email:
         text = md.read_text(encoding="utf-8")
         r["email_error"] = send_email(f"Trade bot review {day.isoformat()}", text)
-        r["discord_error"] = send_discord(f"Trade bot review {day.isoformat()}", text, md.name)
+        r["discord_error"] = send_discord(f"Trade bot review {day.isoformat()}", text, md.name, report=r)
     (paths.out_dir / f"{day.isoformat()}.json").write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
     return md
 
