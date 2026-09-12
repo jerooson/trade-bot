@@ -94,6 +94,11 @@ LEVERAGED_ETF_MIN_AVG_VOLUME = float(
     os.getenv("DAY_TRADE_LEVERAGED_ETF_MIN_AVG_VOLUME", "1000000")
 )
 ENTRY_ORDER_TTL_S = int(os.getenv("DAY_TRADE_ENTRY_ORDER_TTL_S", "30"))
+# Seconds the signal price must stay beyond the trigger before an entry is
+# submitted.  0 keeps the historical behaviour (buy on the first poll that
+# sees the cross).  The minute-bar replay (docs/replay-findings-2026-09.md)
+# showed a one-minute confirmation skipping wick-only breakouts.
+ENTRY_CONFIRM_S = int(os.getenv("DAY_TRADE_ENTRY_CONFIRM_S", "0"))
 SCHEDULER_TICK_S = float(os.getenv("DAY_TRADE_SCHEDULER_TICK_S", "1"))
 SIGNALS_LOG = Path("logs/signals.jsonl")
 POSITIONS_LOG = Path("logs/day_trade_positions.jsonl")
@@ -165,6 +170,10 @@ class DayPosition:
     armed: bool = True
     manual_cancel_requested: bool = False
     entry_attempt_no: int = 0
+    # First poll that saw the trigger crossed while ENTRY_CONFIRM_S > 0; the
+    # entry is submitted once the cross has held for that long.  Cleared when
+    # price falls back through the trigger.
+    trigger_confirm_started_at: str | None = None
     # Discord plans received during a regular session remain eligible through
     # the following session.  ``discord_carry_from_date`` prevents repeated
     # force-close polls from consuming that next-session window immediately.
@@ -2309,8 +2318,24 @@ def run_once(
                     else:
                         pos.status = "expired"
                         pos.exit_reason = "entry_gap_above_limit"
+                    pos.trigger_confirm_started_at = None
                     changed = True
                     continue
+
+                if ENTRY_CONFIRM_S > 0:
+                    if not pos.trigger_confirm_started_at:
+                        pos.trigger_confirm_started_at = now.isoformat()
+                        changed = True
+                        log.info(
+                            "TRIGGER SEEN: %s price=%.4f trigger=%.4f — confirming for %ds before entry",
+                            pos.ticker, signal_price, pos.trigger_price, ENTRY_CONFIRM_S,
+                        )
+                        continue
+                    held_s = (now - datetime.fromisoformat(pos.trigger_confirm_started_at)).total_seconds()
+                    if held_s < ENTRY_CONFIRM_S:
+                        continue
+                    pos.trigger_confirm_started_at = None
+                    changed = True
 
                 log.info(
                     "TRIGGER: %s price=%.4f >= trigger=%.4f — preparing protected $%.0f fractional buy with cap %.4f",
@@ -2322,6 +2347,12 @@ def run_once(
                 )
                 if _submit_or_recover_entry(session, account_number, pos):
                     changed = True
+            elif pos.trigger_confirm_started_at:
+                # Price fell back through the level before the confirmation
+                # window elapsed: a wick, not a breakout.  Start over.
+                log.info("TRIGGER LOST during confirmation: %s price=%.4f trigger=%.4f", pos.ticker, signal_price, pos.trigger_price)
+                pos.trigger_confirm_started_at = None
+                changed = True
             continue
 
         # --- Open position management ---

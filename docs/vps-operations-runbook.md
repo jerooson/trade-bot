@@ -369,6 +369,12 @@ starts the next session unarmed: if price gaps above the trigger and the +0.2%
 entry cap, the bot waits for price to return below the trigger and break out
 again instead of chasing. It expires at the following session's close.
 
+`DAY_TRADE_ENTRY_CONFIRM_S` (default 0) makes the day trader wait until the
+signal price has stayed beyond the trigger for that many seconds before it
+submits the entry; a dip back through the trigger restarts the wait. Set it
+to `60` to run the one-minute confirmation studied in
+`docs/replay-findings-2026-09.md` (paper account first).
+
 The day-trade stop policy starts at -2%. Its first risk-reduction milestone
 uses one 5-second observation (`+1% -> -0.5% stop`); milestones from +2% onward
 still require two consecutive 5-second observations.
