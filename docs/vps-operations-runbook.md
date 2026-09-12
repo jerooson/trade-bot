@@ -461,3 +461,12 @@ the project `logs/` directory.
 - Maintain off-VPS backups of `logs/`.
 - Add monitoring for listener and auto-trader failures.
 - Replace the Discord selfbot with an official bot or webhook when possible.
+
+## Discord main-channel plans: record only
+
+`DAY_TRADE_DISCORD_PLANS=record` keeps the listener writing main-channel PLAN
+signals to `logs/signals.jsonl` (so replay datasets keep growing) but the day
+trader never turns them into watches. Heat ideas and manual watches are not
+affected. Set it back to `execute` (the default) and restart the day trader to
+resume trading them. Enabled on the VPS on 2026-09-12 together with
+`DAY_TRADE_BUDGET_USD=50`, so the day P&L from that date on is Heat-only.

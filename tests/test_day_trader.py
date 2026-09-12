@@ -1617,3 +1617,27 @@ class TestUnderlyingRiskForLeveragedETF(_Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestDiscordPlanRecordMode(_Base):
+    """DAY_TRADE_DISCORD_PLANS=record logs main-channel plans but never trades them."""
+
+    def test_record_mode_creates_no_watch(self):
+        from bot.parser import Side, Signal, SignalKind
+        sig = Signal(kind=SignalKind.PLAN, ticker="NEW", trigger=50.0,
+                     side=Side.LONG, received_at=datetime.now(timezone.utc))
+        sig.message_id = "rec-1"
+        positions: list = []
+        with patch("bot.day_trader.DISCORD_PLAN_MODE", "record"):
+            self._run(positions, new_plans=[sig], price=49.0)
+        assert positions == []
+
+    def test_execute_mode_still_creates_watch(self):
+        from bot.parser import Side, Signal, SignalKind
+        sig = Signal(kind=SignalKind.PLAN, ticker="NEW", trigger=50.0,
+                     side=Side.LONG, received_at=datetime.now(timezone.utc))
+        sig.message_id = "exe-1"
+        positions: list = []
+        with patch("bot.day_trader.DISCORD_PLAN_MODE", "execute"):
+            self._run(positions, new_plans=[sig], price=49.0)
+        assert [p.ticker for p in positions] == ["NEW"]

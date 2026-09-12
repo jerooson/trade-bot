@@ -79,6 +79,13 @@ ET = ZoneInfo("America/New_York")
 # Constants
 # ------------------------------------------------------------------
 DAY_TRADE_BUDGET_USD = float(os.getenv("DAY_TRADE_BUDGET_USD", "20"))
+# "execute": Discord main-channel PLAN signals become day-trade watches.
+# "record": they are logged (the listener still writes signals.jsonl) but the
+# day trader never creates a watch for them; Heat ideas and manual watches
+# are unaffected.
+DISCORD_PLAN_MODE = os.getenv("DAY_TRADE_DISCORD_PLANS", "execute").strip().lower()
+if DISCORD_PLAN_MODE not in ("execute", "record"):
+    raise ValueError("DAY_TRADE_DISCORD_PLANS must be 'execute' or 'record'")
 FAR_POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_FAR_POLL_INTERVAL_S", "15"))
 NEAR_POLL_INTERVAL_S = int(os.getenv("DAY_TRADE_NEAR_POLL_INTERVAL_S", "5"))
 NEAR_TRIGGER_PCT = float(os.getenv("DAY_TRADE_NEAR_TRIGGER_PCT", "0.5"))
@@ -2061,6 +2068,12 @@ def run_once(
     # 1. Ingest new PLAN signals.
     new_plans = _load_new_plans(seen_plan_ids)
     for sig in new_plans:
+        if DISCORD_PLAN_MODE == "record":
+            log.info(
+                "Recording Discord PLAN without executing (DAY_TRADE_DISCORD_PLANS=record): %s trigger=%s",
+                sig.ticker, sig.trigger,
+            )
+            continue
         # Defence in depth: callers/tests can supply Signal objects without
         # going through _load_new_plans().  Only explicit LONG Discord plans
         # are allowed to create an executable DayPosition.
