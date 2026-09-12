@@ -122,3 +122,45 @@ currently buys within seconds.
   pass, or the chart analyzer's own reads, would show how stable they are.
 - 147 entries over five months cannot separate a +0.2 % edge from zero;
   the value here is in the rankings and the slippage measurement.
+
+## 5. Can the yellow lines be generated? (prior-high scanner, preliminary)
+
+`bot/level_scanner.py` reverse-engineers the 21 reviewed yellow lines
+(all on prior daily highs; 15/21 strict pivots; 4-65 sessions old; prior
+close 1-8 % below) and emits, for every symbol-day, the nearest unbroken
+pivot high above the prior close, plus a random-offset control level on the
+same symbol-days. It reproduces 17 of the 21 lines. Run over the 137
+tickers in the dataset for 2026-07-16..09-11 (Heat's window): 613 levels,
+613 controls; 85 % of the required minute bars were cached when the IBKR
+gateway started throttling, and the missing 15 % hit both groups equally.
+
+| Policy | Heat (n=52) | Scanner (n=258) | Random control (n=255) |
+|---|---:|---:|---:|
+| live rules, avg % / trade | **+0.84 ± 0.34** | +0.17 ± 0.12 | +0.18 ± 0.15 |
+| live rules, win % | 64 | 48 | 45 |
+| hold to close, avg % | +0.84 ± 0.36 | +0.32 ± 0.16 | -0.02 ± 0.19 |
+| flat -2 % stop, avg % | +0.79 ± 0.36 | +0.16 ± 0.14 | +0.03 ± 0.16 |
+
+(± is one standard error of the mean.)
+
+What this says:
+
+1. **Prior highs carry some information.** Without stops the scanner's
+   levels beat random levels (+0.32 % vs -0.02 %, 56 % vs 45 % winners),
+   and with a flat stop too. Buying "somewhere above the close" is not the
+   same as buying a prior high.
+2. **The mechanical rule does not reproduce Heat.** Under the live rules
+   the scanner is indistinguishable from random (+0.17 % vs +0.18 %) and a
+   quarter of Heat's per-trade result; the trailing milestones lock in
+   early on all three groups and erase the level's small edge. Restricting
+   the scanner to Heat's own tickers helps (+0.30 %) but stays far below
+   his +0.84 %. Distance band, pivot age and leverage do not separate.
+3. **Most of Heat's edge is selection**: which symbol, which day, and which
+   of several candidate lines. That is the part the scanner cannot see.
+   With 52 Heat trades the gap (+0.84 vs +0.17, difference ~0.67 ± 0.36)
+   is about two standard errors: suggestive, not conclusive.
+
+Implications: a fully automatic "Heat without Heat" is not supported by
+this evidence. What the scanner *is* good for is the opposite direction:
+turning Heat's chart-only posts into executable levels automatically
+(17/21 recall) so the live bot no longer waits for a typed number.
