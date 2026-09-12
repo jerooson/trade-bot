@@ -402,6 +402,19 @@ def _field(name: str, lines: list[str], limit: int = 1000) -> dict[str, Any]:
     return {"name": name, "value": text or "无", "inline": False}
 
 
+def _split_field(name: str, lines: list[str], limit: int = 1000) -> list[dict[str, Any]]:
+    """Like _field but continues into extra fields instead of truncating."""
+    out: list[dict[str, Any]] = []
+    chunk: list[str] = []
+    for ln in lines:
+        if sum(len(x) + 1 for x in chunk) + len(ln) > limit and chunk:
+            out.append({"name": name if not out else f"{name} (续)", "value": "\n".join(chunk), "inline": False})
+            chunk = []
+        chunk.append(ln[:limit])
+    out.append({"name": name if not out else f"{name} (续)", "value": "\n".join(chunk) or "无", "inline": False})
+    return out
+
+
 def _w(text: str) -> int:
     import unicodedata
     return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
@@ -489,52 +502,63 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
     color = 0x3BA55D if pnl > 0 else 0xED4245 if pnl < 0 else 0x5865F2
     fields: list[dict[str, Any]] = []
 
-    head = f"**{s['n']} 笔** · 盈亏 **{_sign(pnl, True)}** · 胜率 {s['win_rate'] if s['win_rate'] is not None else '-'}% · 平均 {_sign(s['avg_pct'])}"
-    rows_ = []
+    # --- day trades: one line per trade ---
+    trade_lines = [f"**{s['n']} 笔** · 盈亏 **{_sign(pnl, True)}** · 胜率 {s['win_rate'] if s['win_rate'] is not None else '-'}% · 平均 {_sign(s['avg_pct'])}"]
+    exit_cn = {"eod": "收盘平仓", "stop": "止损", "target": "到目标", "manual": "手动"}
+    src_cn = {"heat": "Heat", "discord": "主频道", "manual": "手动"}
     for t in d["closed"]:
-        via = t["execution"] if (t["leverage"] or 1) == 1 else f"{t['execution']}x{t['leverage']:.0f}"
-        rows_.append([t["ticker"], via, {"heat": "heat", "discord": "main", "manual": "manual"}.get(t["source"], t["source"]),
-                      f"{t['entered']}-{t['exit']}", {"eod": "收盘", "stop": "止损", "target": "目标", "manual": "手动"}.get(t["exit_reason"], "其他"),
-                      _sign(t["pnl_usd"], True), _sign(t["pnl_pct"])])
+        via = "" if (t["leverage"] or 1) == 1 else f" 经 {t['execution']} x{t['leverage']:.0f}"
+        trade_lines.append(f"{'🟢' if (t['pnl_usd'] or 0) > 0 else '🔴'} **{t['ticker']}**{via} · {src_cn.get(t['source'], t['source'])} · {t['entered']}→{t['exit']} {exit_cn.get(t['exit_reason'], t['exit_reason'])} · **{_sign(t['pnl_usd'], True)}** ({_sign(t['pnl_pct'])})")
     for t in d["open"]:
-        rows_.append([t["ticker"], t["execution"] or "", "", t["entered"], {"pending_exit": "平仓", "open": "持仓", "unreconciled": "对账"}.get(t["status"], "其他"), "", ""])
+        st_cn = {"pending_exit": "平仓中", "open": "持仓中", "unreconciled": "待对账"}.get(t["status"], t["status"])
+        trade_lines.append(f"⏳ **{t['ticker']}** ({t['execution']}) {st_cn}" + (f" — {str(t['error'])[:70]}" if t["error"] else ""))
     for t in d["failed"]:
-        rows_.append([t["ticker"], "", "", "", "失败", "", ""])
-    fields += _table_fields("📈 日内交易", head, ["sym", "exec", "src", "in-out", "exit", "P&L", "%"], rows_, widths=[5, 8, 6, 11, 4, 7, 7])
+        trade_lines.append(f"❌ **{t['ticker']}** {t['status']} — {str(t['error'])[:70]}")
     if d["still_watching"]:
-        fields.append(_field("👀 挂单等待", [", ".join(f"{w['ticker']}@{w['trigger']:.2f} ({w['source']})" for w in d["still_watching"][:10])]))
+        trade_lines.append("👀 挂单等待: " + ", ".join(f"{w['ticker']}@{w['trigger']:.2f}" for w in d["still_watching"][:10]))
+    fields.append(_field("📈 日内交易", trade_lines))
 
-    summary = f"{h['count']} 条 · 自动批准 {len(h['approved'])} · 待审 {len(h['needs_review'])} · 期权帖 {len(h['option_posts'])}"
-    fields += _table_fields("🔥 Heat 信号 → bot 动作", summary,
-                            ["time", "sym", "level", "parse", "bot result"],
-                            [[_when(x, r["date"]), x["ticker"] or "?", _level(x), _parse_label(x), _outcome_label(x)] for x in r["heat_vs_bot"]],
-                            widths=[11, 5, 9, 6, 22])
+    # --- Heat: one entry per post, time-ordered: status line + his words ---
+    heat_lines = [f"{h['count']} 条 · 自动批准 {len(h['approved'])} · 待审 {len(h['needs_review'])} · 期权帖 {len(h['option_posts'])}"]
+    for x in r["heat_vs_bot"]:
+        outcome = x["outcome"]
+        icon = ("✅" if outcome.startswith("traded") else "⏳" if outcome == "watching_not_triggered"
+                else "📝" if outcome.startswith("not_approved") else "🔵" if outcome in ("open", "pending_exit", "pending_entry")
+                else "⚠️")
+        lvl = "" if x.get("trigger") is None else f" {'站上' if x.get('operator') != 'below' else '跌破'} {x['trigger']:.2f}"
+        heat_lines.append(f"{icon} **{_when(x, r['date'])} {x['ticker'] or '?'}**{lvl} · {_parse_label(x)} → {_outcome_label(x)}")
+        if x.get("text"):
+            heat_lines.append(f"> {x['text'][:80]}")
+    fields += _split_field("🔥 Heat 信号 → bot 动作", heat_lines)
 
     dp = r["discord_plans_recorded"]
     if dp["count"]:
         fields.append(_field("📋 主频道信号（只记录）", [", ".join(f"{p['ticker']}@{p['trigger']}" for p in dp["rows"][:12])]))
 
     os_ = o["summary"]
-    opt_head = f"开仓 {len(o['opened'])} · 平仓 {os_['n']} · 平均 {_sign(os_['avg_pct'])} · {_sign(os_['usd'], True)} · 持仓 {o['open_now']} / 盯盘 {o['watching_now']}"
-    opt_rows = [[x["time"], x["ticker"], x["contract"], "开仓", f"@{x['price']}", ""] for x in o["opened"]]
-    opt_rows += [[x["time"], x["ticker"], "", {"eod": "收盘", "stop_30pct": "止损", "stop_level": "破位",
-                                               "trim_half_50pct": "减半", "trim_runner_100pct": "跑者", "trim_runner_target": "目标"}.get(x["exit_reason"], "其他"),
-                  _sign(x["realized_pct"]), f"max {_sign(x['max_gain_pct'])}"] for x in o["closed"]]
-    fields += _table_fields("🎯 期权影子（纸面）", opt_head, ["time", "sym", "contract", "act", "result", "max"], opt_rows, widths=[5, 5, 16, 4, 8, 12])
+    opt_lines = [f"开仓 {len(o['opened'])} · 平仓 {os_['n']} · 平均 {_sign(os_['avg_pct'])} · {_sign(os_['usd'], True)} · 持仓 {o['open_now']} / 盯盘 {o['watching_now']}"]
+    for x in o["opened"]:
+        opt_lines.append(f"🔵 {x['time']} **{x['ticker']}** {x['contract']} 开仓 @{x['price']}")
+    exit_opt = {"eod": "收盘平仓", "stop_30pct": "止损 -30%", "stop_level": "破位止损", "trim_half_50pct": "减半", "trim_runner_100pct": "留 runner", "trim_runner_target": "到目标"}
+    for x in o["closed"]:
+        opt_lines.append(f"{'🟢' if x['realized_pct'] > 0 else '🔴'} {x['time']} **{x['ticker']}** {exit_opt.get(x['exit_reason'], x['exit_reason'])} · **{_sign(x['realized_pct'])}** (最高 {_sign(x['max_gain_pct'])})")
+    fields.append(_field("🎯 期权影子（纸面）", opt_lines))
 
-    sw_head = f"信号 {len(sw['signals'])} · 审核 " + (", ".join(f"{k} {v}" for k, v in sw["reviews_by_status"].items()) or "无") + f" · 成交 {sw['fills']}"
-    sw_rows = [[p["ticker"], p["kind"], f"${p['usd']}"] for p in sw["placed"]]
-    fields += _table_fields("🌊 Swing", sw_head, ["sym", "action", "usd"], sw_rows, widths=[6, 14, 8])
+    sw_lines = [f"信号 {len(sw['signals'])} · 审核 " + (", ".join(f"{k} {v}" for k, v in sw["reviews_by_status"].items()) or "无") + f" · 成交 {sw['fills']}"]
+    for p in sw["placed"]:
+        sw_lines.append(f"• **{p['ticker']}** {p['kind']} ${p['usd']}")
+    fields.append(_field("🌊 Swing", sw_lines))
 
     t = r.get("totals") or {}
-    tot_rows = []
+    tot = []
     for k, label in (("day", "日内"), ("swing", "波段")):
         v = t.get(k) or {}
         if isinstance(v, dict) and v.get("count"):
-            tot_rows.append([label, str(v["count"]), _sign(v.get("net"), True), f"{v['wins'] / v['count'] * 100:.0f}%", str(v.get("profit_factor"))])
+            tot.append(f"**{label}** {v['count']} 笔 · 净 **{_sign(v.get('net'), True)}** · 胜率 {v['wins'] / v['count'] * 100:.0f}% · PF {v.get('profit_factor')}")
     combined = t.get("combined") if isinstance(t.get("combined"), dict) else {}
-    tot_head = f"合计已实现 {_sign(combined.get('combined_realized'), True)}" if combined else ""
-    fields += _table_fields("Σ 累计", tot_head, ["strat", "n", "net", "win", "PF"], tot_rows, widths=[6, 5, 9, 5, 6])
+    if combined:
+        tot.append(f"合计已实现 **{_sign(combined.get('combined_realized'), True)}**")
+    fields.append(_field("Σ 累计", tot or ["-"]))
 
     health = []
     hb = hl["day_trader_heartbeat_age_min"]
