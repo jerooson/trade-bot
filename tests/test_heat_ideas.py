@@ -145,12 +145,31 @@ def test_heat_parser_prefers_explicit_uppercase_ticker_over_later_alias():
     "关注 SPY sell puts",
     "NVDA 200C +80% nice win",
 ])
-def test_heat_parser_ignores_option_show_and_tell(text):
-    assert parse_heat_idea(
+def test_heat_parser_records_option_posts_without_trigger(text):
+    idea = parse_heat_idea(
         text,
         idea_id="option-show",
         created_at="2026-07-15T15:00:00+00:00",
-    ) is None
+    )
+    assert idea is not None
+    assert idea["classification"] == "option_post"
+    assert idea["trigger_price"] is None
+    assert idea["auto_eligible"] is False
+    assert idea["mapping_supported"] is False
+
+
+def test_option_posts_stay_unexecutable_after_materialize():
+    from bot.heat_ideas import materialize_heat_ideas
+    idea = parse_heat_idea(
+        "SPY put 关注突破600",
+        idea_id="option-1",
+        created_at="2026-07-15T15:00:00+00:00",
+    )
+    (row,) = materialize_heat_ideas([idea], [])
+    assert row["classification"] == "option_post"
+    assert row["status"] != "auto_approved"
+    assert row["decision"] is None
+    assert row["trigger_price"] is None
 
 
 def test_heat_parser_accepts_explicit_bearish_breakdown_route():

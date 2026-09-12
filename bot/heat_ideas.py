@@ -130,6 +130,8 @@ def _ticker_from(text: str) -> str | None:
 
 def _classification_from(text: str, trigger: float | None) -> str:
     """Classify Heat content before it reaches trade approval controls."""
+    if _OPTION_RE.search(text or ""):
+        return "option_post"
     if _SWING_DCA_RE.search(text or ""):
         return "swing_dca"
     if _POSITION_UPDATE_RE.search(text or ""):
@@ -239,9 +241,28 @@ def parse_heat_idea(
         return None
     option_message = bool(_OPTION_RE.search(body))
     if option_message:
-        # Heat's option posts are performance/show-and-tell, not actionable
-        # trade opportunities. Do not surface them as ideas or review items.
-        return None
+        # Heat's option posts are recorded for later research (which
+        # contracts, which direction, what he said) but never carry a trigger
+        # and never become executable: the bot trades cash equities only.
+        return {
+            "event_type": "idea",
+            "id": str(idea_id),
+            "ticker": ticker,
+            "trigger_price": None,
+            "target_price": None,
+            "direction": _direction_from(body),
+            "trigger_operator": "below" if _BELOW_RE.search(body) else "above",
+            "mapping_supported": False,
+            "leveraged_candidates": [],
+            "setup": body[:500] or "Heat option post",
+            "text": body,
+            "reply_text": context[:1000] or None,
+            "attachments": [],
+            "auto_eligible": False,
+            "confidence": "review",
+            "classification": "option_post",
+            "created_at": created_at,
+        }
     trigger = _trigger_from(body)
     classification = _classification_from(body, trigger)
     direction = _direction_from(body)
@@ -377,7 +398,9 @@ def materialize_heat_ideas(
         # repaired in place.  Operator decisions always win.
         decision_trigger = decision.get("trigger_price") if decision else None
         if body and decision_trigger is None:
-            reparsed = _trigger_from(body)
+            # Option posts are research records: numbers in them are strikes
+            # or premiums, never a cash-equity trigger.
+            reparsed = None if _OPTION_RE.search(body) else _trigger_from(body)
             if reparsed != idea.get("trigger_price"):
                 idea["trigger_price"] = reparsed
                 if idea.get("auto_eligible") and reparsed is None:
