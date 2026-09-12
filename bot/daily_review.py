@@ -410,8 +410,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--narrative", action="store_true", help="add a Codex-written summary (skipped on quota errors)")
     p.add_argument("--email", action="store_true", help="send by SMTP when REVIEW_EMAIL_TO / REVIEW_SMTP_* are set")
     args = p.parse_args(argv)
+    from dotenv import load_dotenv
+    load_dotenv()
     md = write(args.date, with_narrative=args.narrative, email=args.email)
     print(md)
+    if args.email or args.narrative:
+        meta = json.loads((md.with_suffix(".json")).read_text(encoding="utf-8"))
+        print("narrative:", "ok" if meta.get("narrative") else meta.get("narrative_error", "skipped"))
+        print("email:", meta.get("email_error") or "sent")
     if args.print:
         print(md.read_text(encoding="utf-8"))
 
