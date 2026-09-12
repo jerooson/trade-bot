@@ -53,6 +53,22 @@ services:
       retries: 3
       start_period: 10s
 
+  # Optional: headless IB Gateway for BROKER=ibkr (paper). Start with
+  #   docker compose --profile ibkr up -d ib-gateway
+  # See docs/ibkr-paper.md.
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    profiles: ["ibkr"]
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
+      TRADING_MODE: ${IBKR_TRADING_MODE:-paper}
+      READ_ONLY_API: "no"
+      TWOFA_TIMEOUT_ACTION: restart
+    ports:
+      - "127.0.0.1:4002:4004"
+
   web:
     build: ./web
     restart: unless-stopped

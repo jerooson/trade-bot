@@ -61,11 +61,14 @@ from bot.leveraged_etfs import (
     has_verified_liquidity,
     result_by_symbol,
 )
-from bot.robinhood_mcp_client import (
+from bot.broker import create_broker
+from bot.broker.base import (
+    Broker,
+    BrokerError,
+    OrderRejected,
+    OrderRequest,
     OrderResult,
-    RobinhoodMCPError,
-    _load_token,
-    _MCPSession,
+    ShareShortfall,
 )
 
 log = logging.getLogger("bot.day_trader")
@@ -245,16 +248,15 @@ class DayPosition:
 class DayTraderRuntime:
     """Non-persistent connection and per-position scheduling state."""
 
-    session: _MCPSession | None = field(default=None, repr=False)
+    session: Broker | None = field(default=None, repr=False)
     account_number: str | None = None
     next_due: dict[str, float] = field(default_factory=dict)
     consecutive_failures: int = 0
     retry_not_before: float = 0.0
 
-    def connection(self) -> tuple[_MCPSession, str]:
+    def connection(self) -> tuple[Broker, str]:
         if self.session is None or self.account_number is None:
-            self.session = _MCPSession(_load_token())
-            self.account_number = _get_agentic_account(self.session)
+            self.session, self.account_number = _connect_broker()
         return self.session, self.account_number
 
     def due_positions(self, positions: list[DayPosition]) -> list[DayPosition]:
@@ -276,6 +278,11 @@ class DayTraderRuntime:
         self.retry_not_before = 0.0
 
     def record_failure(self) -> float:
+        if self.session is not None:
+            try:
+                self.session.close()
+            except Exception:  # noqa: BLE001
+                pass
         self.session = None
         self.account_number = None
         idx = min(self.consecutive_failures, len(_RECONNECT_BACKOFF_S) - 1)
@@ -679,58 +686,26 @@ def _sync_heat_ideas(
 
 
 # ------------------------------------------------------------------
-# Robinhood helpers (decoupled from swing shadow_reviewer)
+# Broker helpers (decoupled from swing shadow_reviewer)
 # ------------------------------------------------------------------
 
-def _quote_price(item: dict[str, Any]) -> float | None:
-    q = item.get("quote") or item
-    ltp = q.get("last_trade_price")
-    if ltp is not None:
-        return float(ltp)
-    ask = q.get("ask_price")
-    bid = q.get("bid_price")
-    if ask is not None and bid is not None:
-        return (float(ask) + float(bid)) / 2
-    if ask is not None:
-        return float(ask)
-    if bid is not None:
-        return float(bid)
-    return None
+def _connect_broker() -> tuple[Broker, str]:
+    """Open the configured broker (BROKER env) and resolve its account id."""
+    broker = create_broker(role="day_trader")
+    return broker, broker.account_id()
 
 
-def _get_prices(session: _MCPSession, tickers: list[str]) -> dict[str, float]:
-    """Fetch all due ticker quotes in one Robinhood request."""
+def _get_prices(broker: Broker, tickers: list[str]) -> dict[str, float]:
+    """Fetch all due ticker quotes in one broker request."""
     if not tickers:
         return {}
     symbols = list(dict.fromkeys(t.upper() for t in tickers))
-    data = session.call("get_equity_quotes", symbols=symbols)
-    results = data.get("data", {}).get("results", [])
     prices: dict[str, float] = {}
-    for index, item in enumerate(results):
-        q = item.get("quote") or item
-        symbol = str(
-            item.get("symbol")
-            or q.get("symbol")
-            or q.get("instrument_symbol")
-            or ""
-        ).upper()
-        if not symbol and len(results) == len(symbols):
-            # Robinhood preserves request order even when a response omits the
-            # redundant symbol field.
-            symbol = symbols[index]
-        price = _quote_price(item)
-        if symbol and price is not None:
-            prices[symbol] = price
+    for symbol, quote in broker.quotes(symbols).items():
+        price = quote.price
+        if price is not None:
+            prices[symbol.upper()] = price
     return prices
-
-
-def _get_agentic_account(session: _MCPSession) -> str:
-    accounts_data = session.call("get_accounts")
-    accounts = accounts_data.get("data", {}).get("accounts", [])
-    agentic = [a for a in accounts if a.get("agentic_allowed")]
-    if not agentic:
-        raise RobinhoodMCPError("No Agentic account found")
-    return agentic[0]["account_number"]
 
 
 class EntryPreflightRejected(Exception):
@@ -746,24 +721,19 @@ class EntryPreflightUnavailable(Exception):
 
 
 def _validate_entry_preflight(
-    session: _MCPSession,
+    broker: Broker,
     ticker: str,
     trigger_price: float,
     max_price: float,
     trigger_operator: str = "above",
 ) -> tuple[float, float, float, float]:
     """Return last/bid/ask/spread after enforcing the final entry guard."""
-    data = session.call("get_equity_quotes", symbols=[ticker])
-    results = data.get("data", {}).get("results", [])
-    if not results:
+    quote = broker.quotes([ticker]).get(ticker.upper())
+    if quote is None:
         raise EntryPreflightUnavailable(f"No fresh quote for {ticker}")
-    quote = results[0].get("quote") or results[0]
-    try:
-        last = float(quote["last_trade_price"])
-        bid = float(quote["bid_price"])
-        ask = float(quote["ask_price"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise EntryPreflightUnavailable(f"Incomplete fresh quote for {ticker}") from exc
+    if quote.last is None or quote.bid is None or quote.ask is None:
+        raise EntryPreflightUnavailable(f"Incomplete fresh quote for {ticker}")
+    last, bid, ask = float(quote.last), float(quote.bid), float(quote.ask)
     if last <= 0 or bid <= 0 or ask <= 0 or ask < bid:
         raise EntryPreflightUnavailable(
             f"Invalid fresh quote for {ticker}: last={last} bid={bid} ask={ask}",
@@ -819,7 +789,7 @@ def _float_or_none(value: object) -> float | None:
 
 
 def _select_leveraged_etf(
-    session: _MCPSession,
+    broker: Broker,
     account_number: str,
     source_ticker: str,
     direction: str,
@@ -832,18 +802,9 @@ def _select_leveraged_etf(
             f"No supported execution route for {source_ticker} {direction}",
         )
     symbols = [candidate.ticker for candidate in candidates]
-    quote_data = session.call("get_equity_quotes", symbols=symbols)
-    quote_rows = quote_data.get("data", {}).get("results", [])
-    quotes = result_by_symbol(quote_rows, symbols)
-
-    tradability_data = session.call(
-        "get_equity_tradability",
-        account_number=account_number,
-        symbols=symbols,
-    )
-    tradability_rows = tradability_data.get("data", {}).get("results", [])
-    tradability = result_by_symbol(tradability_rows, symbols)
-    if not tradability_rows:
+    quotes = broker.quotes(symbols)
+    tradability = broker.tradability(symbols)
+    if not tradability:
         raise EntryPreflightUnavailable(
             f"No tradability response for execution candidates {symbols}"
         )
@@ -852,19 +813,15 @@ def _select_leveraged_etf(
     rejected: list[str] = []
     for candidate in candidates:
         symbol = candidate.ticker
-        item = quotes.get(symbol)
+        quote = quotes.get(symbol)
         trade = tradability.get(symbol)
-        if item is None or trade is None:
+        if quote is None or trade is None:
             rejected.append(f"{symbol}:missing quote/tradability")
             continue
-        quote = item.get("quote") or item
-        try:
-            last = float(quote["last_trade_price"])
-            bid = float(quote["bid_price"])
-            ask = float(quote["ask_price"])
-        except (KeyError, TypeError, ValueError):
+        if quote.last is None or quote.bid is None or quote.ask is None:
             rejected.append(f"{symbol}:incomplete quote")
             continue
+        last, bid, ask = float(quote.last), float(quote.bid), float(quote.ask)
         if last < LEVERAGED_ETF_MIN_PRICE or bid <= 0 or ask < bid:
             rejected.append(f"{symbol}:invalid/low price")
             continue
@@ -873,18 +830,14 @@ def _select_leveraged_etf(
         if spread_pct > LEVERAGED_ETF_MAX_SPREAD_PCT:
             rejected.append(f"{symbol}:spread {spread_pct:.3f}%")
             continue
-        trade_item = trade.get("tradability") or trade
-        if not trade_item.get("tradeable", True):
+        if not trade.tradeable:
             rejected.append(f"{symbol}:not tradeable")
             continue
-        if trade_item.get("fractional_tradability", "tradable") == "untradable":
+        if not trade.fractional:
             rejected.append(f"{symbol}:not fractional")
             continue
-        average_volume = _float_or_none(
-            quote.get("average_volume_30_days")
-            or quote.get("average_volume")
-        )
-        current_volume = _float_or_none(quote.get("volume"))
+        average_volume = _float_or_none(quote.average_volume)
+        current_volume = _float_or_none(quote.volume)
         observed_volume = average_volume or current_volume
         verified_liquidity = (
             candidate.leverage > 1.0 and has_verified_liquidity(symbol)
@@ -945,7 +898,7 @@ def _select_leveraged_etf(
 
 
 def _place_fractional_market_buy(
-    session: _MCPSession,
+    broker: Broker,
     account_number: str,
     ticker: str,
     usd: float,
@@ -957,59 +910,36 @@ def _place_fractional_market_buy(
         uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
         f"dayentry:{ref_key}",
     ))
-    order_kwargs: dict[str, Any] = {
-        "account_number": account_number,
-        "symbol": ticker,
-        "side": "buy",
-        "type": "market",
-        "time_in_force": "gfd",
-        "market_hours": "regular_hours",
-        "dollar_amount": f"{usd:.2f}",
-        "ref_id": ref_id,
-    }
     log.info(
         "Submitting protected fractional buy for %s: $%.2f market, preflight cap %.2f",
         ticker,
         usd,
         max_price,
     )
-    resp = session.call("place_equity_order", **order_kwargs)
-    order_id = resp.get("data", {}).get("order", {}).get("id") or resp.get("id", "")
-    state = resp.get("data", {}).get("order", {}).get("state") or resp.get("state", "queued")
-    if not order_id:
-        raise RobinhoodMCPError(f"place_equity_order returned no order id: {resp}")
+    result = broker.place_order(OrderRequest(
+        symbol=ticker,
+        side="buy",
+        order_type="market",
+        dollar_amount=round(usd, 2),
+        time_in_force="gfd",
+        regular_hours_only=True,
+        ref_id=ref_id,
+    ))
+    if not result.order_id:
+        raise BrokerError(f"broker returned no order id for {ticker} buy")
 
     # Poll for fill
-    fill_price: float | None = None
-    fill_qty: float | None = None
     for _ in range(10):
+        if result.is_terminal or result.state == "partially_filled":
+            break
         time.sleep(2)
         try:
-            od = session.call("get_equity_orders", account_number=account_number, symbol=ticker)
-            orders = od.get("data", {}).get("orders", [])
-            match = next((o for o in orders if o.get("id") == order_id), None)
-            if match:
-                state = match.get("state", state)
-                avg = match.get("average_price")
-                qty = match.get("cumulative_quantity")
-                if avg is not None and qty is not None:
-                    fill_price = float(avg)
-                    fill_qty = float(qty)
-                if str(state).lower() in {
-                    "filled", "partially_filled", "cancelled", "canceled",
-                    "rejected", "failed", "expired",
-                }:
-                    break
+            latest = broker.get_order(result.order_id, ticker)
         except Exception:
-            pass
-
-    return OrderResult(
-        order_id=order_id,
-        state=state,
-        fill_price=fill_price,
-        fill_qty=fill_qty,
-        fill_usd=round(fill_price * fill_qty, 4) if fill_price and fill_qty else None,
-    )
+            continue
+        if latest is not None:
+            result = latest
+    return result
 
 
 def _entry_limit_price(trigger_price: float) -> float:
@@ -1192,37 +1122,22 @@ def _converted_heat_target(pos: DayPosition, fill_price: float) -> float | None:
 
 
 def _poll_order(
-    session: _MCPSession,
+    broker: Broker,
     account_number: str,
     ticker: str,
     order_id: str,
 ) -> OrderResult | None:
     """Return the latest state of a previously submitted equity order."""
     try:
-        data = session.call("get_equity_orders", account_number=account_number, symbol=ticker)
-        orders = data.get("data", {}).get("orders", [])
-        order = next((item for item in orders if item.get("id") == order_id), None)
-        if order is None:
-            return None
-        avg = order.get("average_price")
-        qty = order.get("cumulative_quantity")
-        fill_price = float(avg) if avg is not None else None
-        fill_qty = float(qty) if qty is not None else None
-        return OrderResult(
-            order_id=order_id,
-            state=order.get("state", "unknown"),
-            fill_price=fill_price,
-            fill_qty=fill_qty,
-            fill_usd=round(fill_price * fill_qty, 4) if fill_price and fill_qty else None,
-        )
+        return broker.get_order(order_id, ticker)
     except Exception as exc:
         log.warning("Could not check order %s for %s: %s", order_id, ticker, exc)
         return None
 
 
-def _place_stop_order(session: _MCPSession, account_number: str, ticker: str, qty: float, stop_price: float) -> str | None:
+def _place_stop_order(broker: Broker, account_number: str, ticker: str, qty: float, stop_price: float) -> str | None:
     """
-    Attempt a stop_market sell order. Returns order_id or None.
+    Attempt a stop-market sell order. Returns order_id or None.
 
     Robinhood does not support stop orders on fractional positions — in that
     case we return None and rely on the bot's fast price check to
@@ -1230,19 +1145,17 @@ def _place_stop_order(session: _MCPSession, account_number: str, ticker: str, qt
     """
     ref_id = str(uuid.uuid5(uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), f"daystop:{ticker}:{stop_price}"))
     try:
-        resp = session.call(
-            "place_equity_order",
-            account_number=account_number,
+        result = broker.place_order(OrderRequest(
             symbol=ticker,
             side="sell",
-            type="stop_market",
-            stop_price=str(round(stop_price, 2)),
-            quantity=str(round(qty, 6)),
+            order_type="stop",
+            quantity=round(qty, 6),
+            stop_price=round(stop_price, 2),
             time_in_force="gfd",
             ref_id=ref_id,
-        )
-        return resp.get("data", {}).get("order", {}).get("id") or resp.get("id")
-    except RobinhoodMCPError as exc:
+        ))
+        return result.order_id or None
+    except BrokerError as exc:
         msg = str(exc)
         if "fractional" in msg.lower() or "trigger" in msg.lower():
             log.info(
@@ -1257,23 +1170,21 @@ def _place_stop_order(session: _MCPSession, account_number: str, ticker: str, qt
         return None
 
 
-def _place_limit_sell(session: _MCPSession, account_number: str, ticker: str, qty: float, limit_price: float) -> str | None:
+def _place_limit_sell(broker: Broker, account_number: str, ticker: str, qty: float, limit_price: float) -> str | None:
     """Place a limit sell order (for Will's target). Returns order_id or None."""
     ref_id = str(uuid.uuid5(uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"), f"daylimit:{ticker}:{limit_price}"))
     try:
-        resp = session.call(
-            "place_equity_order",
-            account_number=account_number,
+        result = broker.place_order(OrderRequest(
             symbol=ticker,
             side="sell",
-            type="limit",
-            limit_price=str(round(limit_price, 2)),
-            quantity=str(round(qty, 6)),
+            order_type="limit",
+            quantity=round(qty, 6),
+            limit_price=round(limit_price, 2),
             time_in_force="gfd",
             ref_id=ref_id,
-        )
-        return resp.get("data", {}).get("order", {}).get("id") or resp.get("id")
-    except RobinhoodMCPError as exc:
+        ))
+        return result.order_id or None
+    except BrokerError as exc:
         msg = str(exc)
         if "fractional" in msg.lower():
             log.info(
@@ -1288,9 +1199,9 @@ def _place_limit_sell(session: _MCPSession, account_number: str, ticker: str, qt
         return None
 
 
-def _cancel_order(session: _MCPSession, account_number: str, order_id: str) -> bool:
+def _cancel_order(broker: Broker, account_number: str, order_id: str) -> bool:
     try:
-        session.call("cancel_equity_order", account_number=account_number, order_id=order_id)
+        broker.cancel_order(order_id)
         log.info("Cancelled order %s", order_id)
         return True
     except Exception as exc:
@@ -1299,7 +1210,7 @@ def _cancel_order(session: _MCPSession, account_number: str, order_id: str) -> b
 
 
 def _market_sell_all(
-    session: _MCPSession,
+    broker: Broker,
     account_number: str,
     ticker: str,
     qty: float,
@@ -1314,47 +1225,25 @@ def _market_sell_all(
         uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
         f"dayclose:{ref_key}",
     ))
-    response = session.call(
-        "place_equity_order",
-        account_number=account_number,
+    result = broker.place_order(OrderRequest(
         symbol=ticker,
         side="sell",
-        type="market",
-        quantity=f"{qty:.6f}",
+        order_type="market",
+        quantity=round(qty, 6),
         time_in_force="gfd",
+        regular_hours_only=False,
         ref_id=ref_id,
-    )
-    order = response.get("data", {}).get("order", {})
-    order_id = order.get("id") or response.get("id", "")
-    state = order.get("state") or response.get("state", "queued")
-    if not order_id:
-        raise RobinhoodMCPError(
-            f"place_equity_order returned no exit order id for {ticker}"
-        )
-    average_price = order.get("average_price")
-    cumulative_quantity = order.get("cumulative_quantity")
-    fill_price = float(average_price) if average_price is not None else None
-    fill_qty = (
-        float(cumulative_quantity) if cumulative_quantity is not None else None
-    )
+    ))
+    if not result.order_id:
+        raise BrokerError(f"broker returned no exit order id for {ticker}")
     log.info(
         "Exit market-sell acknowledged for %s qty=%.6f order=%s state=%s",
         ticker,
         qty,
-        order_id,
-        state,
+        result.order_id,
+        result.state,
     )
-    return OrderResult(
-        order_id=order_id,
-        state=state,
-        fill_price=fill_price,
-        fill_qty=fill_qty,
-        fill_usd=(
-            round(fill_price * fill_qty, 4)
-            if fill_price is not None and fill_qty is not None
-            else None
-        ),
-    )
+    return result
 
 
 _EXIT_TERMINAL_FAILURE_STATES = {
@@ -1445,21 +1334,15 @@ def _apply_exit_order_result(pos: DayPosition, result: OrderResult) -> bool:
 
 def _is_share_shortfall(error: object) -> bool:
     """Broker rejected a sell because the account holds fewer shares."""
-    return "not enough shares" in str(error).lower()
+    return isinstance(error, ShareShortfall) or "not enough shares" in str(error).lower()
 
 
-def _broker_position_qty(session: _MCPSession, account_number: str, symbol: str) -> float:
-    data = session.call("get_equity_positions", account_number=account_number)
-    positions = data.get("data", {}).get("positions", [])
-    match = next(
-        (p for p in positions if str(p.get("symbol") or "").upper() == symbol.upper()),
-        None,
-    )
-    return float(match.get("quantity") or 0.0) if match else 0.0
+def _broker_position_qty(broker: Broker, account_number: str, symbol: str) -> float:
+    return broker.position_qty(symbol)
 
 
 def _reconcile_exit_shortfall(
-    session: _MCPSession,
+    session: Broker,
     account_number: str,
     pos: DayPosition,
     error: object,
@@ -1526,7 +1409,7 @@ def _reconcile_exit_shortfall(
 
 
 def _start_or_retry_exit(
-    session: _MCPSession,
+    session: Broker,
     account_number: str,
     pos: DayPosition,
     reason: str,
@@ -1689,7 +1572,7 @@ def _recover_legacy_discord_carryovers(
 
 
 def _activate_filled_position(
-    session: _MCPSession,
+    session: Broker,
     account_number: str,
     pos: DayPosition,
     result: OrderResult,
@@ -1782,7 +1665,7 @@ def _record_entry_fill(pos: DayPosition, result: OrderResult) -> bool:
 
 
 def _request_entry_cancel(
-    session: _MCPSession,
+    session: Broker,
     account_number: str,
     pos: DayPosition,
     reason: str,
@@ -1845,8 +1728,11 @@ def _end_unsubmitted_entry(pos: DayPosition, reason: str, detail: object) -> Non
 
 
 def _is_definitive_entry_rejection(error: object) -> bool:
-    """Return whether MCP explicitly rejected the order before acknowledgement."""
-    return "'place_equity_order' returned isError:" in str(error)
+    """Return whether the broker explicitly rejected the order before acknowledgement."""
+    if isinstance(error, OrderRejected):
+        return True
+    text = str(error)
+    return "'place_equity_order' returned isError:" in text or "IBKR rejected" in text
 
 
 def _recover_definitive_entry_rejections(positions: list[DayPosition]) -> bool:
@@ -1866,7 +1752,7 @@ def _recover_definitive_entry_rejections(positions: list[DayPosition]) -> bool:
 
 
 def _apply_entry_order_result(
-    session: _MCPSession,
+    session: Broker,
     account_number: str,
     pos: DayPosition,
     result: OrderResult,
@@ -1935,7 +1821,7 @@ def _entry_order_timed_out(pos: DayPosition, now: datetime) -> bool:
 
 
 def _submit_or_recover_entry(
-    session: _MCPSession,
+    session: Broker,
     account_number: str,
     pos: DayPosition,
 ) -> bool:
@@ -2033,7 +1919,7 @@ def _submit_or_recover_entry(
             pos.entry_limit_price,
             f"{pos.id}:{pos.entry_attempt_no}",
         )
-    except RobinhoodMCPError as exc:
+    except BrokerError as exc:
         if _is_definitive_entry_rejection(exc):
             _end_unsubmitted_entry(pos, "broker_rejected", exc)
             return True
@@ -2225,8 +2111,7 @@ def run_once(
         if runtime:
             session, account_number = runtime.connection()
         else:
-            session = _MCPSession(_load_token())
-            account_number = _get_agentic_account(session)
+            session, account_number = _connect_broker()
         quote_symbols = [
             symbol
             for pos in due
@@ -2540,20 +2425,10 @@ def run_once(
 
             if pos.limit_order_id and not _uses_underlying_risk(pos):
                 try:
-                    od = session.call(
-                        "get_equity_orders",
-                        account_number=account_number,
-                        symbol=_execution_symbol(pos),
-                    )
-                    orders = od.get("data", {}).get("orders", [])
-                    tgt_order = next((o for o in orders if o.get("id") == pos.limit_order_id), None)
-                    if tgt_order and tgt_order.get("state") == "filled":
-                        fill_p = float(tgt_order.get("average_price") or price or 0)
-                        fill_q = float(
-                            tgt_order.get("cumulative_quantity")
-                            or pos.fill_qty
-                            or 0
-                        )
+                    tgt_order = session.get_order(pos.limit_order_id, _execution_symbol(pos))
+                    if tgt_order and tgt_order.state == "filled":
+                        fill_p = float(tgt_order.fill_price or price or 0)
+                        fill_q = float(tgt_order.fill_qty or pos.fill_qty or 0)
                         log.info("Limit order filled for %s at %.4f", pos.ticker, fill_p)
                         if pos.stop_order_id:
                             _cancel_order(session, account_number, pos.stop_order_id)
@@ -2566,14 +2441,14 @@ def run_once(
                         continue
                     if (
                         tgt_order
-                        and str(tgt_order.get("state", "")).lower()
+                        and str(tgt_order.state or "").lower()
                         in _EXIT_TERMINAL_FAILURE_STATES
                     ):
                         log.warning(
                             "Broker target %s for %s ended state=%s; reverting to bot-managed target",
                             pos.limit_order_id,
                             pos.ticker,
-                            tgt_order.get("state"),
+                            tgt_order.state,
                         )
                         pos.limit_order_id = None
                         changed = True

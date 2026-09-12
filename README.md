@@ -19,6 +19,11 @@ the executor to remain in `DRY_RUN`. For everyday VPS operation, use
 To review fresh ENTRY and REDUCE proposals through Robinhood without placing
 orders, see [docs/robinhood-shadow-review.md](docs/robinhood-shadow-review.md).
 
+Execution goes through a broker adapter (`bot/broker/`): `BROKER=robinhood`
+(default) or `BROKER=ibkr` for Interactive Brokers via IB Gateway. Run the
+full pipeline against the IBKR paper account first; see
+[docs/ibkr-paper.md](docs/ibkr-paper.md).
+
 The swing executor and the day trader share one Robinhood account. Each
 strategy sells only the shares it owns (`bot/position_ownership.py`) and will
 not open a position in a symbol the other strategy holds. A reconciled

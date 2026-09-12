@@ -7,6 +7,10 @@ consent for every tool call and cannot be satisfied in unattended VPS mode.
 
 Uses MCP protocol 2025-03-26 (no elicitation capability), matching the
 protocol version that Codex CLI used before v0.139.0.
+
+This module only owns the transport (token refresh + JSON-RPC session).  The
+broker-agnostic execution surface lives in ``bot.broker`` and the swing
+order-placement logic in ``bot.swing_orders``.
 """
 
 from __future__ import annotations
@@ -17,53 +21,19 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from bot import position_ownership
+from bot.broker.base import BrokerError, OrderResult, OwnershipBlocked  # noqa: F401 - re-exported
 
 log = logging.getLogger("bot.robinhood_mcp_client")
 
 MCP_URL = "https://agent.robinhood.com/mcp/trading"
 CREDS_PATH = Path("~/.codex/.credentials.json").expanduser()
-REF_ID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-
-OPEN_STATES = {
-    "new", "queued", "confirmed", "unconfirmed", "partially_filled"
-}
-
-_BUY_KINDS = {"ENTRY", "ADD"}
-_SELL_KINDS = {"REDUCE", "CLOSE", "STOP_TRIGGER"}
-
-# Poll this many times (×2s each) waiting for a market order to fill.
-_FILL_POLL_ATTEMPTS = 10
-_FILL_POLL_INTERVAL_S = 2.0
 
 
-@dataclass
-class OrderResult:
-    """Result of a placed order, including fill details when available."""
-    order_id: str
-    state: str
-    fill_price: float | None = None    # average fill price (None if not yet filled)
-    fill_qty: float | None = None      # cumulative filled quantity
-    fill_usd: float | None = None      # fill_price × fill_qty
-
-
-class RobinhoodMCPError(Exception):
+class RobinhoodMCPError(BrokerError):
     pass
-
-
-class OwnershipBlocked(RobinhoodMCPError):
-    """No order was placed: the strategy owns nothing sellable at the broker.
-
-    Raised before ``place_equity_order`` when the account-level quantity is
-    zero, or when every share the account holds belongs to another strategy
-    (see ``bot.position_ownership``).  Deterministic and safe to record as a
-    non-placement; it is *not* an ambiguous broker outcome.
-    """
 
 
 _ROBINHOOD_TOKEN_URL = "https://api.robinhood.com/oauth2/token/"
@@ -241,214 +211,3 @@ class _MCPSession:
             return json.loads(text)
         except json.JSONDecodeError:
             return text
-
-
-def resolve_sell_quantity(proposal: dict[str, Any], actual_shares: float) -> float:
-    """Shares the swing strategy may sell for this proposal.
-
-    Ownership comes from the proposal's immutable ``book_before`` snapshot
-    (the executor has already removed a CLOSEd ticker from the live book by
-    the time the order is placed) plus the broker-confirmed swing fills since
-    that holding's first entry.  The day trader's shares in the same symbol
-    are excluded; see ``position_ownership.sellable_quantity``.
-    """
-    ticker = str(proposal["ticker"]).upper()
-    kind = proposal["signal_kind"]
-    book_before = proposal.get("book_before") or {}
-    book_position = book_before.get("ticker_position") or None
-    virtual_est = float(proposal.get("shares_estimate") or 0.0)
-    if book_position is None:
-        # Legacy proposal without a snapshot: only the estimate is available.
-        own = virtual_est
-    else:
-        # May legitimately be 0.0 (fills say the holding was already sold);
-        # that is not a reason to fall back to the estimate.
-        own = position_ownership.swing_owned(ticker, book_position)
-    requested = own if kind in ("CLOSE", "STOP_TRIGGER") else min(virtual_est, own)
-    others = position_ownership.day_owned(ticker)
-    quantity, note = position_ownership.sellable_quantity(
-        requested, own=own, others=others, actual=actual_shares
-    )
-    if note:
-        log.warning("%s %s: %s", kind, ticker, note)
-    log.info(
-        "%s %s: virtual_est=%.6f swing_owned=%.6f day_owned=%.6f actual=%.6f -> sell=%.6f",
-        kind,
-        ticker,
-        virtual_est,
-        own,
-        others,
-        actual_shares,
-        quantity,
-    )
-    return round(quantity, 6)
-
-
-def place_order(
-    proposal: dict[str, Any],
-    expected_usd: float,
-) -> OrderResult:
-    """Place a Robinhood order directly via MCP without Codex.
-
-    Returns an OrderResult with the broker order id, state and fill details.
-    Raises RobinhoodMCPError on any failure; OwnershipBlocked (a subclass) when
-    a sell was refused before placement because nothing sellable belongs to
-    the swing strategy.
-    """
-    ticker = proposal["ticker"]
-    kind = proposal["signal_kind"]
-    amount = float(proposal["usd_amount"])
-
-    signal = proposal.get("signal") or {}
-    msg_id = signal.get("message_id")
-    dedupe_key = f"{msg_id}:{ticker}:{kind}" if msg_id else str(proposal.get("id") or "")
-    ref_id = str(uuid.uuid5(REF_ID_NAMESPACE, dedupe_key))
-
-    log.info(
-        "Direct MCP: %s %s $%.4f ref_id=%s", kind, ticker, amount, ref_id
-    )
-
-    token = _load_token()
-    session = _MCPSession(token)
-
-    # Step 1: Find the Agentic account.
-    accounts_data = session.call("get_accounts")
-    accounts = accounts_data.get("data", {}).get("accounts", [])
-    agentic = [a for a in accounts if a.get("agentic_allowed")]
-    if not agentic:
-        raise RobinhoodMCPError(
-            "No Agentic account found (agentic_allowed=true). "
-            "Complete Robinhood Agentic onboarding in the Robinhood app."
-        )
-    account_number = agentic[0]["account_number"]
-    log.info("Agentic account: %s", account_number)
-
-    # Step 2: Check tradability.
-    tradability_data = session.call(
-        "get_equity_tradability",
-        account_number=account_number,
-        symbols=[ticker],
-    )
-    results = tradability_data.get("data", {}).get("results", [])
-    if results:
-        item = results[0]
-        if not item.get("tradeable", True):
-            reason = item.get("state", "unknown")
-            raise RobinhoodMCPError(f"{ticker} is not tradable: state={reason}")
-        # Dollar-amount (fractional) orders require fractional support.
-        # ENTRY and ADD both submit dollar_amount orders, so both need this check.
-        if kind in _BUY_KINDS:
-            frac = item.get("fractional_tradability", "tradable")
-            if frac == "untradable":
-                raise RobinhoodMCPError(
-                    f"{ticker} does not support fractional/dollar-amount orders "
-                    f"(fractional_tradability={frac!r}). "
-                    "Increase the per-ticker budget to cover at least 1 whole share, "
-                    "or exclude this ticker from agentic trading."
-                )
-
-    # Step 3: Check for existing open orders.
-    existing_data = session.call(
-        "get_equity_orders",
-        account_number=account_number,
-        symbol=ticker,
-    )
-    existing_orders = existing_data.get("data", {}).get("orders", [])
-    open_orders = [o for o in existing_orders if o.get("state") in OPEN_STATES]
-    if open_orders:
-        oid = open_orders[0].get("id", "?")
-        raise RobinhoodMCPError(
-            f"Existing open order for {ticker}: {oid} — skipping to avoid duplicate"
-        )
-
-    # Step 4: For REDUCE/CLOSE/STOP_TRIGGER, size the sell from what the SWING
-    # strategy owns — never from the account-level quantity.  The day trader
-    # can hold the same symbol in the same account (SPXL on 2026-09-02), and
-    # selling "all actual shares" sold its position too.
-    quantity: float | None = None
-    if kind in _SELL_KINDS:
-        positions_data = session.call(
-            "get_equity_positions", account_number=account_number
-        )
-        positions = positions_data.get("data", {}).get("positions", [])
-        position = next((p for p in positions if p.get("symbol") == ticker), None)
-        actual_shares = float(position.get("quantity", 0)) if position else 0.0
-        quantity = resolve_sell_quantity(proposal, actual_shares)
-        if quantity <= position_ownership.QTY_EPSILON:
-            raise OwnershipBlocked(
-                f"{kind} for {ticker}: nothing sellable that belongs to the swing "
-                f"strategy (broker holds {actual_shares:.6f}, "
-                f"day trader owns {position_ownership.day_owned(ticker):.6f})"
-            )
-
-    # Step 5: Place the order.
-    order_kwargs: dict[str, Any] = {
-        "account_number": account_number,
-        "symbol": ticker,
-        "side": "buy" if kind in _BUY_KINDS else "sell",
-        "type": "market",
-        "time_in_force": "gfd",
-        "market_hours": "regular_hours",
-        "ref_id": ref_id,
-    }
-    if kind in _BUY_KINDS:  # ENTRY or ADD: dollar-amount market order
-        order_kwargs["dollar_amount"] = f"{amount:.2f}"
-    else:  # REDUCE or CLOSE: quantity-based market order
-        order_kwargs["quantity"] = f"{quantity:.6f}"
-
-    log.info("Placing order: %s", {k: v for k, v in order_kwargs.items() if k != "account_number"})
-    order_data = session.call("place_equity_order", **order_kwargs)
-
-    order = order_data.get("data", {}).get("order", {})
-    broker_order_id = order.get("id")
-    order_state = order.get("state", "unknown")
-
-    if not broker_order_id:
-        raise RobinhoodMCPError(
-            f"place_equity_order response missing order id: {order_data}"
-        )
-    log.info("Order placed: id=%s state=%s", broker_order_id, order_state)
-
-    # Step 6: Poll for fill — market orders typically fill within seconds.
-    fill_price: float | None = None
-    fill_qty: float | None = None
-    fill_usd: float | None = None
-
-    for attempt in range(_FILL_POLL_ATTEMPTS):
-        time.sleep(_FILL_POLL_INTERVAL_S)
-        confirm_data = session.call(
-            "get_equity_orders",
-            account_number=account_number,
-            order_id=broker_order_id,
-        )
-        confirm_orders = confirm_data.get("data", {}).get("orders", [])
-        if confirm_orders:
-            o = confirm_orders[0]
-            order_state = o.get("state", order_state)
-            if order_state in ("filled", "partially_filled"):
-                raw_price = o.get("average_price")
-                raw_qty = o.get("cumulative_quantity")
-                if raw_price:
-                    fill_price = float(raw_price)
-                if raw_qty:
-                    fill_qty = float(raw_qty)
-                if fill_price and fill_qty:
-                    fill_usd = round(fill_price * fill_qty, 4)
-                log.info(
-                    "Order filled: id=%s price=%.4f qty=%.6f usd=%.4f (attempt %d)",
-                    broker_order_id, fill_price or 0, fill_qty or 0, fill_usd or 0, attempt + 1,
-                )
-                break
-        if attempt == 0:
-            log.info("Order confirmed: id=%s state=%s (polling for fill...)", broker_order_id, order_state)
-
-    if fill_price is None:
-        log.warning("Order %s not filled within poll window (state=%s); fill price unavailable", broker_order_id, order_state)
-
-    return OrderResult(
-        order_id=broker_order_id,
-        state=order_state,
-        fill_price=fill_price,
-        fill_qty=fill_qty,
-        fill_usd=fill_usd,
-    )

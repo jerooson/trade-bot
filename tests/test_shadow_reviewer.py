@@ -280,7 +280,7 @@ def test_review_one_placed_when_direct_mcp_returns_order(tmp_path):
     )
     result = OrderResult(broker_id, "new", 100.0, 0.05, 5.0)
     with patch(
-        "bot.shadow_reviewer.robinhood_mcp_client.place_order",
+        "bot.shadow_reviewer.swing_orders.place_swing_order",
         return_value=result,
     ):
         record = review_one(p, cfg, _append_pending=False)
@@ -301,7 +301,7 @@ def test_review_one_unverified_when_direct_mcp_errors(tmp_path):
         place_orders=True,
     )
     with patch(
-        "bot.shadow_reviewer.robinhood_mcp_client.place_order",
+        "bot.shadow_reviewer.swing_orders.place_swing_order",
         side_effect=RobinhoodMCPError("test broker error"),
     ):
         record = review_one(p, cfg, _append_pending=False)
@@ -322,7 +322,7 @@ def test_review_one_unverified_on_unexpected_direct_mcp_error(tmp_path):
         place_orders=True,
     )
     with patch(
-        "bot.shadow_reviewer.robinhood_mcp_client.place_order",
+        "bot.shadow_reviewer.swing_orders.place_swing_order",
         side_effect=RuntimeError("unexpected"),
     ):
         record = review_one(_proposal("ENTRY", "BUY", 5), cfg, _append_pending=False)
@@ -367,7 +367,7 @@ def test_review_one_writes_pending_before_direct_mcp(tmp_path):
     )
     result = OrderResult(broker_id, "new", 100.0, 0.05, 5.0)
     with patch(
-        "bot.shadow_reviewer.robinhood_mcp_client.place_order",
+        "bot.shadow_reviewer.swing_orders.place_swing_order",
         return_value=result,
     ):
         review_one(p, cfg, _append_pending=True)

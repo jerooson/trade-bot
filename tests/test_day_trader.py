@@ -57,6 +57,7 @@ from bot.day_trader import (
 )
 from bot.leveraged_etfs import LeveragedETF
 from bot.robinhood_mcp_client import OrderResult
+from tests.fake_broker import FakeBroker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -114,9 +115,7 @@ def _patch_env(now=ET_MARKET_OPEN, price=10.0, buy_result: OrderResult | None = 
     patches = [
         patch("bot.day_trader.datetime", wraps=__import__("datetime").datetime),
         patch("bot.day_trader._load_new_plans", return_value=[]),
-        patch("bot.day_trader._load_token", return_value="fake-token"),
-        patch("bot.day_trader._MCPSession", return_value=MagicMock()),
-        patch("bot.day_trader._get_agentic_account", return_value="acct-001"),
+        patch("bot.day_trader._connect_broker", return_value=(MagicMock(), "acct-001")),
         patch("bot.day_trader._get_prices", return_value={"TEST": price}),
         patch("bot.day_trader._validate_entry_preflight", return_value=(price, price, price, 0.0)),
         patch("bot.day_trader._place_fractional_market_buy", return_value=buy_result),
@@ -169,9 +168,7 @@ class _Base(unittest.TestCase):
         mocks = {}
         with patch("bot.day_trader._load_new_plans", return_value=new_plans or []) as m_plans, \
              patch("bot.day_trader.load_plans", return_value=manual_plans), \
-             patch("bot.day_trader._load_token", return_value="tok") as m_tok, \
-             patch("bot.day_trader._MCPSession", return_value=MagicMock()) as m_sess, \
-             patch("bot.day_trader._get_agentic_account", return_value="acct") as m_acct, \
+             patch("bot.day_trader._connect_broker", return_value=(MagicMock(), "acct")) as m_conn, \
              patch("bot.day_trader._get_prices", return_value=prices) as m_price, \
              patch("bot.day_trader._validate_entry_preflight", return_value=(price, price, price, 0.0)) as m_preflight, \
              patch("bot.day_trader._place_fractional_market_buy", return_value=buy_result) as m_buy, \
@@ -443,28 +440,17 @@ class TestPendingEntryLifecycle(_Base):
         self.assertEqual(pos.exit_filled_qty, 0.75)
 
     def test_entry_ref_is_stable_for_safe_retry(self):
-        def make_session():
-            session = MagicMock()
-            session.call.side_effect = [
-                {"data": {"order": {"id": "order-1", "state": "queued"}}},
-                {"data": {"orders": [{
-                    "id": "order-1",
-                    "state": "filled",
-                    "average_price": "10.01",
-                    "cumulative_quantity": "1.998",
-                }]}},
-            ]
-            return session
+        def make_broker():
+            broker = FakeBroker()
+            broker.place_results = [OrderResult("order-1", "filled", 10.01, 1.998, 19.99998)]
+            return broker
 
-        first = make_session()
-        second = make_session()
+        first = make_broker()
+        second = make_broker()
         with patch("bot.day_trader.time.sleep"):
             _place_fractional_market_buy(first, "acct", "TEST", 20, 10.02, "same-position")
             _place_fractional_market_buy(second, "acct", "TEST", 20, 10.02, "same-position")
-        self.assertEqual(
-            first.call.call_args_list[0].kwargs["ref_id"],
-            second.call.call_args_list[0].kwargs["ref_id"],
-        )
+        self.assertEqual(first.requests[0].ref_id, second.requests[0].ref_id)
 
 
 # ===========================================================================
@@ -1103,7 +1089,7 @@ class TestResilience(_Base):
         pos = _open_pos(fill=10.0, stop=9.8, qty=2.0)
         original_status = pos.status
         with patch("bot.day_trader._load_new_plans", return_value=[]), \
-             patch("bot.day_trader._load_token", side_effect=Exception("token expired")), \
+             patch("bot.day_trader._connect_broker", side_effect=Exception("token expired")), \
              patch("bot.day_trader._flush_positions"), \
              patch("bot.day_trader.datetime") as m_dt:
             m_dt.now.return_value = ET_MARKET_OPEN
@@ -1115,9 +1101,7 @@ class TestResilience(_Base):
         """If price fetch fails, that position is skipped for this cycle."""
         pos = _open_pos(fill=10.0, stop=9.8, qty=2.0)
         with patch("bot.day_trader._load_new_plans", return_value=[]), \
-             patch("bot.day_trader._load_token", return_value="tok"), \
-             patch("bot.day_trader._MCPSession", return_value=MagicMock()), \
-             patch("bot.day_trader._get_agentic_account", return_value="acct"), \
+             patch("bot.day_trader._connect_broker", return_value=(MagicMock(), "acct")), \
              patch("bot.day_trader._get_prices", side_effect=Exception("network err")), \
              patch("bot.day_trader._market_sell_all") as m_sell, \
              patch("bot.day_trader._flush_positions"), \
@@ -1133,9 +1117,7 @@ class TestResilience(_Base):
         from bot.robinhood_mcp_client import RobinhoodMCPError
         pos = _watching_pos(trigger=10.0)
         with patch("bot.day_trader._load_new_plans", return_value=[]), \
-             patch("bot.day_trader._load_token", return_value="tok"), \
-             patch("bot.day_trader._MCPSession", return_value=MagicMock()), \
-             patch("bot.day_trader._get_agentic_account", return_value="acct"), \
+             patch("bot.day_trader._connect_broker", return_value=(MagicMock(), "acct")), \
              patch("bot.day_trader._get_prices", return_value={"TEST": 10.0}), \
              patch("bot.day_trader._validate_entry_preflight",
                    return_value=(10.0, 9.99, 10.0, 0.1)), \
@@ -1232,75 +1214,33 @@ class TestResilience(_Base):
 class TestProtectedEntryAndPolling(unittest.TestCase):
 
     def test_pltr_prefers_pltu_over_tighter_underlying_fallback(self):
-        session = MagicMock()
-        session.call.side_effect = [
-            {"data": {"results": [
-                {"symbol": "PLTU", "quote": {
-                    "last_trade_price": "32.00", "bid_price": "31.98",
-                    "ask_price": "32.02", "average_volume_30_days": "2000000",
-                }},
-                {"symbol": "PLTR", "quote": {
-                    "last_trade_price": "138.00", "bid_price": "137.99",
-                    "ask_price": "138.01", "average_volume_30_days": "50000000",
-                }},
-            ]}},
-            {"data": {"results": [
-                {"symbol": "PLTU", "tradeable": True, "fractional_tradability": "tradable"},
-                {"symbol": "PLTR", "tradeable": True, "fractional_tradability": "tradable"},
-            ]}},
-        ]
+        broker = FakeBroker()
+        broker.set_quote("PLTU", 32.00, 31.98, 32.02, average_volume=2_000_000)
+        broker.set_quote("PLTR", 138.00, 137.99, 138.01, average_volume=50_000_000)
 
-        selected = _select_leveraged_etf(session, "acct", "PLTR", "long")
+        selected = _select_leveraged_etf(broker, "acct", "PLTR", "long")
 
         self.assertEqual(selected.ticker, "PLTU")
         self.assertEqual(selected.leverage, 2.0)
 
     def test_curated_pltu_does_not_require_quote_volume(self):
-        session = MagicMock()
-        session.call.side_effect = [
-            {"data": {"results": [
-                {"symbol": "PLTU", "quote": {
-                    "last_trade_price": "32.00", "bid_price": "31.98",
-                    "ask_price": "32.02",
-                }},
-                {"symbol": "PLTR", "quote": {
-                    "last_trade_price": "138.00", "bid_price": "137.99",
-                    "ask_price": "138.01", "average_volume_30_days": "50000000",
-                }},
-            ]}},
-            {"data": {"results": [
-                {"symbol": "PLTU", "tradeable": True, "fractional_tradability": "tradable"},
-                {"symbol": "PLTR", "tradeable": True, "fractional_tradability": "tradable"},
-            ]}},
-        ]
+        broker = FakeBroker()
+        broker.set_quote("PLTU", 32.00, 31.98, 32.02)
+        broker.set_quote("PLTR", 138.00, 137.99, 138.01, average_volume=50_000_000)
 
-        selected = _select_leveraged_etf(session, "acct", "PLTR", "long")
+        selected = _select_leveraged_etf(broker, "acct", "PLTR", "long")
 
         self.assertEqual(selected.ticker, "PLTU")
         self.assertEqual(selected.leverage, 2.0)
         self.assertEqual(selected.liquidity_basis, "curated_liquid_route")
 
     def test_spxl_missing_quote_volume_still_routes_spy_to_spxl(self):
-        session = MagicMock()
-        session.call.side_effect = [
-            {"data": {"results": [
-                {"symbol": "SPXL", "quote": {
-                    "last_trade_price": "271.31", "bid_price": "271.30",
-                    "ask_price": "271.39",
-                }},
-                {"symbol": "SPY", "quote": {
-                    "last_trade_price": "748.61", "bid_price": "748.61",
-                    "ask_price": "748.63",
-                }},
-            ]}},
-            {"data": {"results": [
-                {"symbol": "SPXL", "tradeable": True, "fractional_tradability": "tradable"},
-                {"symbol": "SPY", "tradeable": True, "fractional_tradability": "tradable"},
-            ]}},
-        ]
+        broker = FakeBroker()
+        broker.set_quote("SPXL", 271.31, 271.30, 271.39)
+        broker.set_quote("SPY", 748.61, 748.61, 748.63)
 
         with self.assertLogs("bot.day_trader", level="INFO") as logs:
-            selected = _select_leveraged_etf(session, "acct", "SPY", "long")
+            selected = _select_leveraged_etf(broker, "acct", "SPY", "long")
 
         self.assertEqual(selected.ticker, "SPXL")
         self.assertIsNone(selected.volume)
@@ -1309,23 +1249,9 @@ class TestProtectedEntryAndPolling(unittest.TestCase):
         self.assertIn("volume=missing", "\n".join(logs.output))
 
     def test_non_curated_leveraged_route_still_requires_volume(self):
-        session = MagicMock()
-        session.call.side_effect = [
-            {"data": {"results": [
-                {"symbol": "NVDU", "quote": {
-                    "last_trade_price": "18.00", "bid_price": "17.99",
-                    "ask_price": "18.01",
-                }},
-                {"symbol": "NVDA", "quote": {
-                    "last_trade_price": "190.00", "bid_price": "189.99",
-                    "ask_price": "190.01",
-                }},
-            ]}},
-            {"data": {"results": [
-                {"symbol": "NVDU", "tradeable": True, "fractional_tradability": "tradable"},
-                {"symbol": "NVDA", "tradeable": True, "fractional_tradability": "tradable"},
-            ]}},
-        ]
+        broker = FakeBroker()
+        broker.set_quote("NVDU", 18.00, 17.99, 18.01)
+        broker.set_quote("NVDA", 190.00, 189.99, 190.01)
 
         with patch(
             "bot.day_trader.execution_candidates",
@@ -1334,35 +1260,17 @@ class TestProtectedEntryAndPolling(unittest.TestCase):
                 LeveragedETF("NVDA", 1.0),
             ),
         ):
-            selected = _select_leveraged_etf(session, "acct", "NVDA", "long")
+            selected = _select_leveraged_etf(broker, "acct", "NVDA", "long")
 
         self.assertEqual(selected.ticker, "NVDA")
         self.assertEqual(selected.liquidity_basis, "underlying_fallback")
 
     def test_selects_tightest_spread_fractional_leveraged_etf(self):
-        session = MagicMock()
-        session.call.side_effect = [
-            {"data": {"results": [
-                {"symbol": "NVDL", "quote": {
-                    "last_trade_price": "64.00", "bid_price": "63.94",
-                    "ask_price": "64.06", "volume": "2000000",
-                }},
-                {"symbol": "NVDX", "quote": {
-                    "last_trade_price": "25.00", "bid_price": "24.99",
-                    "ask_price": "25.01", "volume": "1500000",
-                }},
-                {"symbol": "NVDU", "quote": {
-                    "last_trade_price": "18.00", "bid_price": "17.99",
-                    "ask_price": "18.01", "volume": "3000000",
-                }},
-            ]}},
-            {"data": {"results": [
-                {"symbol": "NVDL", "tradeable": True, "fractional_tradability": "tradable"},
-                {"symbol": "NVDX", "tradeable": True, "fractional_tradability": "tradable"},
-                {"symbol": "NVDU", "tradeable": True, "fractional_tradability": "tradable"},
-            ]}},
-        ]
-        selected = _select_leveraged_etf(session, "acct", "NVDA", "long")
+        broker = FakeBroker()
+        broker.set_quote("NVDL", 64.00, 63.94, 64.06, volume=2_000_000)
+        broker.set_quote("NVDX", 25.00, 24.99, 25.01, volume=1_500_000)
+        broker.set_quote("NVDU", 18.00, 17.99, 18.01, volume=3_000_000)
+        selected = _select_leveraged_etf(broker, "acct", "NVDA", "long")
         self.assertEqual(selected.ticker, "NVDX")
         self.assertLess(selected.spread_pct, 0.1)
 
@@ -1399,27 +1307,19 @@ class TestProtectedEntryAndPolling(unittest.TestCase):
         self.assertIsNone(pos.stop_order_id)
 
     def test_batch_quotes_use_one_request_for_multiple_tickers(self):
-        session = MagicMock()
-        session.call.return_value = {"data": {"results": [
-            {"symbol": "AAPL", "quote": {"last_trade_price": "317.30"}},
-            {"symbol": "NVDA", "quote": {"last_trade_price": "190.50"}},
-        ]}}
-        prices = _get_prices(session, ["AAPL", "NVDA"])
-        session.call.assert_called_once_with(
-            "get_equity_quotes", symbols=["AAPL", "NVDA"]
-        )
+        broker = FakeBroker()
+        broker.set_quote("AAPL", 317.30)
+        broker.set_quote("NVDA", 190.50)
+        prices = _get_prices(broker, ["AAPL", "NVDA", "aapl"])
+        self.assertEqual(broker.calls, [("quotes", ["AAPL", "NVDA"])])
         self.assertEqual(prices, {"AAPL": 317.30, "NVDA": 190.50})
 
-    def test_batch_quotes_fall_back_to_request_order_when_symbol_is_omitted(self):
-        session = MagicMock()
-        session.call.return_value = {"data": {"results": [
-            {"quote": {"last_trade_price": "317.30"}},
-            {"quote": {"last_trade_price": "190.50"}},
-        ]}}
-        self.assertEqual(
-            _get_prices(session, ["AAPL", "NVDA"]),
-            {"AAPL": 317.30, "NVDA": 190.50},
+    def test_batch_quotes_use_midpoint_when_last_trade_is_missing(self):
+        broker = FakeBroker()
+        broker.quote_book["AAPL"] = __import__("bot.broker.base", fromlist=["Quote"]).Quote(
+            "AAPL", None, 317.20, 317.40
         )
+        self.assertAlmostEqual(_get_prices(broker, ["AAPL"])["AAPL"], 317.30)
 
     def test_runtime_schedules_each_ticker_independently(self):
         runtime = DayTraderRuntime()
@@ -1533,94 +1433,89 @@ class TestManualDayWatches(_Base):
 
 class TestProtectedEntryHelpers(unittest.TestCase):
 
-    def test_runtime_reuses_mcp_session_and_account(self):
+    def test_runtime_reuses_broker_connection_and_account(self):
         runtime = DayTraderRuntime()
-        session = MagicMock()
-        with patch("bot.day_trader._load_token", return_value="tok") as load_token, \
-             patch("bot.day_trader._MCPSession", return_value=session) as make_session, \
-             patch("bot.day_trader._get_agentic_account", return_value="acct") as get_account:
+        broker = FakeBroker()
+        with patch("bot.day_trader._connect_broker", return_value=(broker, "acct")) as connect:
             first = runtime.connection()
             second = runtime.connection()
         self.assertEqual(first, second)
-        load_token.assert_called_once()
-        make_session.assert_called_once_with("tok")
-        get_account.assert_called_once_with(session)
+        self.assertEqual(first, (broker, "acct"))
+        connect.assert_called_once()
 
     def test_fractional_buy_uses_supported_market_order_shape(self):
-        session = MagicMock()
-        session.call.side_effect = [
-            {"data": {"order": {"id": "order-1", "state": "queued"}}},
-            {"data": {"orders": [{
-                "id": "order-1",
-                "state": "filled",
-                "average_price": "10.01",
-                "cumulative_quantity": "1.998",
-            }]}},
-        ]
+        broker = FakeBroker()
         with patch("bot.day_trader.time.sleep"):
             result = _place_fractional_market_buy(
-                session, "acct", "TEST", 20, 10.02, "position-1"
+                broker, "acct", "TEST", 20, 10.02, "position-1"
             )
-        kwargs = session.call.call_args_list[0].kwargs
-        self.assertEqual(kwargs["type"], "market")
-        self.assertEqual(kwargs["dollar_amount"], "20.00")
-        self.assertEqual(kwargs["market_hours"], "regular_hours")
-        self.assertNotIn("limit_price", kwargs)
-        self.assertNotIn("quantity", kwargs)
+            # Queued at first; the fill arrives while polling.
+            broker.fill(result.order_id, 10.01, 1.998)
+            polled = _place_fractional_market_buy(
+                broker, "acct", "TEST", 20, 10.02, "position-2"
+            )
+        request = broker.requests[0]
+        self.assertEqual(request.order_type, "market")
+        self.assertEqual(request.side, "buy")
+        self.assertEqual(request.dollar_amount, 20.0)
+        self.assertTrue(request.regular_hours_only)
+        self.assertIsNone(request.limit_price)
+        self.assertIsNone(request.quantity)
+        self.assertEqual(result.state, "queued")
+        self.assertIsNotNone(polled.order_id)
+
+    def test_fractional_buy_polls_until_fill(self):
+        broker = FakeBroker()
+        broker.place_results = [OrderResult("order-1", "queued", None, None, None)]
+        original_get = broker.get_order
+
+        def get_order(order_id, symbol=None):
+            broker.fill(order_id, 10.01, 1.998)
+            return original_get(order_id, symbol)
+
+        broker.get_order = get_order  # type: ignore[assignment]
+        with patch("bot.day_trader.time.sleep"):
+            result = _place_fractional_market_buy(broker, "acct", "TEST", 20, 10.02, "position-1")
+        self.assertEqual(result.state, "filled")
         self.assertEqual(result.fill_price, 10.01)
+        self.assertEqual(result.fill_qty, 1.998)
+
+    @staticmethod
+    def _quote_broker(symbol: str, last: float, bid: float, ask: float) -> FakeBroker:
+        broker = FakeBroker()
+        broker.set_quote(symbol, last, bid, ask)
+        return broker
 
     def test_preflight_accepts_price_inside_cap_with_tight_spread(self):
-        session = MagicMock()
-        session.call.return_value = {"data": {"results": [{"quote": {
-            "last_trade_price": "212.77",
-            "bid_price": "212.76",
-            "ask_price": "212.78",
-        }}]}}
+        broker = self._quote_broker("NVDA", 212.77, 212.76, 212.78)
         last, bid, ask, spread = _validate_entry_preflight(
-            session, "NVDA", 212.70, 213.13
+            broker, "NVDA", 212.70, 213.13
         )
         self.assertEqual((last, bid, ask), (212.77, 212.76, 212.78))
         self.assertLess(spread, ENTRY_MAX_SPREAD_PCT)
 
     def test_preflight_rejects_ask_above_cap(self):
-        session = MagicMock()
-        session.call.return_value = {"data": {"results": [{"quote": {
-            "last_trade_price": "213.10",
-            "bid_price": "213.12",
-            "ask_price": "213.14",
-        }}]}}
+        broker = self._quote_broker("NVDA", 213.10, 213.12, 213.14)
         with self.assertRaises(EntryPreflightRejected) as raised:
-            _validate_entry_preflight(session, "NVDA", 212.70, 213.13)
+            _validate_entry_preflight(broker, "NVDA", 212.70, 213.13)
         self.assertEqual(raised.exception.reason, "ask_above_cap")
 
     def test_preflight_rejects_wide_spread(self):
-        session = MagicMock()
-        session.call.return_value = {"data": {"results": [{"quote": {
-            "last_trade_price": "10.01",
-            "bid_price": "9.98",
-            "ask_price": "10.02",
-        }}]}}
+        broker = self._quote_broker("TEST", 10.01, 9.98, 10.02)
         with self.assertRaises(EntryPreflightRejected) as raised:
-            _validate_entry_preflight(session, "TEST", 10.00, 10.02)
+            _validate_entry_preflight(broker, "TEST", 10.00, 10.02)
         self.assertEqual(raised.exception.reason, "spread_too_wide")
 
     def test_bearish_preflight_accepts_break_below_inside_floor(self):
-        session = MagicMock()
-        session.call.return_value = {"data": {"results": [{"quote": {
-            "last_trade_price": "149.90",
-            "bid_price": "149.89",
-            "ask_price": "149.91",
-        }}]}}
+        broker = self._quote_broker("NVDA", 149.90, 149.89, 149.91)
         last, _, _, _ = _validate_entry_preflight(
-            session, "NVDA", 150.0, 149.70, "below"
+            broker, "NVDA", 150.0, 149.70, "below"
         )
         self.assertEqual(last, 149.90)
 
     def test_preflight_missing_quote_is_temporarily_unavailable(self):
-        session = MagicMock()
-        session.call.return_value = {"data": {"results": []}}
         with self.assertRaises(EntryPreflightUnavailable):
-            _validate_entry_preflight(session, "NVDA", 212.70, 213.13)
+            _validate_entry_preflight(FakeBroker(), "NVDA", 212.70, 213.13)
 
     def test_far_watching_position_uses_slow_poll(self):
         pos = _watching_pos(trigger=10.0)

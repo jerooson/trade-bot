@@ -271,6 +271,20 @@ systemctl status trade-bot-shadow-review --no-pager
 journalctl -u trade-bot-shadow-review -n 100 --no-pager
 ```
 
+### Broker adapter (Robinhood or IBKR paper)
+
+Both host services place orders through `bot/broker/`. `BROKER=robinhood` is
+the default; `BROKER=ibkr` with `IBKR_PORT=4002` routes the same logic to the
+IBKR paper gateway (`docker compose --profile ibkr up -d ib-gateway`). Check
+connectivity before switching services:
+
+```bash
+cd ~/trade-bot
+.venv/bin/python -m bot.broker.smoke
+```
+
+Full setup, client-id rules and limits: `docs/ibkr-paper.md`.
+
 ### Performance report (reconciled)
 
 ```bash

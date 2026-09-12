@@ -53,7 +53,9 @@ from typing import Any
 from dotenv import load_dotenv
 
 from bot.executor import TailReader, _fraction_of
-from bot import robinhood_mcp_client, pnl_tracker
+from bot import pnl_tracker, swing_orders
+from bot.broker import create_broker
+from bot.broker.base import BrokerError, OwnershipBlocked
 
 log = logging.getLogger("bot.shadow_reviewer")
 
@@ -459,7 +461,7 @@ def review_one(
     # after Robinhood accepts but before the final record is written, the
     # PENDING entry prevents a re-attempt on restart.
     if _append_pending:
-        backend = "direct-mcp" if config.place_orders else "codex-review"
+        backend = "direct-broker" if config.place_orders else "codex-review"
         _append_record(
             ShadowRecord(status="PENDING", rationale=f"invoking {backend}", **base),
             config.ledger_path,
@@ -472,8 +474,8 @@ def review_one(
         # user consent — auto-cancelled in unattended mode.  The direct client
         # uses protocol 2025-03-26 (no elicitation) and avoids this entirely.
         try:
-            result = robinhood_mcp_client.place_order(proposal, expected)
-        except robinhood_mcp_client.OwnershipBlocked as exc:
+            result = swing_orders.place_swing_order(proposal, expected)
+        except OwnershipBlocked as exc:
             # Deterministic refusal before placement: no broker order exists.
             # The swing book keeps the CLOSE applied (nothing of ours is held).
             return ShadowRecord(
@@ -481,17 +483,17 @@ def review_one(
                 rationale=f"ownership check refused placement: {exc}",
                 **base,
             )
-        except robinhood_mcp_client.RobinhoodMCPError as exc:
+        except BrokerError as exc:
             return ShadowRecord(
                 status="UNVERIFIED",
-                rationale=f"direct MCP outcome requires broker reconciliation: {exc}",
+                rationale=f"direct broker outcome requires reconciliation: {exc}",
                 **base,
             )
         except Exception as exc:  # noqa: BLE001
             return ShadowRecord(
                 status="UNVERIFIED",
                 rationale=(
-                    "direct MCP unexpected outcome requires broker "
+                    "direct broker unexpected outcome requires "
                     f"reconciliation: {exc}"
                 ),
                 **base,
@@ -579,7 +581,7 @@ def _monitor_swing_stops(config: ShadowConfig) -> None:
 
     If price <= stop_loss, append a STOP_TRIGGER entry to swings.jsonl.  The
     executor turns it into a SELL proposal and this same process places it
-    through ``robinhood_mcp_client.place_order`` — the one sell path that sizes
+    through ``swing_orders.place_swing_order`` — the one sell path that sizes
     the order from swing-owned shares and records the fill in the P&L ledger.
 
     The monitor used to place its own market sell here *and* emit the
@@ -608,25 +610,26 @@ def _monitor_swing_stops(config: ShadowConfig) -> None:
         return
 
     try:
-        token = robinhood_mcp_client._load_token()
-        session = robinhood_mcp_client._MCPSession(token)
+        broker = create_broker(role="swing")
     except Exception as exc:
-        log.warning("stop monitor: cannot open MCP session: %s", exc)
+        log.warning("stop monitor: cannot connect to broker: %s", exc)
         return
 
+    try:
+        _check_swing_stops(config, broker, stops)
+    finally:
+        broker.close()
+
+
+def _check_swing_stops(config: ShadowConfig, broker, stops: dict[str, dict[str, Any]]) -> None:
     for ticker, pos in stops.items():
         stop_price: float = pos["stop_loss"]
         shares: float = pos.get("shares") or 0.0
         avg_price: float = pos.get("avg_price") or 0.0
 
         try:
-            data = session.call("get_equity_quotes", symbols=[ticker])
-            results = data.get("data", {}).get("results", [])
-            if not results:
-                continue
-            q = results[0].get("quote") or results[0]
-            ltp = q.get("last_trade_price")
-            current_price = float(ltp) if ltp is not None else None
+            quote = broker.quotes([ticker]).get(ticker)
+            current_price = quote.last if quote is not None else None
         except Exception as exc:
             log.warning("stop monitor: price fetch failed for %s: %s", ticker, exc)
             continue

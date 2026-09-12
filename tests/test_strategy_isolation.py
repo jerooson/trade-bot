@@ -19,12 +19,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from bot import day_trader, executor, position_ownership, robinhood_mcp_client, shadow_reviewer
+from bot import day_trader, executor, position_ownership, shadow_reviewer, swing_orders
+from bot.broker.base import OrderResult, OwnershipBlocked
 from bot.day_trader import DayPosition, ET, _start_or_retry_exit, _submit_or_recover_entry, _sync_heat_ideas, run_once
 from bot.executor import ExecutorConfig, VirtualBook, decide
 from bot.heat_ideas import is_plausible_trigger, materialize_heat_ideas, parse_heat_idea
-from bot.robinhood_mcp_client import OrderResult, OwnershipBlocked, RobinhoodMCPError
+from bot.robinhood_mcp_client import RobinhoodMCPError
 from bot.shadow_reviewer import ShadowConfig, review_one
+from tests.fake_broker import FakeBroker
 
 
 NOT_ENOUGH = (
@@ -148,32 +150,21 @@ def test_sellable_quantity_never_touches_the_other_strategy():
 
 
 # ---------------------------------------------------------------------------
-# robinhood_mcp_client.place_order
+# swing_orders.place_swing_order (broker-agnostic)
 # ---------------------------------------------------------------------------
 
-class _FakeSession:
-    def __init__(self, broker_qty: float):
-        self.broker_qty = broker_qty
-        self.placed: list[dict] = []
+class _FillingBroker(FakeBroker):
+    """Fills every placed order at 284.4425 on the first poll."""
 
-    def call(self, tool, **kwargs):
-        if tool == "get_accounts":
-            return {"data": {"accounts": [{"account_number": "A1", "agentic_allowed": True}]}}
-        if tool == "get_equity_tradability":
-            return {"data": {"results": [{"tradeable": True, "fractional_tradability": "tradable"}]}}
-        if tool == "get_equity_orders":
-            if "order_id" in kwargs:
-                return {"data": {"orders": [{
-                    "id": kwargs["order_id"], "state": "filled",
-                    "average_price": "284.4425", "cumulative_quantity": self.placed[-1]["quantity"],
-                }]}}
-            return {"data": {"orders": []}}
-        if tool == "get_equity_positions":
-            return {"data": {"positions": [{"symbol": "SPXL", "quantity": str(self.broker_qty)}]}}
-        if tool == "place_equity_order":
-            self.placed.append(kwargs)
-            return {"data": {"order": {"id": "ord-1", "state": "confirmed"}}}
-        raise AssertionError(f"unexpected tool {tool}")
+    def get_order(self, order_id, symbol=None):
+        order = self.orders.get(order_id)
+        if order is not None and not order.is_terminal:
+            self.fill(order_id, 284.4425, float(self.requests[-1].quantity or 0))
+        return super().get_order(order_id, symbol)
+
+    @property
+    def placed(self) -> list[dict]:
+        return [{"side": r.side, "quantity": r.quantity, "ref_id": r.ref_id} for r in self.requests]
 
 
 def _swing_sell_proposal(kind: str = "STOP_TRIGGER", shares_estimate: float = 0.035168) -> dict:
@@ -190,12 +181,10 @@ def _swing_sell_proposal(kind: str = "STOP_TRIGGER", shares_estimate: float = 0.
 
 
 def _place(proposal, broker_qty):
-    session = _FakeSession(broker_qty)
-    with patch.object(robinhood_mcp_client, "_load_token", return_value="tok"), \
-         patch.object(robinhood_mcp_client, "_MCPSession", return_value=session), \
-         patch.object(robinhood_mcp_client.time, "sleep"):
-        result = robinhood_mcp_client.place_order(proposal, 10.0)
-    return session, result
+    broker = _FillingBroker(holdings={"SPXL": broker_qty})
+    with patch.object(swing_orders.time, "sleep"):
+        result = swing_orders.place_swing_order(proposal, 10.0, broker=broker)
+    return broker, result
 
 
 def test_swing_stop_trigger_sells_only_swing_owned_shares(ledgers):
@@ -256,7 +245,7 @@ def test_review_one_records_blocked_when_ownership_refuses(tmp_path):
     proposal = _swing_sell_proposal()
     proposal["decided_at"] = datetime.now(timezone.utc).isoformat()
     with patch.object(
-        shadow_reviewer.robinhood_mcp_client, "place_order",
+        shadow_reviewer.swing_orders, "place_swing_order",
         side_effect=OwnershipBlocked("nothing sellable"),
     ):
         record = review_one(proposal, _shadow_config(tmp_path), _append_pending=False)
@@ -273,19 +262,15 @@ def test_stop_monitor_emits_stop_trigger_without_placing_an_order(tmp_path):
         "ticker": "NOK", "shares": 0.93, "avg_price": 6.5, "deployed_usd": 6.0,
         "stop_loss": 6.2, "stop_loss_label": "$6.20",
     }}}), encoding="utf-8")
-    session = MagicMock()
-    session.call.side_effect = lambda tool, **kw: (
-        {"data": {"results": [{"quote": {"last_trade_price": "6.10"}}]}}
-        if tool == "get_equity_quotes" else (_ for _ in ()).throw(AssertionError(tool))
-    )
+    broker = FakeBroker()
+    broker.set_quote("NOK", 6.10)
     with patch.object(shadow_reviewer, "_is_market_open", return_value=True), \
-         patch.object(shadow_reviewer.robinhood_mcp_client, "_load_token", return_value="tok"), \
-         patch.object(shadow_reviewer.robinhood_mcp_client, "_MCPSession", return_value=session):
+         patch.object(shadow_reviewer, "create_broker", return_value=broker):
         shadow_reviewer._monitor_swing_stops(config)
         # Second check with the executor still down: no duplicate trigger.
         shadow_reviewer._monitor_swing_stops(config)
-    tools = [c.args[0] for c in session.call.call_args_list]
-    assert tools == ["get_equity_quotes", "get_equity_quotes"]
+    assert [c[0] for c in broker.calls] == ["quotes", "quotes"]
+    assert not broker.requests
     rows = [json.loads(line) for line in config.swings_path.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
     assert rows[0]["kind"] == "STOP_TRIGGER" and rows[0]["ticker"] == "NOK"
@@ -377,10 +362,8 @@ def _open_spxl() -> DayPosition:
     )
 
 
-def _session_with_broker_qty(qty: float) -> MagicMock:
-    session = MagicMock()
-    session.call.return_value = {"data": {"positions": [{"symbol": "SPXL", "quantity": str(qty)}]}}
-    return session
+def _session_with_broker_qty(qty: float) -> FakeBroker:
+    return FakeBroker(holdings={"SPXL": qty})
 
 
 def test_exit_shortfall_with_no_shares_ends_unreconciled_without_pnl(ledgers):
@@ -475,8 +458,7 @@ def test_unreconciled_positions_are_ignored_by_the_poll_loop(ledgers):
     pos.status = "unreconciled"
     with patch.object(day_trader, "_load_new_plans", return_value=[]), \
          patch.object(day_trader, "load_plans", return_value=[]), \
-         patch.object(day_trader, "_MCPSession") as session, \
-         patch.object(day_trader, "_load_token", return_value="tok"), \
+         patch.object(day_trader, "_connect_broker") as session, \
          patch.object(day_trader, "_flush_positions"), \
          patch.object(day_trader, "datetime") as m_dt:
         m_dt.now.return_value = datetime(2026, 9, 3, 10, 0, tzinfo=ET)
@@ -537,9 +519,7 @@ def _run_watch(pos: DayPosition, price: float) -> None:
     }]
     with patch.object(day_trader, "_load_new_plans", return_value=[]), \
          patch.object(day_trader, "load_plans", return_value=plans), \
-         patch.object(day_trader, "_load_token", return_value="tok"), \
-         patch.object(day_trader, "_MCPSession", return_value=MagicMock()), \
-         patch.object(day_trader, "_get_agentic_account", return_value="acct"), \
+         patch.object(day_trader, "_connect_broker", return_value=(MagicMock(), "acct")), \
          patch.object(day_trader, "_get_prices", return_value={pos.ticker: price}), \
          patch.object(day_trader, "_place_fractional_market_buy") as buy, \
          patch.object(day_trader, "_flush_positions"), \
