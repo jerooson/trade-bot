@@ -35,3 +35,6 @@ Thumbs.db
 
 # Personal Claude Code overrides
 .claude/settings.local.json
+
+# Research data (bar cache + signal datasets built from private ledgers)
+data/
