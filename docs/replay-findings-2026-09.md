@@ -118,7 +118,7 @@ currently buys within seconds.
   optimistic, relative rankings are the usable output.
 - Milestones confirm on 1-minute closes; the live bot confirms on 5-second
   polls and locks in slightly sooner.
-- Heat's chart-only ideas (82 % of them) are missing. Building levels for
-  those (chart analyzer output plus manual review) is the next dataset job.
-- 122 entries over five months cannot separate a +0.2 % edge from zero;
+- Chart levels were read by one reviewer from static screenshots; a second
+  pass, or the chart analyzer's own reads, would show how stable they are.
+- 147 entries over five months cannot separate a +0.2 % edge from zero;
   the value here is in the rankings and the slippage measurement.
