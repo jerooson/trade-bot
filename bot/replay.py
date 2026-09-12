@@ -71,7 +71,7 @@ class Policy:
 # Sessions a level stays live in the replay, per source.  Discord plans carry
 # into the next session; Heat and manual watches are good-til-cancelled and
 # have filled up to two weeks after posting.
-SESSIONS_BY_SOURCE = {"discord": 2, "heat": 10, "manual": 10}
+SESSIONS_BY_SOURCE = {"discord": 2, "heat": 10, "manual": 10, "scan": 10, "random": 10}
 
 
 POLICIES = [
