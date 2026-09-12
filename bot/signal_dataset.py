@@ -110,10 +110,29 @@ def discord_rows(paths: Iterable[Path]) -> list[SignalRow]:
     return list(rows.values())
 
 
-def heat_rows(ideas_path: Path, decisions_path: Path | None) -> list[SignalRow]:
+def load_reviewed_levels(path: Path | None) -> dict[str, dict[str, Any]]:
+    """Chart levels read by a human/LLM reviewer: {idea_id: row}.
+
+    Rows carry ``level`` (or null), ``operator``, ``kind``, ``confidence``
+    (0-1) and an optional ``target``.  Only rows with a level and
+    confidence >= 0.5 are used as executable levels; the rest document why
+    an idea has none.
+    """
+    if not path or not path.exists():
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for rec in read_jsonl(path):
+        if rec.get("id"):
+            out[str(rec["id"])] = rec
+    return out
+
+
+def heat_rows(ideas_path: Path, decisions_path: Path | None,
+              reviewed_path: Path | None = None) -> list[SignalRow]:
     ideas = materialize_heat_ideas(
         read_jsonl(ideas_path), read_jsonl(decisions_path) if decisions_path else (),
     )
+    reviewed = load_reviewed_levels(reviewed_path)
     rows: list[SignalRow] = []
     for idea in ideas:
         ticker = str(idea.get("ticker") or "").upper()
@@ -124,12 +143,24 @@ def heat_rows(ideas_path: Path, decisions_path: Path | None) -> list[SignalRow]:
         if direction not in ("long", "short"):
             continue
         trigger = idea.get("trigger_price")
+        target = idea.get("target_price")
+        operator = str(idea.get("trigger_operator") or "above")
         notes: list[str] = []
         classification = str(idea.get("classification") or "")
         if classification in ("position_update", "market_context", "swing_dca"):
             continue
         if trigger is not None and not is_plausible_trigger(float(trigger), None):
             trigger = None
+        review = reviewed.get(str(idea.get("id")))
+        if trigger is None and review:
+            if review.get("level") and float(review.get("confidence") or 0) >= 0.5:
+                trigger = float(review["level"])
+                operator = str(review.get("operator") or operator)
+                if review.get("target") is not None:
+                    target = review["target"]
+                notes.append(f"chart_level:{review.get('kind')}:{review.get('confidence')}")
+            else:
+                notes.append(f"chart_reviewed_no_level:{review.get('kind')}")
         if idea.get("decision") == "rejected":
             notes.append("operator_rejected")
         if trigger is None:
@@ -140,8 +171,8 @@ def heat_rows(ideas_path: Path, decisions_path: Path | None) -> list[SignalRow]:
         rows.append(SignalRow(
             id=f"heat:{idea.get('id')}", source="heat", ticker=ticker,
             trigger=float(trigger) if trigger is not None else None,
-            operator=str(idea.get("trigger_operator") or "above"), direction=direction,
-            target=float(idea["target_price"]) if idea.get("target_price") is not None else None,
+            operator=operator, direction=direction,
+            target=float(target) if target is not None else None,
             posted_at=posted.isoformat(), session=session_date_for(posted).isoformat(),
             execution=execution, leverage=leverage,
             setup=idea.get("setup"), text=idea.get("text"), notes=notes,
@@ -220,10 +251,11 @@ def attach_actuals(rows: list[SignalRow], positions_path: Path | None) -> int:
 # ---------------------------------------------------------------------------
 
 def build(discord: list[Path], heat: Path | None, heat_decisions: Path | None,
-          manual: Path | None, positions: Path | None) -> list[SignalRow]:
+          manual: Path | None, positions: Path | None,
+          heat_reviewed: Path | None = None) -> list[SignalRow]:
     rows = discord_rows(discord)
     if heat:
-        rows += heat_rows(heat, heat_decisions)
+        rows += heat_rows(heat, heat_decisions, heat_reviewed)
     rows += manual_rows(manual)
     attach_actuals(rows, positions)
     rows.sort(key=lambda r: r.posted_at)
@@ -273,10 +305,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--discord", type=Path, action="append", default=[])
     parser.add_argument("--heat", type=Path)
     parser.add_argument("--heat-decisions", type=Path)
+    parser.add_argument("--heat-reviewed", type=Path,
+                        help="reviewed chart levels (data/heat_levels_reviewed.jsonl)")
     parser.add_argument("--manual", type=Path)
     parser.add_argument("--positions", type=Path)
     args = parser.parse_args(argv)
-    rows = build(args.discord, args.heat, args.heat_decisions, args.manual, args.positions)
+    rows = build(args.discord, args.heat, args.heat_decisions, args.manual, args.positions,
+                 heat_reviewed=args.heat_reviewed)
     write_dataset(rows, args.out)
     by_source: dict[str, list[SignalRow]] = {}
     for row in rows:

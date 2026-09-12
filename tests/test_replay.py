@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -132,3 +133,27 @@ def test_summary_groups_by_policy_and_source():
     r = simulate(_row(), _bars(closes), _bars(closes), POLICIES[0], session=DAY, armed=True)
     s = summarize([r])
     assert s["live/discord"]["entered"] == 1 and s["live/all"]["win_rate"] == 100.0
+
+
+def test_reviewed_chart_levels_fill_heat_ideas_without_numeric_levels(tmp_path):
+    from bot.signal_dataset import heat_rows
+    ideas = tmp_path / "heat.jsonl"
+    ideas.write_text(json.dumps({
+        "event_type": "idea", "id": "h1", "ticker": "PLTR", "trigger_price": None,
+        "text": "PLTR 黄线强阻力，关注能否站上去", "direction": "long", "trigger_operator": "above",
+        "auto_eligible": False, "classification": "needs_level",
+        "created_at": "2026-08-05T15:43:00+00:00", "attachments": ["x-0.png"],
+    }) + "\n", encoding="utf-8")
+    reviewed = tmp_path / "reviewed.jsonl"
+    reviewed.write_text(
+        json.dumps({"id": "h1", "level": 162.4, "operator": "above", "kind": "yellow_line", "confidence": 0.85}) + "\n"
+        + json.dumps({"id": "h2", "level": 10.0, "operator": "above", "kind": "guess", "confidence": 0.3}) + "\n",
+        encoding="utf-8",
+    )
+    rows = heat_rows(ideas, None, reviewed)
+    assert len(rows) == 1 and rows[0].trigger == 162.4
+    assert any(n.startswith("chart_level:yellow_line") for n in rows[0].notes)
+    # A low-confidence review never becomes a level.
+    ideas.write_text(ideas.read_text(encoding="utf-8").replace('"h1"', '"h2"'), encoding="utf-8")
+    rows = heat_rows(ideas, None, reviewed)
+    assert rows[0].trigger is None and "chart_reviewed_no_level:guess" in rows[0].notes
