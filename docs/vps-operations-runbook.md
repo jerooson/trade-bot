@@ -470,3 +470,18 @@ trader never turns them into watches. Heat ideas and manual watches are not
 affected. Set it back to `execute` (the default) and restart the day trader to
 resume trading them. Enabled on the VPS on 2026-09-12 together with
 `DAY_TRADE_BUDGET_USD=50`, so the day P&L from that date on is Heat-only.
+
+## Heat option shadow tracker (paper)
+
+`trade-bot-option-shadow.service` runs `python -m bot.option_shadow` on the
+host. It watches every approved Heat idea, and when the underlying crosses the
+trigger it records a paper purchase of the nearest-expiry at-the-money option
+(call for long, put for short) at the ask, then applies Heat's mechanical
+rules: sell half at +50 %, cut to a runner at +100 % or at the target, sell all
+at -30 %, after five minutes past the trigger against the position, or at
+15:50 ET. It never places orders. Ledger: `logs/option_shadow.jsonl`; open
+state: `state/option_shadow.json`. Summary:
+
+```
+.venv/bin/python -m bot.option_shadow --report
+```
