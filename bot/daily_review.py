@@ -387,6 +387,25 @@ def send_email(subject: str, body_md: str) -> str | None:
     return None
 
 
+def send_discord(subject: str, body_md: str, filename: str) -> str | None:
+    """Post the review to a Discord webhook (REVIEW_DISCORD_WEBHOOK): short text plus the markdown as a file."""
+    import os
+    import httpx
+    url = os.getenv("REVIEW_DISCORD_WEBHOOK", "").strip()
+    if not url:
+        return "discord not configured"
+    # Discord messages cap at 2000 chars: send the head inline, the full page as an attachment.
+    head = body_md.split("\n## Heat feed", 1)[0].strip()
+    content = f"**{subject}**\n{head}"[:1900]
+    try:
+        r = httpx.post(url, data={"content": content}, files={"file": (filename, body_md.encode("utf-8"), "text/markdown")}, timeout=30)
+        if r.status_code >= 300:
+            return f"discord failed: {r.status_code} {r.text[:120]}"
+    except httpx.HTTPError as exc:
+        return f"discord failed: {exc}"[:200]
+    return None
+
+
 def write(day: date, paths: Paths | None = None, *, with_narrative: bool = False, email: bool = False) -> Path:
     paths = paths or Paths()
     r = build(day, paths)
@@ -398,7 +417,9 @@ def write(day: date, paths: Paths | None = None, *, with_narrative: bool = False
     md = paths.out_dir / f"{day.isoformat()}.md"
     md.write_text(render_markdown(r), encoding="utf-8")
     if email:
-        r["email_error"] = send_email(f"Trade bot review {day.isoformat()}", md.read_text(encoding="utf-8"))
+        text = md.read_text(encoding="utf-8")
+        r["email_error"] = send_email(f"Trade bot review {day.isoformat()}", text)
+        r["discord_error"] = send_discord(f"Trade bot review {day.isoformat()}", text, md.name)
     (paths.out_dir / f"{day.isoformat()}.json").write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
     return md
 
@@ -418,6 +439,7 @@ def main(argv: list[str] | None = None) -> None:
         meta = json.loads((md.with_suffix(".json")).read_text(encoding="utf-8"))
         print("narrative:", "ok" if meta.get("narrative") else meta.get("narrative_error", "skipped"))
         print("email:", meta.get("email_error") or "sent")
+        print("discord:", meta.get("discord_error") or "sent")
     if args.print:
         print(md.read_text(encoding="utf-8"))
 

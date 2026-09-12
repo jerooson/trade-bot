@@ -501,4 +501,7 @@ them under Review (`/api/review`, `/api/review/<date>` or `latest`).
 - `--email` sends the markdown by SMTP when `REVIEW_EMAIL_TO`,
   `REVIEW_SMTP_USER` and `REVIEW_SMTP_PASSWORD` (a Gmail App Password) are
   set in `.env`; otherwise it only writes the files.
+- `REVIEW_DISCORD_WEBHOOK` posts the review to a Discord webhook over HTTPS
+  (head inline, full markdown attached). DigitalOcean blocks outbound SMTP
+  ports 465/587 from this droplet, so this is the working delivery path.
 - Regenerate a day by hand: `.venv/bin/python -m bot.daily_review --date 2026-09-14 --print`.

@@ -74,3 +74,8 @@ def test_narrative_skips_on_usage_limit(monkeypatch):
 def test_email_not_configured(monkeypatch):
     monkeypatch.delenv("REVIEW_EMAIL_TO", raising=False)
     assert dr.send_email("s", "b") == "email not configured"
+
+
+def test_discord_not_configured(monkeypatch):
+    monkeypatch.delenv("REVIEW_DISCORD_WEBHOOK", raising=False)
+    assert dr.send_discord("s", "# x\n\n## Heat feed\n- a", "x.md") == "discord not configured"
