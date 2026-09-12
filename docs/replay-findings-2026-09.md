@@ -164,3 +164,62 @@ Implications: a fully automatic "Heat without Heat" is not supported by
 this evidence. What the scanner *is* good for is the opposite direction:
 turning Heat's chart-only posts into executable levels automatically
 (17/21 recall) so the live bot no longer waits for a typed number.
+
+## 6. What Heat selects: feature table (Heat 52 vs scanner 258 vs random 255)
+
+`bot/features.py` computes, for every replayed entry, features knowable at
+signal time (market position, 20-day relative strength, distance to the
+21-day SMA, ATR, prior-day volume ratio, breakout-minute volume ratio, entry
+hour) and compares the distributions. Medians, live policy:
+
+| Feature | Heat | Scanner | Random | effect (sd) |
+|---|---:|---:|---:|---:|
+| ret20 (%) | **-0.8** | +5.7 | +6.1 | -0.45 |
+| rs20 vs SPY (%) | **0.0** | +3.6 | +3.8 | -0.48 |
+| dist to SMA21 (%) | **+0.3** | +4.4 | +3.9 | -0.60 |
+| above SMA21 | 56 % | 83 % | 78 % | -0.65 |
+| above SMA50 | 47 % | 65 % | 61 % | -0.37 |
+| ATR14 (%) | **3.4** | 5.1 | 5.7 | -0.56 |
+| level distance (%) | **1.3** | 2.9 | 3.5 | -0.28 |
+| SPY vs 8d / 21d | same | same | same | ~0 |
+| prior-day volume ratio | 0.83 | 0.94 | 0.92 | -0.11 |
+| breakout-minute volume ratio | 0.87 | 1.06 | 1.20 | -0.13 |
+
+Heat is not buying momentum breakouts. His names have gone nowhere for 20
+days, sit on the 21-day average, are calmer than the scanner's, and the
+line is close (1.3 % away). The scanner, by construction, buys prior highs
+in names that are already up 6 % in a month and 4 % above their 21-day:
+that is chasing. Market-regime and volume features do **not** separate the
+groups, so "add a market filter" or "add a volume filter" would not have
+been the right guess.
+
+Turning the difference into a filter is where it gets honest:
+
+| Filter on scanner rows | n | avg % | win % | same filter on random |
+|---|---:|---:|---:|---|
+| near SMA21 (<=2 %) and ret20 <= 2 % | 60 | +0.37 ± 0.29 | 48 | +0.52 ± 0.29 (n=66) |
+| + ATR <= 4.5 % | 20 | +1.17 ± 0.57 | 60 | +0.04 ± 0.62 (n=14) |
+| breakout-minute volume >= 1.5x | 93 | +0.44 ± 0.23 | 48 | +0.26 ± 0.24 (n=102) |
+| breakout volume >= 1.5x, quiet prior day | 61 | +0.49 ± 0.31 | 48 | |
+| entry before 10:00 ET | 137 | +0.16 | 48 | +0.16 |
+
+- The "pullback" filter helps the random control as much as the scanner:
+  in this window it is a general mean-reversion effect, not a prior-high
+  effect. The three-way filter that looks best (n=20) is too small to
+  believe, and Heat's own trades that satisfy it did *worse* (+0.44 %,
+  n=15) than the ones that do not (+1.00 %, n=37), so it does not capture
+  what makes his picks good.
+- Breakout-minute volume is the one feature with a prior-high-specific
+  tilt (scanner +0.44 vs +0.03 below 1.5x, and Discord +0.92 vs +0.05),
+  but the same cut lifts random levels too (+0.26 vs +0.13), and Heat's
+  own entries are mostly low-volume (median 0.87x). Worth a forward test
+  as an entry filter; not a substitute for selection.
+- Heat's edge is concentrated in his early entries: before 10:00 ET
+  +1.81 % (n=19) vs +0.28 % after; the scanner shows no such split. His
+  early trades are levels posted the day before that fill at the open.
+
+Net: the feature table explains *what* Heat picks (quiet names resting on
+the 21-day with a nearby prior high) but no mechanical version of that
+description reproduces his result on out-of-sample symbol-days. The next
+honest test is forward, not backward: run the scanner with the breakout
+-volume filter on paper next to the live Heat feed for a month.
