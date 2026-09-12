@@ -500,13 +500,13 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
         rows_.append([t["ticker"], t["execution"] or "", "", t["entered"], {"pending_exit": "平仓", "open": "持仓", "unreconciled": "对账"}.get(t["status"], "其他"), "", ""])
     for t in d["failed"]:
         rows_.append([t["ticker"], "", "", "", "失败", "", ""])
-    fields += _table_fields("📈 日内交易", head, ["票", "执行标的", "来源", "进-出", "原因", "盈亏", "%"], rows_, widths=[5, 8, 6, 11, 4, 7, 7])
+    fields += _table_fields("📈 日内交易", head, ["sym", "exec", "src", "in-out", "exit", "P&L", "%"], rows_, widths=[5, 8, 6, 11, 4, 7, 7])
     if d["still_watching"]:
         fields.append(_field("👀 挂单等待", [", ".join(f"{w['ticker']}@{w['trigger']:.2f} ({w['source']})" for w in d["still_watching"][:10])]))
 
     summary = f"{h['count']} 条 · 自动批准 {len(h['approved'])} · 待审 {len(h['needs_review'])} · 期权帖 {len(h['option_posts'])}"
     fields += _table_fields("🔥 Heat 信号 → bot 动作", summary,
-                            ["时间", "票", "Heat价位", "解析", "bot结果"],
+                            ["time", "sym", "level", "parse", "bot result"],
                             [[_when(x, r["date"]), x["ticker"] or "?", _level(x), _parse_label(x), _outcome_label(x)] for x in r["heat_vs_bot"]],
                             widths=[11, 5, 9, 6, 22])
 
@@ -520,11 +520,11 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
     opt_rows += [[x["time"], x["ticker"], "", {"eod": "收盘", "stop_30pct": "止损", "stop_level": "破位",
                                                "trim_half_50pct": "减半", "trim_runner_100pct": "跑者", "trim_runner_target": "目标"}.get(x["exit_reason"], "其他"),
                   _sign(x["realized_pct"]), f"max {_sign(x['max_gain_pct'])}"] for x in o["closed"]]
-    fields += _table_fields("🎯 期权影子（纸面）", opt_head, ["时间", "票", "合约", "动作", "结果", "最高浮盈"], opt_rows, widths=[5, 5, 16, 4, 8, 12])
+    fields += _table_fields("🎯 期权影子（纸面）", opt_head, ["time", "sym", "contract", "act", "result", "max"], opt_rows, widths=[5, 5, 16, 4, 8, 12])
 
     sw_head = f"信号 {len(sw['signals'])} · 审核 " + (", ".join(f"{k} {v}" for k, v in sw["reviews_by_status"].items()) or "无") + f" · 成交 {sw['fills']}"
     sw_rows = [[p["ticker"], p["kind"], f"${p['usd']}"] for p in sw["placed"]]
-    fields += _table_fields("🌊 Swing", sw_head, ["票", "动作", "金额"], sw_rows, widths=[6, 14, 8])
+    fields += _table_fields("🌊 Swing", sw_head, ["sym", "action", "usd"], sw_rows, widths=[6, 14, 8])
 
     t = r.get("totals") or {}
     tot_rows = []
@@ -534,7 +534,7 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
             tot_rows.append([label, str(v["count"]), _sign(v.get("net"), True), f"{v['wins'] / v['count'] * 100:.0f}%", str(v.get("profit_factor"))])
     combined = t.get("combined") if isinstance(t.get("combined"), dict) else {}
     tot_head = f"合计已实现 {_sign(combined.get('combined_realized'), True)}" if combined else ""
-    fields += _table_fields("Σ 累计", tot_head, ["策略", "笔数", "净利", "胜率", "PF"], tot_rows, widths=[6, 5, 9, 5, 6])
+    fields += _table_fields("Σ 累计", tot_head, ["strat", "n", "net", "win", "PF"], tot_rows, widths=[6, 5, 9, 5, 6])
 
     health = []
     hb = hl["day_trader_heartbeat_age_min"]
