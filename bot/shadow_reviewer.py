@@ -196,13 +196,20 @@ def _warn_stale_pending(path: Path) -> None:
     """
     if not path.exists():
         return
+    latest: dict[str, dict[str, Any]] = {}
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if row.get("status") == "PENDING":
+            key = str(row.get("dedupe_key") or "")
+            if key:
+                latest[key] = row
+    for row in latest.values():
+        # Only a PENDING row with no later final row for the same key is
+        # stale; a PENDING followed by PLACED/SKIPPED is the normal sequence.
+        if row.get("status") == "PENDING":
                 log.warning(
                     "STALE PENDING record found — manual broker reconciliation required: "
                     "key=%s ticker=%s reviewed_at=%s; "

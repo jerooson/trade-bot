@@ -397,6 +397,24 @@ def test_warn_stale_pending_emits_warning(tmp_path, caplog):
     assert "HOOD" in caplog.text
 
 
+def test_warn_stale_pending_ignores_pending_followed_by_final_row(tmp_path, caplog):
+    ledger = tmp_path / "ledger.jsonl"
+    rows = [
+        {"status": "PENDING", "dedupe_key": "1:NOK:ENTRY", "ticker": "NOK",
+         "reviewed_at": "2026-09-08T16:09:16+00:00"},
+        {"status": "PLACED", "dedupe_key": "1:NOK:ENTRY", "ticker": "NOK",
+         "reviewed_at": "2026-09-08T16:09:16+00:00"},
+        {"status": "PENDING", "dedupe_key": "2:SNOW:REDUCE", "ticker": "SNOW",
+         "reviewed_at": "2026-09-02T20:08:37+00:00"},
+    ]
+    ledger.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    import logging
+    with caplog.at_level(logging.WARNING, logger="bot.shadow_reviewer"):
+        _warn_stale_pending(ledger)
+    assert "NOK" not in caplog.text
+    assert "SNOW" in caplog.text
+
+
 def test_warn_stale_pending_silent_when_no_pending(tmp_path, caplog):
     ledger = tmp_path / "ledger.jsonl"
     row = {"status": "PLACED", "dedupe_key": "123:HOOD:ENTRY", "ticker": "HOOD",

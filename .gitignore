@@ -32,3 +32,6 @@ Thumbs.db
 
 # Private runtime ledgers downloaded for reviews
 .review-*/
+
+# Personal Claude Code overrides
+.claude/settings.local.json
