@@ -11,6 +11,7 @@ import { Sidebar, type ViewId } from "./components/Sidebar";
 import { DayTradeView } from "./components/DayTradeView";
 import { WatchlistView } from "./components/WatchlistView";
 import { SwingTradeView } from "./components/SwingTradeView";
+import { ReviewView } from "./components/ReviewView";
 import { ChatPanel } from "./components/ChatPanel";
 import { Footer } from "./components/Footer";
 
@@ -114,6 +115,7 @@ export default function App() {
               executorError={executorData.error}
             />
           )}
+          {view === "review" && <ReviewView />}
         </div>
       </div>
 

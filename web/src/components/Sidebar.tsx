@@ -1,7 +1,7 @@
 import clsx from "clsx";
-import { Activity, ListTodo, Zap, type LucideIcon } from "lucide-react";
+import { Activity, BookOpen, ListTodo, Zap, type LucideIcon } from "lucide-react";
 
-export type ViewId = "daytrade" | "watchlist" | "swing";
+export type ViewId = "daytrade" | "watchlist" | "swing" | "review";
 
 interface NavItem {
   id: ViewId;
@@ -35,6 +35,7 @@ export function Sidebar({
     { id: "daytrade",  label: "Day Trade",     sublabel: "Plans · Active · P&L",       badge: activeDayTradesCount, highlight: activeDayTradesCount > 0, icon: Zap },
     { id: "watchlist", label: "Watchlist",     sublabel: "Swing trade plans",          badge: planCount,          icon: ListTodo },
     { id: "swing",     label: "Swing",         sublabel: "Positions · P&L · Book",     badge: openPositionsCount, highlight: openPositionsCount > 0 || pnlTradeCount > 0, icon: Activity },
+    { id: "review",    label: "Review",        sublabel: "Daily review",               icon: BookOpen },
   ];
 
   return (

@@ -689,6 +689,42 @@ def get_performance() -> dict[str, Any]:
     )
 
 
+REVIEWS_DIR = LOG_DIR / "reviews"
+_REVIEW_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+@app.get("/api/review")
+def list_reviews() -> dict[str, Any]:
+    """Dates that have a generated daily review, newest first."""
+    if not REVIEWS_DIR.exists():
+        return {"dates": []}
+    dates = sorted((p.stem for p in REVIEWS_DIR.glob("*.md") if _REVIEW_DATE_RE.match(p.stem)), reverse=True)
+    return {"dates": dates}
+
+
+@app.get("/api/review/{day}")
+def get_review(day: str) -> dict[str, Any]:
+    """One daily review: markdown plus the structured report."""
+    if day == "latest":
+        dates = list_reviews()["dates"]
+        if not dates:
+            raise HTTPException(status_code=404, detail="no reviews yet")
+        day = dates[0]
+    if not _REVIEW_DATE_RE.match(day):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    md_path = REVIEWS_DIR / f"{day}.md"
+    if not md_path.exists():
+        raise HTTPException(status_code=404, detail=f"no review for {day}")
+    json_path = REVIEWS_DIR / f"{day}.json"
+    report: dict[str, Any] | None = None
+    if json_path.exists():
+        try:
+            report = json.loads(json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            report = None
+    return {"date": day, "markdown": md_path.read_text(encoding="utf-8"), "report": report}
+
+
 def _latest_day_trade_positions() -> list[dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     if not DAY_TRADE_POSITIONS_PATH.exists():

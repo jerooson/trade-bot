@@ -485,3 +485,20 @@ state: `state/option_shadow.json`. Summary:
 ```
 .venv/bin/python -m bot.option_shadow --report
 ```
+
+## Daily review
+
+`trade-bot-daily-review.timer` runs `python -m bot.daily_review --narrative --email`
+at 16:15 ET on weekdays. It writes `logs/reviews/<date>.md` and `.json`
+(Heat feed, chart analyzer output, day trades with slippage and exits, a
+"Heat said / bot did" reconciliation, recorded-only Discord plans, option
+shadow results, swing activity, running totals, health). The dashboard shows
+them under Review (`/api/review`, `/api/review/<date>` or `latest`).
+
+- `--narrative` asks the Codex CLI (ChatGPT login on the host) for a short
+  Chinese summary; on a quota error the review is still written and sent,
+  with a one-line note instead of the summary.
+- `--email` sends the markdown by SMTP when `REVIEW_EMAIL_TO`,
+  `REVIEW_SMTP_USER` and `REVIEW_SMTP_PASSWORD` (a Gmail App Password) are
+  set in `.env`; otherwise it only writes the files.
+- Regenerate a day by hand: `.venv/bin/python -m bot.daily_review --date 2026-09-14 --print`.

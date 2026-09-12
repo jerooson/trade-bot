@@ -33,7 +33,7 @@ _MIXED_CASE_TICKERS = {
 }
 _BLOCKED_TICKERS = {
     "AH", "AI", "ATH", "CALL", "CUP", "DCA", "EMA", "EOD", "ETF",
-    "FIB", "HOD", "LOD", "LONG", "MA", "OTM", "PM", "POC", "PUT",
+    "FIB", "HOD", "LOD", "LONG", "MA", "OK", "OTM", "PM", "POC", "PUT",
     "RSI", "SHORT", "SL", "SPX", "TP", "TRIM", "USD", "VAH", "VAL",
     "VWAP", "YDH", "YDL",
 }
