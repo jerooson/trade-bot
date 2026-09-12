@@ -169,9 +169,20 @@ def simulate(
             if arms(b.close):
                 armed = True
             continue
+        if policy.entry_mode == "close":
+            # Confirmation rule: act only once a full minute has closed beyond
+            # the level, and pay that close (not the level) for the delay.
+            if crossed(b.close):
+                past_guard = b.close < guard if row.operator == "below" else b.close > guard
+                if past_guard:
+                    armed = False
+                    continue
+                entry_idx = i
+                entry_risk = b.close
+                break
+            continue
         beyond = b.open < guard if row.operator == "below" else b.open > guard
-        seen = (b.high if row.operator == "above" else b.low) if policy.entry_mode == "touch" else b.close
-        if crossed(seen):
+        if crossed(b.high if row.operator == "above" else b.low):
             if beyond:
                 # Gapped past the entry cap at this bar's open: live re-arms
                 # (GTC) or expires (Discord).  Either way no fill this bar.

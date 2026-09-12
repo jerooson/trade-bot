@@ -24,6 +24,11 @@ Execution goes through a broker adapter (`bot/broker/`): `BROKER=robinhood`
 full pipeline against the IBKR paper account first; see
 [docs/ibkr-paper.md](docs/ibkr-paper.md).
 
+Research tooling: `bot/signal_dataset.py` (one row per executable level from
+every source), `bot/market_data.py` (IBKR 1-minute bar cache) and
+`bot/replay.py` (re-runs the live day-trade rules and variants on those
+bars). Findings so far: [docs/replay-findings-2026-09.md](docs/replay-findings-2026-09.md).
+
 The swing executor and the day trader share one Robinhood account. Each
 strategy sells only the shares it owns (`bot/position_ownership.py`) and will
 not open a position in a symbol the other strategy holds. A reconciled

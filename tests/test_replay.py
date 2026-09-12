@@ -114,7 +114,11 @@ def test_close_entry_mode_ignores_a_wick_through_the_level():
     bars = _bars(closes, ohlc={5: (100.0, 101.4, 100.0, 100.5)})   # wick to 101.4, closes 100.5
     touch = simulate(_row(), bars, bars, Policy("t", entry_mode="touch"), session=DAY, armed=True)
     close = simulate(_row(), bars, bars, Policy("c", entry_mode="close"), session=DAY, armed=True)
-    assert touch.entered and not close.entered
+    assert touch.entered and touch.entry_price == 101.0 and not close.entered
+    # A confirmed close pays the close, not the level.
+    confirmed = _bars([100.0] * 5 + [101.15] + [101.0] * 384)
+    c = simulate(_row(), confirmed, confirmed, Policy("c", entry_mode="close"), session=DAY, armed=True)
+    assert c.entered and c.entry_price == 101.15
 
 
 def test_session_date_rolls_after_close_and_over_weekends():
