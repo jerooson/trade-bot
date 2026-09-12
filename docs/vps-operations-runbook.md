@@ -271,6 +271,52 @@ systemctl status trade-bot-shadow-review --no-pager
 journalctl -u trade-bot-shadow-review -n 100 --no-pager
 ```
 
+### Performance report (reconciled)
+
+```bash
+cd ~/trade-bot
+.venv/bin/python -m bot.performance
+.venv/bin/python -m bot.performance --json > /tmp/performance.json
+```
+
+The report splits day trades by source (`discord` / `heat` / `manual`), month
+and exit reason, values every swing sell on the swing-owned quantity only,
+re-allocates any fill that exceeded swing ownership to the day trade that lost
+those shares, shows open P&L from the last polled quote, and ends with an
+**omissions** list. Read the omissions before the totals: a sell without a
+fill, an `unreconciled` day exit, or a `PENDING`/`UNVERIFIED` review means the
+totals are incomplete. The same data is served at `GET /api/performance`.
+
+### Strategy isolation and unreconciled day trades
+
+The swing executor and the day trader share one Robinhood account. Each
+strategy now sells only the shares it owns (`bot/position_ownership.py`), a
+swing `ENTRY` is rejected while the day trader holds the symbol, and a day
+trade waits while the swing book holds its execution symbol. Both guards are
+on by default:
+
+```dotenv
+EXECUTOR_BLOCK_SHARED_TICKERS=true
+DAY_TRADE_BLOCK_SHARED_TICKERS=true
+```
+
+When the broker refuses a day-trade exit with "Not enough shares to sell", the
+day trader reads the account quantity and the swing book, sells only the part
+that cannot belong to the swing strategy, and records the rest as
+`unreconciled_qty` with a `reconciliation_note`. A lifecycle with nothing
+sellable ends in status `unreconciled`: it is no longer polled, no P&L is
+invented, and it appears under `pnl.omissions.unreconciled` in
+`GET /api/daytrader`. Repair the accounting from the Robinhood order history
+(the `/api/performance` re-allocation shows the evidence-based split) before
+treating the totals as complete.
+
+A watch whose trigger is more than `DAY_TRADE_TRIGGER_MAX_RATIO` (default 2)
+times away from the live quote is quarantined (`exit_reason =
+implausible_trigger`, `quarantine_reason` set) instead of armed. Heat ideas
+are re-parsed with the current parser on every read, so an old capture such as
+`站上 fib 1.414` no longer materializes as a `$1.414` trigger; approve the idea
+from the dashboard with the real level to lift the quarantine.
+
 ### Heat day-trade ideas
 
 The listener can watch Heat's channel using stable Discord ID allowlists:

@@ -19,6 +19,12 @@ the executor to remain in `DRY_RUN`. For everyday VPS operation, use
 To review fresh ENTRY and REDUCE proposals through Robinhood without placing
 orders, see [docs/robinhood-shadow-review.md](docs/robinhood-shadow-review.md).
 
+The swing executor and the day trader share one Robinhood account. Each
+strategy sells only the shares it owns (`bot/position_ownership.py`) and will
+not open a position in a symbol the other strategy holds. A reconciled
+per-source / per-month performance report with explicit omissions is
+available via `python -m bot.performance` and `GET /api/performance`.
+
 - Phase 1: Discord message parser (pure functions, fully tested without Discord)
 - Phase 2: Discord listener (selfbot via `discord.py-self`) — wires real messages into the parser
 - Phase 3: Broker order placement (IBKR — `ib_async` or Client Portal Web API)

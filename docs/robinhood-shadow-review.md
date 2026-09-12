@@ -39,11 +39,41 @@ Codex then checks the Agentic account, actual positions, buying power, ticker
 tradability, and calls `place_equity_order` (review is skipped). Each proposal
 gets a stable `ref_id` UUID for idempotent retries.
 
+### Strategy isolation (one account, two strategies)
+
+The day trader and the swing executor share the Agentic account and can hold
+the same symbol (a Heat `SPY` watch routes into `SPXL`; Will can post an
+`SPXL` swing). Sells are therefore sized from **what the swing strategy owns**,
+never from the account-level quantity:
+
+- `CLOSE` / `STOP_TRIGGER` sell the swing-owned quantity: broker-confirmed
+  swing fills from `logs/trade_pnl.jsonl` since the holding's first entry
+  (falling back to the virtual estimate when no fill was recorded).
+- `REDUCE` sells `min(virtual estimate, swing-owned)`.
+- Shares the day trader owns in the same symbol
+  (`logs/day_trade_positions.jsonl`) are excluded. If the broker holds fewer
+  shares than both ledgers claim, only `actual - day-owned` can be sold and
+  the drift is logged.
+- When nothing sellable belongs to the swing strategy, no order is placed and
+  the ledger records `BLOCKED`. The virtual book treats the position as gone.
+- A swing `ENTRY` for a symbol the day trader currently holds is rejected by
+  the executor (`EXECUTOR_BLOCK_SHARED_TICKERS=false` to allow), and the day
+  trader waits (re-arms) instead of buying a symbol the swing book holds
+  (`DAY_TRADE_BLOCK_SHARED_TICKERS=false` to allow).
+
+The bot-managed swing stop monitor only appends a `STOP_TRIGGER` to
+`logs/swings.jsonl`; the resulting proposal is placed through the same sized
+sell path above and recorded in the P&L ledger. It never places its own order.
+
 Every result is appended to:
 
 ```text
 logs/robinhood_shadow_reviews.jsonl
 ```
+
+Ledger statuses: `PLACED`, `SKIPPED` (validation), `BLOCKED` (ownership
+refused the sell; nothing placed), `UNVERIFIED` (broker call failed after
+validation; reconcile), and review-only `REVIEWED` / `FAILED`.
 
 Set `SHADOW_REVIEW_PLACE_ORDERS=false` to pause live placement without stopping
 the watcher.
@@ -119,4 +149,13 @@ The dashboard API also exposes:
 ```text
 GET /api/executor/shadow-reviews
 GET /api/executor/shadow-reviews/stream
+GET /api/performance
 ```
+
+`/api/performance` (and `python -m bot.performance` on the VPS) is the
+reconciled view: per-source and per-month day-trade results, swing sells
+valued on the swing-owned quantity only, fills that exceeded swing ownership
+re-allocated to the day trade that lost them, open P&L from the last polled
+quote, and an explicit list of omissions (sells without fills, unreconciled
+day exits, `PENDING`/`UNVERIFIED` reviews). `/api/pnl` and the day-trade
+`pnl` block keep their historical meaning and now state their scope.

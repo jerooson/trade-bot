@@ -45,11 +45,13 @@ from typing import Any
 
 from zoneinfo import ZoneInfo
 
+from bot import position_ownership
 from bot.parser import Side, Signal, SignalKind, parse_message
 from bot.heat_ideas import (
     HEAT_DECISIONS_PATH,
     HEAT_IDEAS_PATH,
     HEAT_SETTINGS_PATH,
+    is_plausible_trigger,
     load_heat_settings,
     load_materialized_heat_ideas,
 )
@@ -93,6 +95,16 @@ SCHEDULER_TICK_S = float(os.getenv("DAY_TRADE_SCHEDULER_TICK_S", "1"))
 SIGNALS_LOG = Path("logs/signals.jsonl")
 POSITIONS_LOG = Path("logs/day_trade_positions.jsonl")
 MAX_HEAT_PLANS_PER_DAY = int(os.getenv("DAY_TRADE_MAX_HEAT_PLANS_PER_DAY", "3"))
+# A watch whose trigger is more than this many times away from the live quote
+# (either direction) is quarantined for review instead of armed: it is almost
+# certainly a ratio, indicator value or typo, not a price level.
+TRIGGER_MAX_RATIO = float(os.getenv("DAY_TRADE_TRIGGER_MAX_RATIO", "2.0"))
+# Strategy isolation: never open a day trade in a symbol the swing strategy
+# currently holds in the same account (env: DAY_TRADE_BLOCK_SHARED_TICKERS).
+BLOCK_SHARED_TICKERS = (
+    (os.getenv("DAY_TRADE_BLOCK_SHARED_TICKERS") or "true").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 _RECONNECT_BACKOFF_S = (5, 10, 30)
 
 # Trailing-stop milestones: list of (threshold_pct, lock_in_pct) pairs.
@@ -128,9 +140,15 @@ _RISK_BASIS_EXECUTION = "execution"
 class DayPosition:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     ticker: str = ""
-    status: str = "watching"          # watching | pending_entry | open | pending_exit | closed | expired
+    # watching | pending_entry | open | pending_exit | closed | expired |
+    # unreconciled (broker held fewer shares than this lifecycle owned; no
+    # sale was possible and no P&L is invented — see reconciliation_note)
+    status: str = "watching"
 
     trigger_price: float | None = None
+    # Set when a watch is parked for review (for example a trigger that is not
+    # in the same unit as the quote).  Blocks automatic re-activation.
+    quarantine_reason: str | None = None
     target_price: float | None = None
     setup: str | None = None
     plan_signal_id: str | None = None
@@ -202,6 +220,11 @@ class DayPosition:
     exit_filled_qty: float = 0.0
     exit_filled_value: float = 0.0
     exit_last_error: str | None = None
+    # Shares this lifecycle bought but could not sell because the broker no
+    # longer held them (another strategy or a manual sale took them).  They
+    # are excluded from the exit remainder and flagged for reconciliation.
+    unreconciled_qty: float = 0.0
+    reconciliation_note: str | None = None
     realized_pnl: float | None = None
     realized_pnl_pct: float | None = None
     closed_at: str | None = None
@@ -270,7 +293,7 @@ def _load_positions() -> list[DayPosition]:
     if not POSITIONS_LOG.exists():
         return []
     positions: dict[str, DayPosition] = {}
-    for line in POSITIONS_LOG.read_text().splitlines():
+    for line in POSITIONS_LOG.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -290,11 +313,17 @@ def _append_position(pos: DayPosition) -> None:
 
 
 def _flush_positions(positions: list[DayPosition]) -> None:
-    """Rewrite the full positions log (compact — one entry per id)."""
+    """Rewrite the full positions log (compact — one entry per id).
+
+    Written to a temp file and renamed so the swing side, which reads this
+    file to learn what the day trader owns, never sees a truncated ledger.
+    """
     POSITIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with POSITIONS_LOG.open("w", encoding="utf-8") as f:
+    tmp = POSITIONS_LOG.with_suffix(POSITIONS_LOG.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         for pos in positions:
             f.write(json.dumps(pos.to_dict()) + "\n")
+    tmp.replace(POSITIONS_LOG)
 
 
 # ------------------------------------------------------------------
@@ -407,7 +436,7 @@ def _sync_manual_plans(positions: list[DayPosition]) -> bool:
             continue
         related = [p for p in positions if p.manual_plan_id == plan_id]
         if any(
-            p.status in ("watching", "pending_entry", "open", "pending_exit", "closed")
+            p.status in ("watching", "pending_entry", "open", "pending_exit", "closed", "unreconciled")
             or bool(p.fill_qty)
             for p in related
         ):
@@ -416,6 +445,12 @@ def _sync_manual_plans(positions: list[DayPosition]) -> bool:
         ticker = str(plan.get("ticker", "")).upper()
         trigger = plan.get("trigger_price")
         if not ticker or trigger is None:
+            continue
+        # A quarantined watch stays parked until the plan itself changes.
+        if any(
+            p.quarantine_reason and p.trigger_price == float(trigger)
+            for p in related
+        ):
             continue
         # One active day-trade lifecycle per ticker, regardless of source.
         if any(
@@ -490,14 +525,39 @@ def _sync_heat_ideas(
             if pos.good_til_cancelled != persistent:
                 pos.good_til_cancelled = persistent
                 changed = True
+            unfilled = (
+                not pos.buy_order_id
+                and not pos.fill_qty
+                and pos.entry_filled_qty <= 0
+            )
+            # An operator correction of the level (for example re-approving a
+            # watch whose parsed trigger was a Fibonacci ratio) propagates to
+            # the unfilled watch and lifts its quarantine.
+            idea_trigger = (idea or {}).get("trigger_price")
+            operator_decided = bool(idea and idea.get("status") == "approved")
+            if (
+                unfilled
+                and pos.status in ("watching", "expired")
+                and (pos.quarantine_reason or operator_decided)
+                and isinstance(idea_trigger, (int, float))
+                and idea_trigger > 0
+                and float(idea_trigger) != pos.trigger_price
+            ):
+                pos.trigger_price = float(idea_trigger)
+                pos.quarantine_reason = None
+                pos.armed = False
+                if pos.status == "expired" and pos.exit_reason == "implausible_trigger":
+                    pos.status = "watching"
+                    pos.exit_reason = None
+                    pos.manual_cancel_requested = False
+                changed = True
             # Legacy Heat watches expired at EOD. Reactivate only clean,
             # unfilled watches; submitted/partial orders keep their lifecycle.
             if (
                 persistent
                 and pos.status == "expired"
-                and not pos.buy_order_id
-                and not pos.fill_qty
-                and pos.entry_filled_qty <= 0
+                and unfilled
+                and not pos.quarantine_reason
             ):
                 pos.status = "watching"
                 pos.exit_reason = None
@@ -512,7 +572,11 @@ def _sync_heat_ideas(
             if not enabled:
                 pos.exit_reason = "heat_disabled"
             elif not approved:
-                pos.exit_reason = "heat_rejected"
+                pos.exit_reason = (
+                    "heat_needs_review"
+                    if idea is not None and idea.get("decision") is None
+                    else "heat_rejected"
+                )
             else:
                 pos.exit_reason = "heat_unsupported_mapping"
             pos.manual_cancel_requested = True
@@ -1300,24 +1364,34 @@ _QTY_EPSILON = 0.000001
 
 
 def _remaining_exit_qty(pos: DayPosition) -> float:
-    return max(0.0, float(pos.fill_qty or 0) - pos.exit_filled_qty)
+    return max(
+        0.0,
+        float(pos.fill_qty or 0) - pos.exit_filled_qty - float(pos.unreconciled_qty or 0),
+    )
 
 
 def _finalize_exit(pos: DayPosition, fill_price: float, fill_qty: float) -> None:
-    """Close a position using broker-confirmed cumulative sale proceeds."""
+    """Close a position using broker-confirmed cumulative sale proceeds.
+
+    Realized P&L covers only the shares actually sold.  Shares recorded in
+    ``unreconciled_qty`` were never sold by this lifecycle and carry no P&L.
+    """
     total_qty = pos.exit_filled_qty + fill_qty
     total_value = pos.exit_filled_value + fill_price * fill_qty
     original_qty = float(pos.fill_qty or 0)
-    if original_qty <= 0 or total_qty + _QTY_EPSILON < original_qty:
+    accounted = total_qty + float(pos.unreconciled_qty or 0)
+    if original_qty <= 0 or total_qty <= 0 or accounted + _QTY_EPSILON < original_qty:
         raise ValueError(
             f"Cannot finalize {pos.ticker}: sold {total_qty} of {original_qty}"
         )
     pos.exit_filled_qty = total_qty
     pos.exit_filled_value = total_value
     pos.exit_price = total_value / total_qty
+    # Keep four decimals: a $20 trade moves in fractions of a cent and the
+    # dashboard rounds for display.
     pos.realized_pnl = round(
         total_value - float(pos.fill_price or 0) * total_qty,
-        2,
+        4,
     )
     pos.realized_pnl_pct = (
         round((pos.exit_price - pos.fill_price) / pos.fill_price * 100, 3)
@@ -1369,6 +1443,88 @@ def _apply_exit_order_result(pos: DayPosition, result: OrderResult) -> bool:
     return False
 
 
+def _is_share_shortfall(error: object) -> bool:
+    """Broker rejected a sell because the account holds fewer shares."""
+    return "not enough shares" in str(error).lower()
+
+
+def _broker_position_qty(session: _MCPSession, account_number: str, symbol: str) -> float:
+    data = session.call("get_equity_positions", account_number=account_number)
+    positions = data.get("data", {}).get("positions", [])
+    match = next(
+        (p for p in positions if str(p.get("symbol") or "").upper() == symbol.upper()),
+        None,
+    )
+    return float(match.get("quantity") or 0.0) if match else 0.0
+
+
+def _reconcile_exit_shortfall(
+    session: _MCPSession,
+    account_number: str,
+    pos: DayPosition,
+    error: object,
+) -> bool:
+    """The broker refused our sell for lack of shares; reconcile, never retry blindly.
+
+    Reads the account-level quantity and the swing strategy's ownership of the
+    same symbol.  Only shares that cannot belong to the swing strategy are
+    sold; the rest is recorded as ``unreconciled_qty`` with a note so the
+    operator can repair the accounting from broker records.  Without any
+    sellable shares the lifecycle ends as ``unreconciled`` — no P&L is
+    invented and the stale sale stops retrying every poll.
+    """
+    symbol = _execution_symbol(pos)
+    remaining = _remaining_exit_qty(pos)
+    try:
+        actual = _broker_position_qty(session, account_number, symbol)
+        swing = position_ownership.swing_live_owned(symbol)
+    except Exception as exc:
+        pos.exit_last_error = f"shortfall_unresolved:{exc}"
+        log.error(
+            "Exit shortfall for %s could not be reconciled yet (%s); will re-check: %s",
+            pos.ticker,
+            error,
+            exc,
+        )
+        return True
+
+    sellable, _ = position_ownership.sellable_quantity(
+        remaining, own=remaining, others=swing, actual=actual
+    )
+    sellable = round(sellable, 6)
+    shortfall = round(max(0.0, remaining - sellable), 6)
+    pos.unreconciled_qty = round(float(pos.unreconciled_qty or 0) + shortfall, 6)
+    pos.reconciliation_note = (
+        f"broker holds {actual:.6f} {symbol}, swing strategy owns {swing:.6f}; "
+        f"this day trade could not sell {shortfall:.6f} of {remaining:.6f} "
+        f"shares it bought ({error})"
+    )
+    pos.exit_last_error = None
+    pos.exit_order_id = None
+    log.error(
+        "Exit shortfall for %s: %s", pos.ticker, pos.reconciliation_note
+    )
+
+    if sellable <= _QTY_EPSILON:
+        if pos.exit_filled_qty > 0:
+            _finalize_exit(pos, 0.0, 0.0)
+        else:
+            pos.status = "unreconciled"
+            pos.closed_at = datetime.now(timezone.utc).isoformat()
+        return True
+
+    ref_key = f"{pos.id}:{pos.exit_filled_qty:.6f}:shortfall:{sellable:.6f}"
+    try:
+        result = _market_sell_all(session, account_number, symbol, sellable, ref_key)
+    except Exception as exc:
+        pos.exit_last_error = str(exc)
+        log.error("Exit of sellable remainder failed for %s: %s", pos.ticker, exc)
+        return True
+    pos.exit_order_id = result.order_id
+    _apply_exit_order_result(pos, result)
+    return True
+
+
 def _start_or_retry_exit(
     session: _MCPSession,
     account_number: str,
@@ -1393,10 +1549,19 @@ def _start_or_retry_exit(
     if pos.exit_order_id:
         return changed
 
+    # A sale the broker already refused for lack of shares is reconciled
+    # against ownership instead of being resubmitted on every poll.
+    if pos.exit_last_error and _is_share_shortfall(pos.exit_last_error):
+        _reconcile_exit_shortfall(session, account_number, pos, pos.exit_last_error)
+        return True
+
     remaining = _remaining_exit_qty(pos)
     if remaining <= _QTY_EPSILON:
         if pos.exit_filled_qty > 0:
             _finalize_exit(pos, 0.0, 0.0)
+        elif pos.unreconciled_qty > 0:
+            pos.status = "unreconciled"
+            pos.closed_at = datetime.now(timezone.utc).isoformat()
         return True
 
     ref_key = f"{pos.id}:{pos.exit_filled_qty:.6f}"
@@ -1409,6 +1574,9 @@ def _start_or_retry_exit(
             ref_key,
         )
     except Exception as exc:
+        if _is_share_shortfall(exc):
+            _reconcile_exit_shortfall(session, account_number, pos, exc)
+            return True
         pos.exit_last_error = str(exc)
         log.error(
             "Exit submission failed for %s; position remains pending_exit and will retry: %s",
@@ -1426,6 +1594,18 @@ def _start_or_retry_exit(
 # ------------------------------------------------------------------
 # Core loop
 # ------------------------------------------------------------------
+
+def _quarantine_watch(pos: DayPosition, price: float) -> None:
+    """Park a watch whose trigger cannot be a price in the quote's unit."""
+    pos.status = "expired"
+    pos.exit_reason = "implausible_trigger"
+    pos.armed = False
+    pos.quarantine_reason = (
+        f"trigger {pos.trigger_price} is more than {TRIGGER_MAX_RATIO:g}x away from "
+        f"{pos.ticker} price {price:.4f}; needs review (ratio/indicator mis-read?)"
+    )
+    log.error("Quarantined %s watch: %s", pos.ticker, pos.quarantine_reason)
+
 
 def _now_et() -> datetime:
     return datetime.now(ET)
@@ -1827,6 +2007,17 @@ def _submit_or_recover_entry(
                 selection.ask,
                 selection.spread_pct,
             )
+        execution = _execution_symbol(pos)
+        if BLOCK_SHARED_TICKERS and position_ownership.swing_holds(execution):
+            # Strategy isolation: the swing book already owns this symbol in
+            # the same account.  Two owners of one symbol is what made a swing
+            # STOP_TRIGGER sell the day trade's SPXL shares on 2026-09-02.
+            _end_unsubmitted_entry(
+                pos,
+                "shared_ticker_with_swing",
+                f"swing strategy currently holds {execution}",
+            )
+            return True
         pos.entry_submitted_at = datetime.now(timezone.utc).isoformat()
         pos.entry_last_error = None
     pos.status = "pending_entry"
@@ -2196,6 +2387,12 @@ def run_once(
             and signal_price is not None
             and pos.trigger_price is not None
         ):
+            if not is_plausible_trigger(
+                pos.trigger_price, signal_price, max_ratio=TRIGGER_MAX_RATIO
+            ):
+                _quarantine_watch(pos, signal_price)
+                changed = True
+                continue
             if not pos.armed:
                 if _trigger_is_armed(pos, signal_price):
                     pos.armed = True

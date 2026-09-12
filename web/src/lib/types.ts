@@ -169,7 +169,14 @@ export interface ProposedOrder {
 
 // -- Day trade types ----------------------------------------------------------
 
-export type DayTradeStatus = "watching" | "pending_entry" | "open" | "pending_exit" | "closed" | "expired";
+export type DayTradeStatus =
+  | "watching"
+  | "pending_entry"
+  | "open"
+  | "pending_exit"
+  | "closed"
+  | "expired"
+  | "unreconciled"; // broker held fewer shares than the lifecycle owned; no P&L recorded
 
 export interface DayTradePosition {
   id: string;
@@ -210,6 +217,9 @@ export interface DayTradePosition {
   exit_filled_qty: number;
   exit_filled_value: number;
   exit_last_error: string | null;
+  unreconciled_qty?: number;
+  reconciliation_note?: string | null;
+  quarantine_reason?: string | null;
   realized_pnl: number | null;
   realized_pnl_pct: number | null;
   closed_at: string | null;
@@ -301,10 +311,17 @@ export interface DayTradePnlRecord {
 }
 
 export interface DayTradePnl {
+  scope?: "today";              // total_realized_pnl / wins / losses are today (US/Eastern) only
   total_realized_pnl: number;
   wins: number;
   losses: number;
   trades_today: number;
+  all_time?: { total_realized_pnl: number; wins: number; losses: number; trades: number };
+  open_unrealized_pnl?: number | null;   // last polled quote, not a live mark
+  omissions?: {
+    unreconciled: { id: string; ticker: string; status: string; unreconciled_qty: number | null; note: string | null }[];
+    stuck_exits: { id: string; ticker: string; error: string | null; requested_at: string | null }[];
+  };
   records: DayTradePnlRecord[];
 }
 

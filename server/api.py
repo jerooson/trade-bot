@@ -26,12 +26,14 @@ from datetime import datetime, timezone, timedelta
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, AsyncIterator
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+from bot import performance, position_ownership
 from bot.manual_day_plans import cancel_plan, create_plan, load_plans
 from bot.heat_ideas import (
     append_jsonl as append_heat_jsonl,
@@ -42,6 +44,22 @@ from bot.heat_ideas import (
 from bot.leveraged_etfs import candidate_symbols
 
 log = logging.getLogger("server.api")
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _et_date(raw: Any) -> str | None:
+    """Market-day (US/Eastern) date string for an ISO timestamp."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_ET).date().isoformat()
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT_ROOT / "logs"
@@ -642,14 +660,33 @@ def list_pnl() -> dict[str, Any]:
     total_realized = sum(r.get("realized_pnl") or 0.0 for r in records)
     wins = [r for r in records if (r.get("realized_pnl") or 0) > 0]
     losses = [r for r in records if (r.get("realized_pnl") or 0) < 0]
+    missing = [
+        r for r in records
+        if r.get("action") == "SELL" and r.get("realized_pnl") is None
+    ]
 
     return {
         "count": len(records),
+        "scope": (
+            "all recorded swing sells as written at fill time (unadjusted); "
+            "see /api/performance for ownership-adjusted figures"
+        ),
         "total_realized_pnl": round(total_realized, 4),
         "wins": len(wins),
         "losses": len(losses),
+        "sells_missing_realized_pnl": len(missing),
         "records": records,
     }
+
+
+@app.get("/api/performance")
+def get_performance() -> dict[str, Any]:
+    """Reconciled per-source / per-month performance with explicit omissions."""
+    return performance.build_report(
+        positions_path=DAY_TRADE_POSITIONS_PATH,
+        pnl_path=PNL_PATH,
+        reviews_path=SHADOW_REVIEWS_PATH,
+    )
 
 
 def _latest_day_trade_positions() -> list[dict[str, Any]]:
@@ -708,10 +745,12 @@ def _heat_idea_views(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for idea in ideas:
         related = [p for p in positions if p.get("heat_idea_id") == idea.get("id")]
         position = next((p for p in reversed(related) if p.get("status") in {
-            "watching", "pending_entry", "open", "pending_exit", "closed", "expired"
+            "watching", "pending_entry", "open", "pending_exit", "closed", "expired",
+            "unreconciled",
         }), None)
         has_execution = any(
-            p.get("fill_qty") or p.get("status") in {"open", "pending_exit", "closed"}
+            p.get("fill_qty")
+            or p.get("status") in {"open", "pending_exit", "closed", "unreconciled"}
             for p in related
         )
         if idea.get("decision") == "rejected" and not has_execution:
@@ -722,7 +761,9 @@ def _heat_idea_views(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif position:
             idea["position_id"] = position.get("id")
             idea["position_status"] = position.get("status")
-            if position.get("fill_qty") or position.get("status") in {"open", "pending_exit", "closed"}:
+            if position.get("status") == "unreconciled":
+                idea["derived_status"] = "unreconciled"
+            elif position.get("fill_qty") or position.get("status") in {"open", "pending_exit", "closed"}:
                 idea["derived_status"] = "executed"
             elif position.get("status") == "expired":
                 idea["derived_status"] = position.get("exit_reason") or "expired"
@@ -959,13 +1000,34 @@ def get_daytrader_state() -> dict[str, Any]:
 
     positions = _latest_day_trade_positions()
 
-    # Build P&L summary from closed positions
+    # Build P&L summary from closed positions.  ``pnl`` totals are TODAY
+    # (market-day in US/Eastern) only; ``pnl.all_time`` covers every closed
+    # lifecycle, and ``pnl.omissions`` lists what is not in either number.
     closed = [p for p in positions if p.get("status") == "closed" and p.get("realized_pnl") is not None]
-    today_str = datetime.now(timezone.utc).date().isoformat()
-    closed_today = [p for p in closed if (p.get("closed_at") or "").startswith(today_str)]
+    today_et = datetime.now(_ET).date().isoformat()
+    closed_today = [p for p in closed if _et_date(p.get("closed_at")) == today_et]
     total_pnl = sum(p.get("realized_pnl") or 0 for p in closed_today)
     wins = len([p for p in closed_today if (p.get("realized_pnl") or 0) > 0])
     losses = len([p for p in closed_today if (p.get("realized_pnl") or 0) < 0])
+    all_time_pnl = sum(p.get("realized_pnl") or 0 for p in closed)
+    open_positions = [p for p in positions if p.get("status") in ("open", "pending_exit")]
+    unrealized = 0.0
+    for p in open_positions:
+        owned_qty = position_ownership.day_position_owned_qty(p)
+        if p.get("current_price") is not None and p.get("fill_price") and owned_qty > 0:
+            unrealized += (float(p["current_price"]) - float(p["fill_price"])) * owned_qty
+    unreconciled = [
+        {"id": p.get("id"), "ticker": p.get("ticker"), "status": p.get("status"),
+         "unreconciled_qty": p.get("unreconciled_qty"), "note": p.get("reconciliation_note")}
+        for p in positions
+        if p.get("status") == "unreconciled" or float(p.get("unreconciled_qty") or 0) > 0
+    ]
+    stuck_exits = [
+        {"id": p.get("id"), "ticker": p.get("ticker"), "error": p.get("exit_last_error"),
+         "requested_at": p.get("exit_requested_at")}
+        for p in positions
+        if p.get("status") == "pending_exit" and p.get("exit_last_error")
+    ]
 
     pnl_records = [
         {
@@ -985,10 +1047,22 @@ def get_daytrader_state() -> dict[str, Any]:
     return {
         "positions": positions,
         "pnl": {
+            "scope": "today",
             "total_realized_pnl": round(total_pnl, 4),
             "wins": wins,
             "losses": losses,
             "trades_today": len(closed_today),
+            "all_time": {
+                "total_realized_pnl": round(all_time_pnl, 4),
+                "wins": len([p for p in closed if (p.get("realized_pnl") or 0) > 0]),
+                "losses": len([p for p in closed if (p.get("realized_pnl") or 0) < 0]),
+                "trades": len(closed),
+            },
+            "open_unrealized_pnl": round(unrealized, 4) if open_positions else None,
+            "omissions": {
+                "unreconciled": unreconciled,
+                "stuck_exits": stuck_exits,
+            },
             "records": pnl_records,
         },
         "service_running": service_running,

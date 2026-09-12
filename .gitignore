@@ -29,3 +29,6 @@ Thumbs.db
 # Verification screenshots and Playwright MCP scratch outputs (never tracked)
 *.png
 .playwright-mcp/
+
+# Private runtime ledgers downloaded for reviews
+.review-*/

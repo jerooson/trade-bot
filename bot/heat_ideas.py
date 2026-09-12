@@ -143,11 +143,48 @@ def _classification_from(text: str, trigger: float | None) -> str:
     return "needs_level"
 
 
+# Words that turn the following number into a ratio / indicator value rather
+# than a dollar level: ``站上 fib 1.414`` is a Fibonacci extension, not $1.414.
+_RATIO_CONTEXT_RE = re.compile(
+    r"(?:\bfibs?\b|\bfibo\b|fibonacci|斐波那契|黄金分割|extension|retrace(?:ment)?|"
+    r"\bema\b|\bsma\b|\bma\b|\bvwap\b|\brsi\b|\batr\b|日线|均线|周线|月线)",
+    re.I,
+)
+_RATIO_SUFFIX_RE = re.compile(r"\s*(?:%|％|倍|x\b|日线|均线|周线|ema\b|sma\b|ma\b)", re.I)
+_FIB_RATIOS = {
+    0.236, 0.382, 0.5, 0.618, 0.786, 0.886, 1.0, 1.272, 1.414, 1.618, 2.0,
+    2.272, 2.618, 3.618, 4.236,
+}
+
+
+def _number_is_price_level(text: str, match: re.Match[str]) -> bool:
+    """False when the matched number is a ratio, percentage or indicator.
+
+    Only the words between the trigger verb and the number are inspected
+    (``站上 fib 1.414``); for number-first patterns a short window before the
+    number is used.  Earlier clauses of the sentence never disqualify a later
+    explicit level such as ``站上200日线，最好是站上64.2``.
+    """
+    number_start = match.start(1)
+    prefix = text[match.start():number_start]
+    if not prefix:
+        prefix = text[max(0, number_start - 6):number_start]
+    if _RATIO_CONTEXT_RE.search(prefix):
+        return False
+    suffix = text[match.end(1):match.end(1) + 8]
+    if _RATIO_SUFFIX_RE.match(suffix):
+        return False
+    return True
+
+
+def looks_like_fib_ratio(value: float) -> bool:
+    return any(abs(value - ratio) < 1e-6 for ratio in _FIB_RATIOS)
+
+
 def _trigger_from(text: str) -> float | None:
     for pattern in _TRIGGER_PATTERNS:
         for match in pattern.finditer(text or ""):
-            suffix = (text[match.end():match.end() + 8]).lower()
-            if re.match(r"\s*(?:日线|均线|ema\b|ma\b)", suffix, re.I):
+            if not _number_is_price_level(text, match):
                 continue
             try:
                 value = float(match.group(1))
@@ -156,6 +193,22 @@ def _trigger_from(text: str) -> float | None:
             if value > 0:
                 return value
     return None
+
+
+def is_plausible_trigger(trigger: float | None, reference_price: float | None, *, max_ratio: float = 2.0) -> bool:
+    """True unless ``trigger`` is clearly not in the same unit as the quote.
+
+    A day-trade level more than ``max_ratio`` times away from the live price
+    (either direction) is treated as a mis-parsed ratio, indicator value or
+    typo and must be reviewed rather than armed.  Unknown reference prices
+    never fail the check so legitimate distant levels are not discarded.
+    """
+    if trigger is None or trigger <= 0:
+        return False
+    if reference_price is None or reference_price <= 0:
+        return True
+    ratio = max(trigger, reference_price) / min(trigger, reference_price)
+    return ratio <= max_ratio
 
 
 def _direction_from(text: str) -> str | None:
@@ -319,6 +372,19 @@ def materialize_heat_ideas(
         if decision and decision.get("ticker"):
             inferred_ticker = str(decision["ticker"]).upper()
         idea["ticker"] = inferred_ticker
+        # Re-derive the trigger from Heat's own words with the current parser
+        # so a level captured by an older parser (``fib 1.414`` -> $1.414) is
+        # repaired in place.  Operator decisions always win.
+        decision_trigger = decision.get("trigger_price") if decision else None
+        if body and decision_trigger is None:
+            reparsed = _trigger_from(body)
+            if reparsed != idea.get("trigger_price"):
+                idea["trigger_price"] = reparsed
+                if idea.get("auto_eligible") and reparsed is None:
+                    idea["auto_eligible"] = False
+                    if idea.get("decision") == "approved" and idea.get("status") == "auto_approved":
+                        idea["decision"] = None
+                        idea["status"] = "needs_review"
         if decision and decision.get("decision") == "approved":
             idea["classification"] = "actionable_setup"
         else:

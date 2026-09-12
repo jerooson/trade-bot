@@ -27,6 +27,10 @@ Sizing rules
 - Max concurrent tickers (default 5, env: EXECUTOR_MAX_OPEN_TICKERS).
 - SHORT signals are rejected (cash account, no shorting).
 - ADD for tickers we don't hold yet is rejected (we missed the ENTRY).
+- ENTRY for a symbol the day trader currently holds is rejected (strategy
+  isolation; env: EXECUTOR_BLOCK_SHARED_TICKERS=false to allow). Sells are
+  always sized from the swing strategy's own shares, see
+  `bot/position_ownership.py`.
 
 State
 -----
@@ -57,6 +61,7 @@ from typing import Any, Iterable
 
 from dotenv import load_dotenv
 
+from bot import position_ownership
 from bot.notifier import Notifier
 from bot.swing_parser import ActionKind, Side
 
@@ -95,6 +100,10 @@ class ExecutorConfig:
     # Final broker-review outcomes used to keep the virtual book aligned with
     # orders that were actually placed.
     review_ledger_path: Path = Path("./logs/robinhood_shadow_reviews.jsonl")
+    # Day-trader state, read live so a swing ENTRY never opens a second
+    # strategy's position in a symbol the day trader is already holding.
+    day_positions_path: Path = Path("./logs/day_trade_positions.jsonl")
+    block_shared_tickers: bool = True
 
     @property
     def is_dry_run(self) -> bool:
@@ -136,6 +145,13 @@ def load_config() -> ExecutorConfig:
                 "SHADOW_REVIEW_LEDGER_PATH",
                 "./logs/robinhood_shadow_reviews.jsonl",
             )
+        ),
+        day_positions_path=Path(
+            os.environ.get("DAY_TRADE_POSITIONS_PATH", "./logs/day_trade_positions.jsonl")
+        ),
+        block_shared_tickers=(
+            (os.environ.get("EXECUTOR_BLOCK_SHARED_TICKERS") or "true").strip().lower()
+            not in {"0", "false", "no", "off"}
         ),
     )
 
@@ -239,6 +255,14 @@ _NON_PLACEMENT_REVIEW_STATUSES = {
 # Labels that mean "stop at my average cost" (breakeven).
 _BREAKEVEN_LABELS = ("保本", "均价", "breakeven", "avg cost", "average")
 
+# Strategy-isolation rejections depend on the day trader's live state, which
+# a startup replay cannot reconstruct.  They are tagged in the decision log
+# with this prefix so replay can exclude them without a shadow-review row.
+ISOLATION_REJECT_PREFIX = "strategy isolation"
+# Sentinel placed in ``day_holdings`` when the day ledger cannot be read:
+# fail closed rather than let a shared-ticker ENTRY through unchecked.
+ISOLATION_UNAVAILABLE = "*"
+
 
 
 @dataclass
@@ -289,12 +313,22 @@ def _book_snapshot(book: VirtualBook, ticker: str) -> dict[str, Any]:
     }
 
 
-def decide(action: dict[str, Any], book: VirtualBook, config: ExecutorConfig) -> Decision:
+def decide(
+    action: dict[str, Any],
+    book: VirtualBook,
+    config: ExecutorConfig,
+    *,
+    day_holdings: set[str] | None = None,
+) -> Decision:
     """Pure(-ish) decision function: action + book → Decision.
 
     Note: this mutates `book` only for accepted BUY/SELL decisions (so the
     caller doesn't need a second "apply" step). Pass a copy if you want a
     no-side-effect dry run.
+
+    ``day_holdings`` is the set of symbols the day trader owns *right now*.
+    It is only supplied for live decisions: startup replay passes nothing, so
+    historical ENTRYs are never re-judged against today's day-trade book.
     """
 
     kind = action.get("kind", "")
@@ -347,6 +381,16 @@ def decide(action: dict[str, Any], book: VirtualBook, config: ExecutorConfig) ->
             return _reject(
                 f"max {config.max_open_tickers} concurrent tickers reached "
                 f"(currently holding: {sorted(book.positions)})"
+            )
+        if day_holdings and ISOLATION_UNAVAILABLE in day_holdings:
+            return _reject(
+                f"{ISOLATION_REJECT_PREFIX}: day-trader ledger unreadable; refusing new "
+                "swing positions until strategy isolation can be checked"
+            )
+        if day_holdings and ticker in day_holdings:
+            return _reject(
+                f"{ISOLATION_REJECT_PREFIX}: day trader currently holds {ticker}; one "
+                "strategy per symbol until the day-trade lifecycle closes"
             )
         if signal_price is None or signal_price <= 0:
             return _reject("ENTRY signal has no usable price")
@@ -713,6 +757,7 @@ def replay_history(
         if review_outcomes is not None
         else _load_review_outcomes(config.review_ledger_path)
     )
+    isolation_rejects = _load_isolation_rejects(config.orders_path)
     for a in actions:
         if a.get("kind") not in ACTIONABLE_KINDS:
             continue
@@ -721,8 +766,9 @@ def replay_history(
             if ts is not None and ts <= cutoff:
                 skipped_pre_cutoff += 1
                 continue
-        status = outcomes.get(_action_dedupe_key(a))
-        if status in _NON_PLACEMENT_REVIEW_STATUSES:
+        key = _action_dedupe_key(a)
+        status = outcomes.get(key)
+        if status in _NON_PLACEMENT_REVIEW_STATUSES or (key and key in isolation_rejects):
             skipped_unplaced += 1
             continue
         # Mutate the book; discard the Decision (we don't log replay decisions).
@@ -872,6 +918,36 @@ def _setup_logging() -> None:
     )
 
 
+def _current_day_holdings(config: ExecutorConfig) -> set[str] | None:
+    """Symbols the day trader owns now, or None when isolation is disabled."""
+    if not config.block_shared_tickers:
+        return None
+    try:
+        return position_ownership.day_holdings(config.day_positions_path)
+    except Exception as exc:  # noqa: BLE001 - fail closed, never fail open
+        log.error(
+            "could not read day-trader holdings from %s; rejecting new ENTRYs until it is readable: %s",
+            config.day_positions_path,
+            exc,
+        )
+        return {ISOLATION_UNAVAILABLE}
+
+
+def _load_isolation_rejects(orders_path: Path) -> set[str]:
+    """Signal keys the live executor rejected for strategy isolation."""
+    keys: set[str] = set()
+    for row in _read_jsonl(orders_path):
+        if row.get("action") != "REJECT":
+            continue
+        if not str(row.get("rationale") or "").startswith(ISOLATION_REJECT_PREFIX):
+            continue
+        signal = row.get("signal") or {}
+        message_id = signal.get("message_id")
+        if message_id is not None:
+            keys.add(f"{message_id}:{str(row.get('ticker') or '').upper()}:{row.get('signal_kind')}")
+    return keys
+
+
 def run(config: ExecutorConfig) -> None:
     if not config.is_dry_run:
         log.error(
@@ -927,12 +1003,13 @@ def run(config: ExecutorConfig) -> None:
             new_records = tail.read_new_records()
             if new_records:
                 book_dirty = False
+                day_holdings = _current_day_holdings(config)
                 for action in new_records:
                     if action.get("kind") not in ACTIONABLE_KINDS:
                         # Still update last_processed_at so dashboard heartbeat moves.
                         book.last_processed_at = datetime.now(timezone.utc).isoformat()
                         continue
-                    decision = decide(action, book, config)
+                    decision = decide(action, book, config, day_holdings=day_holdings)
                     book.decisions_total += 1
                     book.last_decision_at = decision.decided_at
                     book.last_processed_at = decision.decided_at

@@ -23,6 +23,17 @@ credentials live under the deploy user's home directory.
   limited to one get_equity_orders call immediately after placement.
 - Full idempotency across process restarts is limited: PENDING entries are
   permanent until manually reconciled.
+
+## Ledger statuses
+
+- PLACED     broker order placed (fill details in the rationale / P&L ledger)
+- SKIPPED    proposal failed validation; nothing placed
+- BLOCKED    ownership check refused the sell before placement: the broker
+             holds no shares that belong to the swing strategy (the day trader
+             may own the symbol).  Nothing placed; the swing book treats the
+             position as gone.
+- UNVERIFIED broker call failed after validation; outcome must be reconciled
+- REVIEWED / FAILED   review-only (Codex) outcomes
 """
 
 from __future__ import annotations
@@ -462,6 +473,14 @@ def review_one(
         # uses protocol 2025-03-26 (no elicitation) and avoids this entirely.
         try:
             result = robinhood_mcp_client.place_order(proposal, expected)
+        except robinhood_mcp_client.OwnershipBlocked as exc:
+            # Deterministic refusal before placement: no broker order exists.
+            # The swing book keeps the CLOSE applied (nothing of ours is held).
+            return ShadowRecord(
+                status="BLOCKED",
+                rationale=f"ownership check refused placement: {exc}",
+                **base,
+            )
         except robinhood_mcp_client.RobinhoodMCPError as exc:
             return ShadowRecord(
                 status="UNVERIFIED",
@@ -550,13 +569,22 @@ def _is_market_open() -> bool:
     return open_t <= now_et < close_t
 
 
+# (ticker, first_entry_at) -> monotonic time the STOP_TRIGGER was written.
+_emitted_stop_triggers: dict[tuple[str, str], float] = {}
+_STOP_TRIGGER_STALE_S = 300.0
+
+
 def _monitor_swing_stops(config: ShadowConfig) -> None:
     """Check each open swing position's stop_loss against current price.
 
-    If price ≤ stop_loss:
-    1. Place a market sell of the full remaining position via direct MCP.
-    2. Append a STOP_TRIGGER entry to swings.jsonl so the executor removes
-       the position from the virtual_book on its next read.
+    If price <= stop_loss, append a STOP_TRIGGER entry to swings.jsonl.  The
+    executor turns it into a SELL proposal and this same process places it
+    through ``robinhood_mcp_client.place_order`` — the one sell path that sizes
+    the order from swing-owned shares and records the fill in the P&L ledger.
+
+    The monitor used to place its own market sell here *and* emit the
+    STOP_TRIGGER, so every bot-managed stop produced two sell attempts and an
+    unrecorded fill.  It never places orders directly any more.
     """
     if not config.place_orders:
         return  # review-only mode — don't act autonomously
@@ -564,7 +592,7 @@ def _monitor_swing_stops(config: ShadowConfig) -> None:
         return
 
     try:
-        book_data = json.loads(config.book_path.read_text())
+        book_data = json.loads(config.book_path.read_text(encoding="utf-8"))
     except Exception:
         return
 
@@ -573,6 +601,9 @@ def _monitor_swing_stops(config: ShadowConfig) -> None:
         t: p for t, p in positions.items()
         if isinstance(p.get("stop_loss"), (int, float)) and p["stop_loss"] > 0
     }
+    # Forget emitted stops for holdings that have left the book.
+    for key in [k for k in _emitted_stop_triggers if k[0] not in positions]:
+        _emitted_stop_triggers.pop(key, None)
     if not stops:
         return
 
@@ -587,7 +618,6 @@ def _monitor_swing_stops(config: ShadowConfig) -> None:
         stop_price: float = pos["stop_loss"]
         shares: float = pos.get("shares") or 0.0
         avg_price: float = pos.get("avg_price") or 0.0
-        deployed: float = pos.get("deployed_usd") or 0.0
 
         try:
             data = session.call("get_equity_quotes", symbols=[ticker])
@@ -611,45 +641,28 @@ def _monitor_swing_stops(config: ShadowConfig) -> None:
             )
             continue
 
+        # One STOP_TRIGGER per holding.  The book only drops the ticker once
+        # the executor has consumed the trigger; while the executor is down
+        # the same stop must not be re-emitted every check.
+        holding_key = (ticker, str(pos.get("first_entry_at") or ""))
+        emitted_at = _emitted_stop_triggers.get(holding_key)
+        if emitted_at is not None:
+            if time.monotonic() - emitted_at > _STOP_TRIGGER_STALE_S:
+                log.error(
+                    "stop monitor: STOP_TRIGGER for %s emitted %.0fs ago but the "
+                    "position is still in the virtual book; is the executor running?",
+                    ticker, time.monotonic() - emitted_at,
+                )
+            continue
+        _emitted_stop_triggers[holding_key] = time.monotonic()
+
         log.warning(
-            "STOP TRIGGERED: %s price=%.4f <= stop=%.4f — selling %.6f shares",
+            "STOP TRIGGERED: %s price=%.4f <= stop=%.4f — emitting STOP_TRIGGER "
+            "for %.6f virtual shares (sell is sized from swing-owned fills at placement)",
             ticker, current_price, stop_price, shares,
         )
 
-        # Place market sell for the full remaining position.
-        try:
-            accounts_data = session.call("get_accounts")
-            accounts = accounts_data.get("data", {}).get("accounts", [])
-            agentic = [a for a in accounts if a.get("agentic_allowed")]
-            if not agentic:
-                log.error("stop monitor: no agentic account found for %s sell", ticker)
-                continue
-            acct = agentic[0]["account_number"]
-
-            order_result = session.call(
-                "place_equity_order",
-                account_number=acct,
-                symbol=ticker,
-                side="sell",
-                type="market",
-                quantity=str(round(shares, 6)),
-                time_in_force="gfd",
-            )
-            order_id = (
-                order_result.get("data", {}).get("order", {}).get("id", "unknown")
-            )
-            order_state = (
-                order_result.get("data", {}).get("order", {}).get("state", "unknown")
-            )
-            log.info(
-                "stop monitor: sell placed for %s order=%s state=%s",
-                ticker, order_id, order_state,
-            )
-        except Exception as exc:
-            log.error("stop monitor: sell FAILED for %s: %s", ticker, exc)
-            continue
-
-        # Append STOP_TRIGGER to swings.jsonl so executor removes the position.
+        # Append STOP_TRIGGER to swings.jsonl; the executor + review loop sells.
         trigger_entry = {
             "kind": "STOP_TRIGGER",
             "ticker": ticker,
@@ -670,7 +683,7 @@ def _monitor_swing_stops(config: ShadowConfig) -> None:
             "discord": {"message_id": None},
         }
         try:
-            with config.swings_path.open("a") as f:
+            with config.swings_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(trigger_entry, ensure_ascii=False) + "\n")
             log.info("stop monitor: STOP_TRIGGER written to swings.jsonl for %s", ticker)
         except Exception as exc:

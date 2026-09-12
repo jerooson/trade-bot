@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from bot import position_ownership
+
 log = logging.getLogger("bot.robinhood_mcp_client")
 
 MCP_URL = "https://agent.robinhood.com/mcp/trading"
@@ -52,6 +54,16 @@ class OrderResult:
 
 class RobinhoodMCPError(Exception):
     pass
+
+
+class OwnershipBlocked(RobinhoodMCPError):
+    """No order was placed: the strategy owns nothing sellable at the broker.
+
+    Raised before ``place_equity_order`` when the account-level quantity is
+    zero, or when every share the account holds belongs to another strategy
+    (see ``bot.position_ownership``).  Deterministic and safe to record as a
+    non-placement; it is *not* an ambiguous broker outcome.
+    """
 
 
 _ROBINHOOD_TOKEN_URL = "https://api.robinhood.com/oauth2/token/"
@@ -231,14 +243,57 @@ class _MCPSession:
             return text
 
 
+def resolve_sell_quantity(proposal: dict[str, Any], actual_shares: float) -> float:
+    """Shares the swing strategy may sell for this proposal.
+
+    Ownership comes from the proposal's immutable ``book_before`` snapshot
+    (the executor has already removed a CLOSEd ticker from the live book by
+    the time the order is placed) plus the broker-confirmed swing fills since
+    that holding's first entry.  The day trader's shares in the same symbol
+    are excluded; see ``position_ownership.sellable_quantity``.
+    """
+    ticker = str(proposal["ticker"]).upper()
+    kind = proposal["signal_kind"]
+    book_before = proposal.get("book_before") or {}
+    book_position = book_before.get("ticker_position") or None
+    virtual_est = float(proposal.get("shares_estimate") or 0.0)
+    if book_position is None:
+        # Legacy proposal without a snapshot: only the estimate is available.
+        own = virtual_est
+    else:
+        # May legitimately be 0.0 (fills say the holding was already sold);
+        # that is not a reason to fall back to the estimate.
+        own = position_ownership.swing_owned(ticker, book_position)
+    requested = own if kind in ("CLOSE", "STOP_TRIGGER") else min(virtual_est, own)
+    others = position_ownership.day_owned(ticker)
+    quantity, note = position_ownership.sellable_quantity(
+        requested, own=own, others=others, actual=actual_shares
+    )
+    if note:
+        log.warning("%s %s: %s", kind, ticker, note)
+    log.info(
+        "%s %s: virtual_est=%.6f swing_owned=%.6f day_owned=%.6f actual=%.6f -> sell=%.6f",
+        kind,
+        ticker,
+        virtual_est,
+        own,
+        others,
+        actual_shares,
+        quantity,
+    )
+    return round(quantity, 6)
+
+
 def place_order(
     proposal: dict[str, Any],
     expected_usd: float,
-) -> tuple[str, str]:
+) -> OrderResult:
     """Place a Robinhood order directly via MCP without Codex.
 
-    Returns (broker_order_id, order_state).
-    Raises RobinhoodMCPError on any failure.
+    Returns an OrderResult with the broker order id, state and fill details.
+    Raises RobinhoodMCPError on any failure; OwnershipBlocked (a subclass) when
+    a sell was refused before placement because nothing sellable belongs to
+    the swing strategy.
     """
     ticker = proposal["ticker"]
     kind = proposal["signal_kind"]
@@ -306,9 +361,10 @@ def place_order(
             f"Existing open order for {ticker}: {oid} — skipping to avoid duplicate"
         )
 
-    # Step 4: For REDUCE/CLOSE, fetch actual broker position to determine sell quantity.
-    # REDUCE caps at min(virtual_estimate, actual_shares).
-    # CLOSE sells all actual shares held (ignores the virtual estimate entirely).
+    # Step 4: For REDUCE/CLOSE/STOP_TRIGGER, size the sell from what the SWING
+    # strategy owns — never from the account-level quantity.  The day trader
+    # can hold the same symbol in the same account (SPXL on 2026-09-02), and
+    # selling "all actual shares" sold its position too.
     quantity: float | None = None
     if kind in _SELL_KINDS:
         positions_data = session.call(
@@ -317,25 +373,13 @@ def place_order(
         positions = positions_data.get("data", {}).get("positions", [])
         position = next((p for p in positions if p.get("symbol") == ticker), None)
         actual_shares = float(position.get("quantity", 0)) if position else 0.0
-        if actual_shares <= 0:
-            raise RobinhoodMCPError(
-                f"{kind} for {ticker} but actual position is 0 shares"
+        quantity = resolve_sell_quantity(proposal, actual_shares)
+        if quantity <= position_ownership.QTY_EPSILON:
+            raise OwnershipBlocked(
+                f"{kind} for {ticker}: nothing sellable that belongs to the swing "
+                f"strategy (broker holds {actual_shares:.6f}, "
+                f"day trader owns {position_ownership.day_owned(ticker):.6f})"
             )
-        virtual_est = float(proposal.get("shares_estimate", 0))
-        if kind in ("CLOSE", "STOP_TRIGGER"):
-            # Sell all actual shares — ignore virtual book estimate.
-            quantity = actual_shares
-        else:
-            # REDUCE: cap at actual shares to avoid overselling.
-            quantity = min(virtual_est, actual_shares)
-        log.info(
-            "%s %s: virtual_est=%.6f actual=%.6f → sell=%.6f",
-            kind,
-            ticker,
-            virtual_est,
-            actual_shares,
-            quantity,
-        )
 
     # Step 5: Place the order.
     order_kwargs: dict[str, Any] = {
