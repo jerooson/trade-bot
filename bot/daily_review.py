@@ -173,9 +173,14 @@ def heat_vs_bot(ideas: list[dict[str, Any]], positions: list[dict[str, Any]], da
             else:
                 outcome = str(s)
         if created.date() == day or (p and (_on(p.get("entered_at"), day) or _on(p.get("closed_at"), day))):
-            rows.append({"time": _hm(i.get("created_at")), "ticker": i.get("ticker"), "trigger": i.get("trigger_price"),
+            rows.append({"time": _hm(i.get("created_at")), "ts": created.isoformat(), "ticker": i.get("ticker"),
+                         "trigger": i.get("trigger_price"), "operator": i.get("trigger_operator"),
                          "direction": i.get("direction"), "outcome": outcome,
+                         "parse": str(i.get("status")), "attachments": len(i.get("attachments") or []),
+                         "pnl_pct": p.get("realized_pnl_pct") if p else None,
+                         "exit_reason": p.get("exit_reason") if p else None,
                          "text": str(i.get("text") or "")[:70].replace("\n", " ")})
+    rows.sort(key=lambda r: r["ts"])
     return rows
 
 
@@ -397,6 +402,74 @@ def _field(name: str, lines: list[str], limit: int = 1000) -> dict[str, Any]:
     return {"name": name, "value": text or "无", "inline": False}
 
 
+def _w(text: str) -> int:
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _pad(text: str, width: int) -> str:
+    text = str(text)
+    while _w(text) > width and text:
+        text = text[:-1]
+    return text + " " * (width - _w(text))
+
+
+def _table_fields(name: str, head: str, cols: list[str], rows: list[list[Any]], widths: list[int]) -> list[dict[str, Any]]:
+    """A monospace table split across embed fields (each value <= 1024 chars)."""
+    header = " ".join(_pad(c, w) for c, w in zip(cols, widths))
+    lines = [" ".join(_pad(str(c), w) for c, w in zip(row, widths)).rstrip() for row in rows]
+    out: list[dict[str, Any]] = []
+    chunk: list[str] = []
+    budget = 1000 - len(head) - len(header) - 12
+    for ln in lines:
+        if sum(len(x) + 1 for x in chunk) + len(ln) > budget:
+            out.append({"name": name if not out else f"{name} (续)",
+                        "value": (head + "\n" if not out else "") + "```\n" + header + "\n" + "\n".join(chunk) + "\n```",
+                        "inline": False})
+            chunk = []
+        chunk.append(ln)
+    body = ("```\n" + header + "\n" + "\n".join(chunk) + "\n```") if (chunk or not out) else ""
+    if not rows:
+        body = ""
+    out.append({"name": name if not out else f"{name} (续)",
+                "value": ((head + "\n") if not out else "") + body or "无", "inline": False})
+    return out
+
+
+def _when(x: dict[str, Any], day: str) -> str:
+    """HH:MM for posts made that day, MM-DD HH:MM for older ideas still in play."""
+    ts = str(x.get("ts") or "")
+    return x["time"] if ts[:10] == day else f"{ts[5:10]} {x['time']}"
+
+
+def _level(x: dict[str, Any]) -> str:
+    if x.get("trigger") is None:
+        return "图" if x.get("attachments") else "无价位"
+    return f"{'>' if x.get('operator') != 'below' else '<'}{x['trigger']:.2f}"
+
+
+def _parse_label(x: dict[str, Any]) -> str:
+    return {"auto_approved": "自动", "approved": "已批", "needs_review": "待审", "rejected": "拒绝"}.get(x.get("parse") or "", str(x.get("parse")))
+
+
+def _outcome_label(x: dict[str, Any]) -> str:
+    o = str(x.get("outcome") or "")
+    if o.startswith("traded"):
+        reason = {"eod": "收盘", "stop": "止损", "target": "目标"}.get(x.get("exit_reason"), x.get("exit_reason") or "")
+        return f"已交易 {_sign(x.get('pnl_pct'))} {reason}".strip()
+    if o == "watching_not_triggered":
+        return "等待触发"
+    if o == "no_watch_created":
+        return "未建watch(旧watch挡住)"
+    if o.startswith("not_approved"):
+        return "待人工/读图" if x.get("attachments") else "待人工"
+    if o == "unsupported_mapping":
+        return "无法映射标的"
+    if o.startswith("entry_failed"):
+        return "下单失败"
+    return {"pending_exit": "平仓中", "open": "持仓中", "pending_entry": "下单中", "unreconciled": "待对账"}.get(o, o)
+
+
 def _sign(v: Any, money: bool = False) -> str:
     if not isinstance(v, (int, float)):
         return "-"
@@ -412,58 +485,52 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
     color = 0x3BA55D if pnl > 0 else 0xED4245 if pnl < 0 else 0x5865F2
     fields: list[dict[str, Any]] = []
 
-    trade_lines = [f"**{s['n']} 笔** · 盈亏 **{_sign(pnl, True)}** · 胜率 {s['win_rate'] if s['win_rate'] is not None else '-'}% · 平均 {_sign(s['avg_pct'])}"]
+    head = f"**{s['n']} 笔** · 盈亏 **{_sign(pnl, True)}** · 胜率 {s['win_rate'] if s['win_rate'] is not None else '-'}% · 平均 {_sign(s['avg_pct'])}"
+    rows_ = []
     for t in d["closed"]:
-        via = f"{t['execution']}" + (f" x{t['leverage']:.0f}" if (t["leverage"] or 1) != 1 else "")
-        trade_lines.append(f"{'🟢' if (t['pnl_usd'] or 0) > 0 else '🔴'} **{t['ticker']}** ({via}, {t['source']}) {t['entered']}→{t['exit']} {t['exit_reason']} {_sign(t['pnl_usd'], True)} ({_sign(t['pnl_pct'])})")
+        via = t["execution"] if (t["leverage"] or 1) == 1 else f"{t['execution']}x{t['leverage']:.0f}"
+        rows_.append([t["ticker"], via, {"heat": "Heat", "discord": "主频道", "manual": "手动"}.get(t["source"], t["source"]),
+                      f"{t['entered']}-{t['exit']}", {"eod": "收盘", "stop": "止损", "target": "目标", "manual": "手动"}.get(t["exit_reason"], str(t["exit_reason"])),
+                      _sign(t["pnl_usd"], True), _sign(t["pnl_pct"])])
     for t in d["open"]:
-        trade_lines.append(f"⏳ **{t['ticker']}** {t['status']}" + (f" — {t['error'][:80]}" if t["error"] else ""))
+        rows_.append([t["ticker"], t["execution"] or "", "", t["entered"], {"pending_exit": "平仓中", "open": "持仓中", "unreconciled": "待对账"}.get(t["status"], t["status"]), "", ""])
     for t in d["failed"]:
-        trade_lines.append(f"❌ **{t['ticker']}** {t['status']} — {str(t['error'])[:80]}")
+        rows_.append([t["ticker"], "", "", "", "失败", "", ""])
+    fields += _table_fields("📈 日内交易", head, ["票", "执行", "来源", "进-出", "原因", "盈亏", "%"], rows_, widths=[5, 8, 5, 11, 5, 7, 7])
     if d["still_watching"]:
-        trade_lines.append("👀 挂单等待: " + ", ".join(f"{w['ticker']}@{w['trigger']:.2f}" for w in d["still_watching"][:8]))
-    fields.append(_field("📈 日内交易", trade_lines))
+        fields.append(_field("👀 挂单等待", [", ".join(f"{w['ticker']}@{w['trigger']:.2f} ({w['source']})" for w in d["still_watching"][:10])]))
 
-    heat_lines = [f"{h['count']} 条 · 自动批准 {len(h['approved'])} · 待审 {len(h['needs_review'])} · 期权帖 {len(h['option_posts'])}"]
-    for i in h["approved"]:
-        heat_lines.append(f"✅ {i['time']} **{i['ticker']}** {i['direction']} {i['operator']} {i['trigger']:.2f} — {i['text'][:60]}")
-    for i in h["needs_review"][:6]:
-        heat_lines.append(f"📝 {i['time']} **{i['ticker']}**{' 🖼' if i['attachments'] else ''} — {i['text'][:60]}")
-    fields.append(_field("🔥 Heat 信号", heat_lines))
-
-    icon = {"traded": "✅", "watching": "⏳", "not_approved": "📝", "no_watch": "⚠️", "entry_failed": "❌", "unsupported": "🚫"}
-    rec_lines = []
-    for x in r["heat_vs_bot"]:
-        key = next((k for k in icon if x["outcome"].startswith(k)), "•")
-        rec_lines.append(f"{icon.get(key, '•')} {x['time']} **{x['ticker']}** {x['trigger'] if x['trigger'] is not None else ''} → {x['outcome'][:50]}")
-    fields.append(_field("🔍 Heat 说 / bot 做", rec_lines or ["无"]))
+    summary = f"{h['count']} 条 · 自动批准 {len(h['approved'])} · 待审 {len(h['needs_review'])} · 期权帖 {len(h['option_posts'])}"
+    fields += _table_fields("🔥 Heat 信号 → bot 动作", summary,
+                            ["时间", "票", "Heat价位", "解析", "bot结果"],
+                            [[_when(x, r["date"]), x["ticker"] or "?", _level(x), _parse_label(x), _outcome_label(x)] for x in r["heat_vs_bot"]],
+                            widths=[11, 5, 9, 6, 22])
 
     dp = r["discord_plans_recorded"]
     if dp["count"]:
         fields.append(_field("📋 主频道信号（只记录）", [", ".join(f"{p['ticker']}@{p['trigger']}" for p in dp["rows"][:12])]))
 
     os_ = o["summary"]
-    opt_lines = [f"开仓 {len(o['opened'])} · 平仓 {os_['n']} · 平均 {_sign(os_['avg_pct'])} · {_sign(os_['usd'], True)} · 现在持仓 {o['open_now']} / 盯盘 {o['watching_now']}"]
-    for x in o["opened"]:
-        opt_lines.append(f"🟦 {x['time']} {x['ticker']} {x['contract']} @ {x['price']}")
-    for x in o["closed"]:
-        opt_lines.append(f"{'🟢' if x['realized_pct'] > 0 else '🔴'} {x['time']} {x['ticker']} {x['exit_reason']} {_sign(x['realized_pct'])} (最高 {_sign(x['max_gain_pct'])})")
-    fields.append(_field("🎯 期权影子（纸面）", opt_lines))
+    opt_head = f"开仓 {len(o['opened'])} · 平仓 {os_['n']} · 平均 {_sign(os_['avg_pct'])} · {_sign(os_['usd'], True)} · 持仓 {o['open_now']} / 盯盘 {o['watching_now']}"
+    opt_rows = [[x["time"], x["ticker"], x["contract"], "开仓", f"@{x['price']}", ""] for x in o["opened"]]
+    opt_rows += [[x["time"], x["ticker"], "", {"eod": "收盘", "stop_30pct": "止损-30%", "stop_level": "破位止损",
+                                               "trim_half_50pct": "减半", "trim_runner_100pct": "留runner", "trim_runner_target": "到目标"}.get(x["exit_reason"], x["exit_reason"]),
+                  _sign(x["realized_pct"]), f"最高{_sign(x['max_gain_pct'])}"] for x in o["closed"]]
+    fields += _table_fields("🎯 期权影子（纸面）", opt_head, ["时间", "票", "合约", "动作", "结果", "备注"], opt_rows, widths=[5, 5, 16, 8, 8, 12])
 
-    sw_lines = [f"信号 {len(sw['signals'])} · 审核 " + (", ".join(f"{k} {v}" for k, v in sw["reviews_by_status"].items()) or "无") + f" · 成交 {sw['fills']}"]
-    for p in sw["placed"]:
-        sw_lines.append(f"• {p['ticker']} {p['kind']} ${p['usd']}")
-    fields.append(_field("🌊 Swing", sw_lines))
+    sw_head = f"信号 {len(sw['signals'])} · 审核 " + (", ".join(f"{k} {v}" for k, v in sw["reviews_by_status"].items()) or "无") + f" · 成交 {sw['fills']}"
+    sw_rows = [[p["ticker"], p["kind"], f"${p['usd']}"] for p in sw["placed"]]
+    fields += _table_fields("🌊 Swing", sw_head, ["票", "动作", "金额"], sw_rows, widths=[6, 14, 8])
 
     t = r.get("totals") or {}
-    tot = []
+    tot_rows = []
     for k, label in (("day", "日内"), ("swing", "Swing")):
         v = t.get(k) or {}
         if isinstance(v, dict) and v.get("count"):
-            tot.append(f"{label}: {v['count']} 笔 · 净 {_sign(v.get('net'), True)} · 胜率 {v['wins'] / v['count'] * 100:.0f}% · PF {v.get('profit_factor')}")
-    if isinstance(t.get("combined"), dict):
-        tot.append(f"合计已实现 {_sign(t['combined'].get('combined_realized'), True)}")
-    fields.append(_field("Σ 累计", tot or ["-"]))
+            tot_rows.append([label, str(v["count"]), _sign(v.get("net"), True), f"{v['wins'] / v['count'] * 100:.0f}%", str(v.get("profit_factor"))])
+    combined = t.get("combined") if isinstance(t.get("combined"), dict) else {}
+    tot_head = f"合计已实现 {_sign(combined.get('combined_realized'), True)}" if combined else ""
+    fields += _table_fields("Σ 累计", tot_head, ["策略", "笔数", "净利", "胜率", "PF"], tot_rows, widths=[6, 5, 9, 5, 6])
 
     health = []
     hb = hl["day_trader_heartbeat_age_min"]
