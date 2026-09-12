@@ -32,6 +32,12 @@ export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSett
 
   const openCount = visiblePositions.filter((p) => p.status === "open" || p.status === "pending_exit").length;
   const totalPnl = pnl?.total_realized_pnl ?? 0;
+  const allTime = pnl?.all_time;
+  const allTimePnl = allTime?.total_realized_pnl ?? 0;
+  const unrealized = pnl?.open_unrealized_pnl ?? null;
+  const unreconciled = pnl?.omissions?.unreconciled ?? [];
+  const stuckExits = pnl?.omissions?.stuck_exits ?? [];
+  const omissionCount = unreconciled.length + stuckExits.length;
 
   return (
     <div className="relative z-10 mx-auto max-w-[1400px] px-6 pb-16 pt-8">
@@ -65,7 +71,7 @@ export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSett
       </div>
 
       {/* Quick stats */}
-      <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-4">
+      <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatTile
           label="Watching"
           value={(visiblePositions.filter(p => p.status === "watching" || p.status === "pending_entry").length).toString()}
@@ -73,13 +79,49 @@ export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSett
         />
         <StatTile label="Open Trades" value={openCount.toString()} caption="in market" highlight={openCount > 0} />
         <StatTile
-          label="Realized P&L"
+          label="Today P&L"
           value={`${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`}
           valueClass={totalPnl >= 0 ? "text-crt-long" : "text-crt-short"}
-          caption={`${pnl?.wins ?? 0}W · ${pnl?.losses ?? 0}L today`}
+          caption={`${pnl?.trades_today ?? 0} closed · ${pnl?.wins ?? 0}W · ${pnl?.losses ?? 0}L`}
         />
-        <StatTile label="Plans Today" value={(pnl?.trades_today ?? 0).toString()} caption="executed" />
+        <StatTile
+          label="All-Time P&L"
+          value={`${allTimePnl >= 0 ? "+" : ""}$${allTimePnl.toFixed(2)}`}
+          valueClass={allTimePnl >= 0 ? "text-crt-long" : "text-crt-short"}
+          caption={`${allTime?.trades ?? 0} closed · ${allTime?.wins ?? 0}W · ${allTime?.losses ?? 0}L · realized only`}
+        />
+        <StatTile
+          label="Open P&L"
+          value={unrealized == null ? "—" : `${unrealized >= 0 ? "+" : ""}$${unrealized.toFixed(2)}`}
+          valueClass={unrealized == null ? undefined : unrealized >= 0 ? "text-crt-long" : "text-crt-short"}
+          caption="last polled quote"
+        />
       </div>
+
+      {omissionCount > 0 && (
+        <div className="mb-6 border border-crt-short/50 bg-crt-short/10 px-4 py-3">
+          <div className="text-[10px] uppercase tracking-[0.28em] text-crt-short">
+            {omissionCount} lifecycle{omissionCount === 1 ? "" : "s"} not in the totals · needs reconciliation
+          </div>
+          <div className="mt-2 flex flex-col gap-1 text-[11px] text-bone-300">
+            {unreconciled.map((item) => (
+              <div key={item.id}>
+                <span className="font-editorial text-base italic text-bone-50">{item.ticker}</span>
+                <span className="ml-2 text-bone-500">{item.status}</span>
+                {item.unreconciled_qty != null && <span className="ml-2 tabular text-bone-400">{item.unreconciled_qty.toFixed(6)} sh unsold</span>}
+                {item.note && <div className="text-[10px] text-bone-500">{item.note}</div>}
+              </div>
+            ))}
+            {stuckExits.map((item) => (
+              <div key={item.id}>
+                <span className="font-editorial text-base italic text-bone-50">{item.ticker}</span>
+                <span className="ml-2 text-bone-500">exit blocked</span>
+                {item.error && <div className="text-[10px] text-bone-500">{item.error}</div>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Sub-tab nav */}
       <div className="mb-4 flex items-center gap-2">
@@ -647,7 +689,11 @@ function ActiveTab({ positions, heatIdeas, signals, serviceRunning, onChanged }:
 
   const watching = positions.filter((p) => p.status === "watching" || p.status === "pending_entry");
   const open = positions.filter((p) => p.status === "open" || p.status === "pending_exit");
-  const closed = positions.filter((p) => p.status === "closed");
+  const unreconciledPositions = positions.filter((p) => p.status === "unreconciled");
+  const closed = positions
+    .filter((p) => p.status === "closed")
+    .sort((a, b) => (b.closed_at ?? "").localeCompare(a.closed_at ?? ""))
+    .slice(0, 25);
 
   return (
     <>
@@ -762,8 +808,36 @@ function ActiveTab({ positions, heatIdeas, signals, serviceRunning, onChanged }:
         </Section>
       )}
 
+      {unreconciledPositions.length > 0 && (
+        <Section title="Needs Reconciliation" subtitle="the broker held fewer shares than this lifecycle bought — no P&L recorded, not retried">
+          <div className="flex flex-col">
+            <GridHeader cols={["ticker / source", "note", "fill", "bought", "unsold", "ended"]} spans={[2,5,1,1,1,2]} />
+            {unreconciledPositions.map((p) => {
+              const origin = tradeOrigin(p, heatIdeas, signals);
+              const executionTicker = p.execution_ticker ?? p.ticker;
+              return (
+                <div key={p.id} className="grid grid-cols-12 items-center gap-3 border-b border-ink-500/20 px-4 py-3 hover:bg-ink-800/30">
+                  <div className="col-span-2">
+                    <div className="font-editorial text-xl italic text-crt-short">{executionTicker}</div>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                      <SourceBadge origin={origin} />
+                      {executionTicker !== p.ticker && <span className="text-[9px] text-bone-600">signal {p.ticker}</span>}
+                    </div>
+                  </div>
+                  <div className="col-span-5 text-[11px] leading-relaxed text-bone-400">{p.reconciliation_note ?? p.exit_last_error ?? "—"}</div>
+                  <div className="col-span-1 tabular text-sm text-bone-300">${p.fill_price?.toFixed(2) ?? "—"}</div>
+                  <div className="col-span-1 tabular text-[11px] text-bone-300">{p.entry_filled_value != null ? `$${p.entry_filled_value.toFixed(2)}` : "—"}</div>
+                  <div className="col-span-1 tabular text-[11px] text-crt-short">{(p.unreconciled_qty ?? 0).toFixed(6)}</div>
+                  <div className="col-span-2 text-[9px] text-bone-600">{formatTradeTime(p.closed_at)}</div>
+                </div>
+              );
+            })}
+          </div>
+        </Section>
+      )}
+
       {closed.length > 0 && (
-        <Section title="Closed Today" subtitle="completed day trades — source and thesis retained for review">
+        <Section title="Closed" subtitle="most recent completed day trades — source and thesis retained for review">
           <div className="flex flex-col">
             <GridHeader cols={["ticker / source", "trade reason", "fill → exit", "p&l $", "p&l %", "exit"]} spans={[2,3,2,2,1,2]} />
             {closed.map((p) => {
@@ -824,8 +898,41 @@ function PnlTab({ pnl }: { pnl: DayTradePnl | null }) {
     );
   }
 
+  const allTime = pnl.all_time;
+  const allTimePnl = allTime?.total_realized_pnl ?? 0;
+  const todayPnl = pnl.total_realized_pnl;
+  const omissions = (pnl.omissions?.unreconciled.length ?? 0) + (pnl.omissions?.stuck_exits.length ?? 0);
+
   return (
-    <Section title="Day Trade P&L" subtitle="all completed day trades">
+    <Section title="Day Trade P&L" subtitle="all completed day trades · realized only · bot ledger, not a broker statement">
+      <div className="grid grid-cols-2 gap-3 border-b border-ink-500/30 px-4 py-3 md:grid-cols-4">
+        <div>
+          <div className="text-[9px] uppercase tracking-[0.18em] text-bone-500">all time</div>
+          <div className={clsx("tabular text-lg font-medium", allTimePnl >= 0 ? "text-crt-long" : "text-crt-short")}>
+            {allTimePnl >= 0 ? "+" : ""}${allTimePnl.toFixed(2)}
+          </div>
+          <div className="text-[9px] text-bone-600">{allTime?.trades ?? pnl.records.length} closed · {allTime?.wins ?? 0}W · {allTime?.losses ?? 0}L</div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-[0.18em] text-bone-500">today</div>
+          <div className={clsx("tabular text-lg font-medium", todayPnl >= 0 ? "text-crt-long" : "text-crt-short")}>
+            {todayPnl >= 0 ? "+" : ""}${todayPnl.toFixed(2)}
+          </div>
+          <div className="text-[9px] text-bone-600">{pnl.trades_today} closed · {pnl.wins}W · {pnl.losses}L</div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-[0.18em] text-bone-500">open (last quote)</div>
+          <div className={clsx("tabular text-lg font-medium", (pnl.open_unrealized_pnl ?? 0) >= 0 ? "text-crt-long" : "text-crt-short")}>
+            {pnl.open_unrealized_pnl == null ? "—" : `${pnl.open_unrealized_pnl >= 0 ? "+" : ""}$${pnl.open_unrealized_pnl.toFixed(2)}`}
+          </div>
+          <div className="text-[9px] text-bone-600">not included above</div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-[0.18em] text-bone-500">not in totals</div>
+          <div className={clsx("tabular text-lg font-medium", omissions > 0 ? "text-crt-short" : "text-bone-300")}>{omissions}</div>
+          <div className="text-[9px] text-bone-600">unreconciled / blocked exits · see /api/performance</div>
+        </div>
+      </div>
       <div className="flex flex-col">
         <GridHeader cols={["when", "ticker", "setup", "fill", "exit", "p&l $", "p&l %", "reason"]} spans={[2,1,3,1,1,2,1,1]} />
         {pnl.records.map((r) => (
