@@ -223,3 +223,70 @@ the 21-day with a nearby prior high) but no mechanical version of that
 description reproduces his result on out-of-sample symbol-days. The next
 honest test is forward, not backward: run the scanner with the breakout
 -volume filter on paper next to the live Heat feed for a month.
+
+## 7. Stress-testing the two leads from §6 (2026-09-12)
+
+Both leads from the feature table were re-tested with look-ahead removed and
+with a permutation test. Neither survives.
+
+### 7.1 Breakout-minute volume was mostly look-ahead
+
+Under `--entry touch` the trade is filled at the level the moment the bar
+touches it, but the volume of that bar is only known when the minute closes.
+A "high-volume breakout minute" is therefore partly a description of what
+the price did *after* the fill. Re-running with `--entry close` (fill at the
+close of the confirming minute, volume fully known) changes the picture:
+
+| rows, policy = live | vol >= 1.5x | vol < 1.5x | vol >= 2x | vol < 2x |
+|---|---|---|---|---|
+| Discord, touch (§6) | +0.92 (n=24) | +0.05 (n=35) | +0.88 (n=16) | +0.23 (n=43) |
+| Discord, close | -0.01 (n=19) | +0.37 (n=48) | -0.07 (n=10) | +0.32 (n=57) |
+| Heat, close | +0.89 (n=4) | +1.06 (n=45) | | |
+| Scanner, close | +0.12 (n=64) | +0.13 (n=181) | +0.38 (n=48) | +0.07 (n=197) |
+| Random, close | +0.15 (n=63) | -0.16 (n=173) | -0.10 (n=42) | -0.08 (n=194) |
+
+- The Discord tilt disappears entirely once the fill waits for the close.
+- The scanner keeps a tilt only at >= 2x (and >= 3x: +0.55 vs +0.08, n=24),
+  not at 1.5x. Permutation test on the >= 2x split: diff +0.32, one-sided
+  p = 0.17; at >= 3x, p = 0.14. The same cut on the random control gives
+  p = 0.18 at 3x. Across the six exit policies the >= 2x scanner subset is
+  positive every time but so is the unfiltered scanner; under `hold` the
+  difference shrinks to +0.21 (p = 0.30).
+- A version that is knowable at touch time (average volume of the three
+  minutes before the breakout / day average) shows no consistent tilt:
+  Heat inverts (>= 1x +(-0.20) vs +0.89 below), Discord inverts, scanner
+  >= 2x is +0.83 on n = 20 with random at +0.33 on n = 21.
+
+Verdict: not a filter. The honest estimate of the volume effect on scanner
+rows is a fraction of a percent with p around 0.15 on n < 50.
+
+### 7.2 Heat before 10:00 ET is a leverage artifact
+
+The early-vs-late split holds across all six policies in raw terms
+(+1.5 to +1.8 % early vs +0.2 to +0.5 % late; permutation p = 0.018), and
+none of the early entries is a gap-through. But the early bucket is where
+the 3x ETF proxies live: 10 of 19 early entries route to 3x products
+(SMH, PLTR, TSLA, SPY, QQQ), against 10 of 33 late. The five biggest early
+winners (+9.6, +9.2, +5.9, +5.5, +3.7 %) are all 3x fills.
+
+| Heat, policy = live | early (< 10:00) | late |
+|---|---|---|
+| raw pnl % | +1.81 (n=19) | +0.28 (n=33) |
+| pnl per 1x of leverage | +0.79 | +0.26 (p = 0.10) |
+| unleveraged names only | +0.10 (n=7) | +0.53 (n=17) |
+
+So the "early entries win" line in §6 is "early entries happened to be the
+leveraged ones during a strong tape". It is not a timing rule, and the
+scanner and random sets show no early/late split at all. Discord early
+entries are the worst bucket (-0.45 % for the first five minutes, n=45).
+
+### 7.3 What is left
+
+Nothing from §5-§7 beats "take the Heat feed as posted" under live rules.
+Prior-high levels alone are worth about the same as random levels the same
+distance above the close. Volume, time of day, pullback state and
+market-regime features either do not separate the winners or do so only in
+ways that also lift the random control. The distribution that matters is
+which names he draws lines on, and that is not in any daily-bar feature
+tried here. With 52 Heat entries, effects smaller than about 1 % per trade
+are not detectable in this sample, so more slicing will mostly find noise.
