@@ -331,6 +331,22 @@ def test_ibkr_order_id_falls_back_to_session_order_id_before_perm_id():
     assert broker.get_order(result.order_id, "SPXL") is not None
 
 
+def test_ibkr_quote_without_book_falls_back_to_last():
+    ib = _FakeIB(last=283.18)
+    original = ib.reqTickers
+
+    def no_book(*contracts):
+        tickers = original(*contracts)
+        for t in tickers:
+            t.bid = t.ask = float("nan")
+        return tickers
+
+    ib.reqTickers = no_book  # type: ignore[assignment]
+    quote = IBKRBroker(ib).quotes(["SPXL"])["SPXL"]
+    assert quote.last == 283.18 and quote.bid == 283.18 and quote.ask == 283.18
+    assert quote.spread_pct == 0.0
+
+
 def test_ibkr_quotes_positions_and_tradability():
     ib = _FakeIB(positions={"SPXL": 0.070886})
     broker = IBKRBroker(ib, market_data_type=3)

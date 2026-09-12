@@ -339,11 +339,20 @@ class IBKRBroker(Broker):
         for contract, ticker in zip(contracts, tickers):
             symbol = str(contract.symbol).upper()
             last = _num(getattr(ticker, "last", None)) or _num(getattr(ticker, "close", None))
+            bid = _num(getattr(ticker, "bid", None)) or None
+            ask = _num(getattr(ticker, "ask", None)) or None
+            if last and (bid is None or ask is None):
+                # Delayed / frozen snapshots outside the session carry no
+                # book.  Use the last trade for both sides so preflight can
+                # still compute a (zero) spread; the log says it is synthetic.
+                bid = bid or last
+                ask = ask or last
+                log.debug("IBKR quote for %s has no bid/ask; using last=%.4f for both", symbol, last)
             out[symbol] = Quote(
                 symbol=symbol,
                 last=last if last else None,
-                bid=_num(getattr(ticker, "bid", None)) or None,
-                ask=_num(getattr(ticker, "ask", None)) or None,
+                bid=bid,
+                ask=ask,
                 volume=_num(getattr(ticker, "volume", None)),
                 # IBKR snapshots carry no 30-day average volume; curated
                 # leveraged routes do not need it, others fall back to volume.
