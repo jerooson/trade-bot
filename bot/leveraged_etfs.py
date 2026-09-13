@@ -86,6 +86,10 @@ P0_LEVERAGED_ETFS: dict[str, dict[str, tuple[LeveragedETF, ...]]] = {
     "PLTR": {
         "long": (LeveragedETF("PLTU", 2.0),),
     },
+    "MU": {
+        "long": (LeveragedETF("MUU", 2.0),),
+        "short": (LeveragedETF("MUZ", 2.0),),
+    },
 }
 
 # These are indexes/futures-style signal symbols, not Robinhood equities that
