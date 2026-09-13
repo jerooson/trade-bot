@@ -66,6 +66,11 @@ class Policy:
     # a one-second wick is enough).  "close": the bar must also close beyond
     # the level, closer to what a 5-15 s poll actually observes.
     entry_mode: str = "touch"
+    # Research knobs (defaults reproduce the live rules):
+    milestones: tuple[tuple[float, float], ...] | None = None   # override MILESTONES
+    exit_time: dtime | None = None                               # flatten at this ET time
+    trim_pct: float | None = None                                # take part off at +trim_pct
+    trim_frac: float = 0.5                                       # fraction sold at the trim
 
 
 # Sessions a level stays live in the replay, per source.  Discord plans carry
@@ -212,6 +217,9 @@ def simulate(
 
     stop = level(-policy.stop_pct) if policy.stop_pct is not None else None
     target = row.target if (policy.use_target and row.target) else None
+    milestones = list(policy.milestones) if policy.milestones is not None else MILESTONES
+    trimmed_pnl = 0.0          # realised pnl% contribution of the trimmed part
+    remaining = 1.0            # fraction of the position still open
     milestone_idx = 0
     confirm = 0
     confirm_idx: int | None = None
@@ -245,10 +253,18 @@ def simulate(
                 exit_ts, exit_reason = b.ts, "target"
                 exit_px = target if direct else _exec_price(exec_bars, b.ts, target)
                 break
-        if b.ts.time() >= FORCE_CLOSE:
-            exit_ts, exit_reason = b.ts, "eod"
+        if b.ts.time() >= FORCE_CLOSE or (policy.exit_time is not None and b.ts.time() >= policy.exit_time):
+            exit_ts, exit_reason = b.ts, "eod" if b.ts.time() >= FORCE_CLOSE else "time"
             exit_px = b.close if direct else _exec_price(exec_bars, b.ts, b.close)
             break
+        if policy.trim_pct is not None and remaining == 1.0 and hi_move >= policy.trim_pct:
+            trim_risk = level(policy.trim_pct)
+            trim_px = trim_risk if direct else _exec_price(exec_bars, b.ts, trim_risk)
+            part = (trim_px - entry_px) / entry_px * 100
+            if short and direct:
+                part = -part
+            trimmed_pnl = part * policy.trim_frac
+            remaining = 1.0 - policy.trim_frac
         if policy.eod_tighten and not tightened and b.ts.time() >= EOD_TIGHTEN:
             new_stop = round(b.close * 1.01, 4) if short else round(b.close * 0.99, 4)
             if stop is None or (new_stop < stop if short else new_stop > stop):
@@ -257,8 +273,8 @@ def simulate(
             continue
         if policy.trailing:
             eligible = None
-            for idx in range(milestone_idx, len(MILESTONES)):
-                thr, _ = MILESTONES[idx]
+            for idx in range(milestone_idx, len(milestones)):
+                thr, _ = milestones[idx]
                 if favorable(b.close) >= thr:
                     eligible = idx
                 else:
@@ -270,7 +286,7 @@ def simulate(
                 confirm_idx = eligible
                 need = FIRST_MILESTONE_CONFIRM if eligible == 0 else CONFIRM_BARS
                 if confirm >= need:
-                    _, lock = MILESTONES[eligible]
+                    _, lock = milestones[eligible]
                     new_stop = level(lock)
                     if stop is None or (new_stop < stop if short else new_stop > stop):
                         stop = new_stop
@@ -284,6 +300,7 @@ def simulate(
     pnl_pct = (exit_px - entry_px) / entry_px * 100
     if short and direct:
         pnl_pct = -pnl_pct
+    pnl_pct = trimmed_pnl + pnl_pct * remaining
     return ReplayResult(**base, entered=True, skip_reason=None, entry_ts=entry_bar.ts.isoformat(),
                         entry_price=round(entry_px, 4), entry_risk_price=round(anchor, 4),
                         exit_ts=exit_ts.isoformat(), exit_price=round(exit_px, 4), exit_reason=exit_reason,

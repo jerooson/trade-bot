@@ -157,3 +157,30 @@ def test_reviewed_chart_levels_fill_heat_ideas_without_numeric_levels(tmp_path):
     ideas.write_text(ideas.read_text(encoding="utf-8").replace('"h1"', '"h2"'), encoding="utf-8")
     rows = heat_rows(ideas, None, reviewed)
     assert rows[0].trigger is None and "chart_reviewed_no_level:guess" in rows[0].notes
+
+
+def test_exit_time_flattens_at_the_given_bar():
+    from datetime import time as dtime
+    closes = [100.0] * 5 + [101.0] + [102.0] * 384      # cross at 09:35, then flat at 102
+    pol = Policy("exit12", exit_time=dtime(12, 0))
+    r = simulate(_row(), _bars(closes), _bars(closes), pol, session=DAY, armed=True)
+    assert r.exit_reason == "time" and r.exit_ts.endswith("12:00:00-04:00")
+    assert r.pnl_pct == pytest.approx((102.0 - 101.0) / 101.0 * 100, abs=1e-3)
+
+
+def test_trim_realises_half_at_the_trim_level_and_runs_the_rest():
+    closes = [100.0] * 5 + [101.0] + [103.5] * 10 + [98.0] * 374    # +2.5% then through the -2% stop
+    pol = Policy("trim", stop_pct=2.0, trailing=False, eod_tighten=False, trim_pct=2.0, trim_frac=0.5)
+    r = simulate(_row(), _bars(closes), _bars(closes), pol, session=DAY, armed=True)
+    trimmed = (101.0 * 1.02 - 101.0) / 101.0 * 100 * 0.5           # half sold at +2%
+    rest = -2.0 * 0.5                                              # other half stopped at -2%
+    assert r.pnl_pct == pytest.approx(trimmed + rest, abs=0.05)
+    untrimmed = simulate(_row(), _bars(closes), _bars(closes), Policy("flat", 2.0, False, False, False), session=DAY, armed=True)
+    assert untrimmed.pnl_pct == pytest.approx(-2.0, abs=0.05)
+
+
+def test_milestone_override_changes_lock_level():
+    closes = [100.0] * 5 + [101.0] + [102.5] * 5 + [101.6] * 379     # +1.5% then fade to +0.6%
+    tight = Policy("tight", milestones=((0.5, -0.5), (1.0, 0.8)))
+    r = simulate(_row(), _bars(closes), _bars(closes), tight, session=DAY, armed=True)
+    assert r.exit_reason == "stop" and r.pnl_pct == pytest.approx(0.8, abs=0.05)

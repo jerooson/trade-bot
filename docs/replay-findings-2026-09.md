@@ -290,3 +290,47 @@ ways that also lift the random control. The distribution that matters is
 which names he draws lines on, and that is not in any daily-bar feature
 tried here. With 52 Heat entries, effects smaller than about 1 % per trade
 are not detectable in this sample, so more slicing will mostly find noise.
+
+## 8. Exit-rule variants for Heat signals, ranked by risk-adjusted return (2026-09-12)
+
+Question: is there an exit rule with a better Sharpe than the live one for
+Heat signals?  17 variants replayed on the same 52 (touch) / 49 (close)
+entries: initial stop 1 / 1.5 / 3 %, tighter or looser trailing ladders, no
+EOD tighten, no target, time exits at 12:00 / 13:00 / 14:00, and Heat-style
+partial take-profit (sell half at +1.5 / 2 / 3 %, run the rest under the live
+ladder).  Sharpe here is mean / sd of per-trade %.
+
+| Heat, entry = touch | avg % | Sharpe/trade | win % | PF | max DD % |
+|---|---:|---:|---:|---:|---:|
+| trim half at +2 % | 0.89 | 0.39 | 65 | 3.4 | -7.6 |
+| tight ladder (+0.5 -> -0.5, +1 -> +0.2, +2 -> +1 ...) | 0.93 | 0.39 | 65 | 3.6 | -7.6 |
+| live with 1.5 % initial stop | 0.90 | 0.37 | 63 | 3.7 | -6.8 |
+| live (current) | 0.85 | 0.35 | 63 | 3.2 | -7.6 |
+| exit at 12:00 | 0.93 | 0.36 | 65 | 3.8 | -8.3 |
+| 3 % initial stop | 0.81 | 0.32 | 63 | 2.9 | -9.5 |
+| loose ladder | 0.81 | 0.31 | 62 | 2.7 | -9.6 |
+
+With `--entry close` the same order holds (live 0.42; trim-half 0.46-0.49;
+loose ladder 0.39).  Removing the EOD tighten or the target changes nothing:
+no Heat trade in the sample hit either.
+
+Paired bootstrap against live on the same signals (95 % CI of the mean
+difference, %/trade):
+
+| variant | touch | close |
+|---|---|---|
+| trim half at +2 % | +0.04 [-0.16, +0.22] | +0.01 [-0.14, +0.16] |
+| tight ladder | +0.08 [-0.13, +0.29] | -0.00 [-0.16, +0.14] |
+| 1.5 % initial stop | +0.05 [+0.01, +0.09] (4 trades differ) | +0.01 [+0.00, +0.03] (1 trade) |
+| exit at 12:00 | +0.08 [-0.28, +0.46] | -0.03 [-0.35, +0.28] |
+| loose ladder | -0.04 [-0.18, +0.10] | -0.04 [-0.19, +0.11] |
+
+Reading: every variant is within sampling noise of the live rules.  The
+ranking is stable in direction (tighter protection >= live > looser
+protection) but the effect sizes are a few hundredths of a percent per
+trade on n ~ 50, so nothing here justifies changing the live exit.  The one
+interval that excludes zero, the 1.5 % initial stop, rests on four trades.
+Heat-style trimming does what it does for him: it lowers variance (sd 2.28
+vs 2.47) and raises the median, without changing the mean.  Not adopted;
+`Policy` now carries `milestones`, `exit_time`, `trim_pct` / `trim_frac` so
+the same table can be re-run when the sample is larger.
