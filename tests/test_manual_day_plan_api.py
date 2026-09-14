@@ -87,7 +87,6 @@ def test_executed_plan_allows_new_watch_for_same_ticker(monkeypatch, workspace_t
         "manual_plan_id": second.json()["id"],
         "status": "open",
         "fill_qty": 0.5,
-    }) + "
-", encoding="utf-8")
+    }) + "\n", encoding="utf-8")
     cannot_cancel_live = client.delete(f"/api/daytrader/manual-plans/{second.json()['id']}")
     assert cannot_cancel_live.status_code == 409
