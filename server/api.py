@@ -33,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from bot import performance, position_ownership
+from bot import acknowledgements, performance, position_ownership
 from bot.manual_day_plans import cancel_plan, create_plan, load_plans
 from bot.heat_ideas import (
     append_jsonl as append_heat_jsonl,
@@ -91,6 +91,7 @@ HEAT_IDEAS_PATH = LOG_DIR / "heat_ideas.jsonl"
 HEAT_ATTACHMENTS_PATH = LOG_DIR / "heat_attachments"
 HEAT_DECISIONS_PATH = PROJECT_ROOT / "state" / "heat_idea_decisions.jsonl"
 HEAT_SETTINGS_PATH = PROJECT_ROOT / "state" / "heat_settings.json"
+ACKNOWLEDGED_POSITIONS_PATH = PROJECT_ROOT / "state" / "acknowledged_positions.json"
 # Service PID file written by the day_trader process.
 DAY_TRADER_PID_PATH = LOG_DIR / "day_trader.pid"
 
@@ -928,6 +929,25 @@ def remove_manual_day_plan(plan_id: str) -> dict[str, Any]:
     return plan
 
 
+class AcknowledgeInput(BaseModel):
+    note: str | None = None
+
+
+@app.post("/api/daytrader/positions/{position_id}/acknowledge")
+def acknowledge_position(position_id: str, body: AcknowledgeInput | None = None) -> dict[str, Any]:
+    """Archive an unreconciled lifecycle: it stays in the ledger and the P&L
+    report, but stops being flagged on the dashboard and in the daily review."""
+    pos = next((p for p in _latest_day_trade_positions() if str(p.get("id")) == position_id), None)
+    if pos is None:
+        raise HTTPException(status_code=404, detail="day-trade position not found")
+    if pos.get("status") != "unreconciled" and not float(pos.get("unreconciled_qty") or 0) > 0:
+        raise HTTPException(status_code=409, detail="only unreconciled lifecycles can be acknowledged")
+    return acknowledgements.acknowledge(
+        position_id, ticker=pos.get("ticker"), note=(body.note if body else None),
+        path=ACKNOWLEDGED_POSITIONS_PATH,
+    )
+
+
 def _find_heat_idea(idea_id: str) -> dict[str, Any] | None:
     return next(
         (item for item in load_materialized_heat_ideas(
@@ -1055,9 +1075,13 @@ def get_daytrader_state() -> dict[str, Any]:
         owned_qty = position_ownership.day_position_owned_qty(p)
         if p.get("current_price") is not None and p.get("fill_price") and owned_qty > 0:
             unrealized += (float(p["current_price"]) - float(p["fill_price"])) * owned_qty
+    acked = acknowledgements.load(ACKNOWLEDGED_POSITIONS_PATH)
+    for p in positions:
+        p["acknowledged"] = str(p.get("id")) in acked
     unreconciled = [
         {"id": p.get("id"), "ticker": p.get("ticker"), "status": p.get("status"),
-         "unreconciled_qty": p.get("unreconciled_qty"), "note": p.get("reconciliation_note")}
+         "unreconciled_qty": p.get("unreconciled_qty"), "note": p.get("reconciliation_note"),
+         "acknowledged": str(p.get("id")) in acked}
         for p in positions
         if p.get("status") == "unreconciled" or float(p.get("unreconciled_qty") or 0) > 0
     ]

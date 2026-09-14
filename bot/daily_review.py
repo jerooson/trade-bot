@@ -227,8 +227,11 @@ def health_section(paths: Paths, positions: list[dict[str, Any]], now: datetime)
         hb = round((now.timestamp() - paths.heartbeat.stat().st_mtime) / 60, 1)
     stuck = [p for p in positions if p.get("status") in ("pending_exit", "pending_entry")
              and (_ts(p.get("exit_requested_at") or p.get("entry_submitted_at")) or now) < now - timedelta(minutes=30)]
+    from bot.acknowledgements import load as load_acks
+    acked = load_acks(paths.root / "state" / "acknowledged_positions.json")
     return {"day_trader_heartbeat_age_min": hb,
-            "unreconciled": [p.get("ticker") for p in positions if p.get("status") == "unreconciled"],
+            "unreconciled": [p.get("ticker") for p in positions
+                             if p.get("status") == "unreconciled" and str(p.get("id")) not in acked],
             "stuck_pending": [f"{p.get('ticker')}:{p.get('status')}" for p in stuck]}
 
 

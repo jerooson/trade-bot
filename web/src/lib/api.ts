@@ -218,6 +218,18 @@ export async function createManualDayPlan(input: {
   return res.json();
 }
 
+export async function acknowledgePosition(positionId: string, note?: string): Promise<void> {
+  const res = await fetch(`/api/daytrader/positions/${positionId}/acknowledge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note: note ?? null }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail ?? `acknowledge: ${res.status}`);
+  }
+}
+
 export async function cancelManualDayPlan(planId: string): Promise<void> {
   const res = await fetch(`/api/daytrader/manual-plans/${planId}`, {
     method: "DELETE",

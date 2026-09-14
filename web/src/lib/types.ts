@@ -218,6 +218,7 @@ export interface DayTradePosition {
   exit_filled_value: number;
   exit_last_error: string | null;
   unreconciled_qty?: number;
+  acknowledged?: boolean;
   reconciliation_note?: string | null;
   quarantine_reason?: string | null;
   realized_pnl: number | null;
@@ -319,7 +320,7 @@ export interface DayTradePnl {
   all_time?: { total_realized_pnl: number; wins: number; losses: number; trades: number };
   open_unrealized_pnl?: number | null;   // last polled quote, not a live mark
   omissions?: {
-    unreconciled: { id: string; ticker: string; status: string; unreconciled_qty: number | null; note: string | null }[];
+    unreconciled: { id: string; ticker: string; status: string; unreconciled_qty: number | null; note: string | null; acknowledged?: boolean }[];
     stuck_exits: { id: string; ticker: string; error: string | null; requested_at: string | null }[];
   };
   records: DayTradePnlRecord[];

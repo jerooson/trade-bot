@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import clsx from "clsx";
 import type { DayTradePosition, DayTradePnl, HeatIdea, HeatSettings, ManualDayPlan, Signal } from "../lib/types";
-import { approveHeatIdea, cancelManualDayPlan, createManualDayPlan, rejectHeatIdea, setHeatAutoTrading } from "../lib/api";
+import { acknowledgePosition, approveHeatIdea, cancelManualDayPlan, createManualDayPlan, rejectHeatIdea, setHeatAutoTrading } from "../lib/api";
 import { SignalsView, type DashLike } from "./SignalsView";
 import { relativeTime } from "../lib/format";
 
@@ -35,7 +35,7 @@ export function DayTradeView({ dash, positions, manualPlans, heatIdeas, heatSett
   const allTime = pnl?.all_time;
   const allTimePnl = allTime?.total_realized_pnl ?? 0;
   const unrealized = pnl?.open_unrealized_pnl ?? null;
-  const unreconciled = pnl?.omissions?.unreconciled ?? [];
+  const unreconciled = (pnl?.omissions?.unreconciled ?? []).filter((item) => !item.acknowledged);
   const stuckExits = pnl?.omissions?.stuck_exits ?? [];
   const omissionCount = unreconciled.length + stuckExits.length;
 
@@ -689,7 +689,7 @@ function ActiveTab({ positions, heatIdeas, signals, serviceRunning, onChanged }:
 
   const watching = positions.filter((p) => p.status === "watching" || p.status === "pending_entry");
   const open = positions.filter((p) => p.status === "open" || p.status === "pending_exit");
-  const unreconciledPositions = positions.filter((p) => p.status === "unreconciled");
+  const unreconciledPositions = positions.filter((p) => p.status === "unreconciled" && !p.acknowledged);
   const closed = positions
     .filter((p) => p.status === "closed")
     .sort((a, b) => (b.closed_at ?? "").localeCompare(a.closed_at ?? ""))
@@ -811,7 +811,7 @@ function ActiveTab({ positions, heatIdeas, signals, serviceRunning, onChanged }:
       {unreconciledPositions.length > 0 && (
         <Section title="Needs Reconciliation" subtitle="the broker held fewer shares than this lifecycle bought — no P&L recorded, not retried">
           <div className="flex flex-col">
-            <GridHeader cols={["ticker / source", "note", "fill", "bought", "unsold", "ended"]} spans={[2,5,1,1,1,2]} />
+            <GridHeader cols={["ticker / source", "note", "fill", "bought", "unsold", "ended"]} spans={[2,4,1,1,1,3]} />
             {unreconciledPositions.map((p) => {
               const origin = tradeOrigin(p, heatIdeas, signals);
               const executionTicker = p.execution_ticker ?? p.ticker;
@@ -824,11 +824,23 @@ function ActiveTab({ positions, heatIdeas, signals, serviceRunning, onChanged }:
                       {executionTicker !== p.ticker && <span className="text-[9px] text-bone-600">signal {p.ticker}</span>}
                     </div>
                   </div>
-                  <div className="col-span-5 text-[11px] leading-relaxed text-bone-400">{p.reconciliation_note ?? p.exit_last_error ?? "—"}</div>
+                  <div className="col-span-4 text-[11px] leading-relaxed text-bone-400">{p.reconciliation_note ?? p.exit_last_error ?? "—"}</div>
                   <div className="col-span-1 tabular text-sm text-bone-300">${p.fill_price?.toFixed(2) ?? "—"}</div>
                   <div className="col-span-1 tabular text-[11px] text-bone-300">{p.entry_filled_value != null ? `$${p.entry_filled_value.toFixed(2)}` : "—"}</div>
                   <div className="col-span-1 tabular text-[11px] text-crt-short">{(p.unreconciled_qty ?? 0).toFixed(6)}</div>
-                  <div className="col-span-2 text-[9px] text-bone-600">{formatTradeTime(p.closed_at)}</div>
+                  <div className="col-span-3 flex items-center justify-between gap-2">
+                    <span className="text-[9px] text-bone-600">{formatTradeTime(p.closed_at)}</span>
+                    <button
+                      onClick={async () => {
+                        try { await acknowledgePosition(p.id); await onChanged(); }
+                        catch (e) { setError(String(e)); }
+                      }}
+                      className="border border-ink-500/60 px-2 py-1 text-[10px] uppercase tracking-[0.15em] text-bone-300 hover:border-crt-info/40 hover:text-bone-50"
+                      title="Archive: keeps the ledger and P&L, stops flagging it"
+                    >
+                      已确认归档
+                    </button>
+                  </div>
                 </div>
               );
             })}
