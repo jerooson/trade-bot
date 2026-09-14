@@ -334,3 +334,46 @@ Heat-style trimming does what it does for him: it lowers variance (sd 2.28
 vs 2.47) and raises the median, without changing the mean.  Not adopted;
 `Policy` now carries `milestones`, `exit_time`, `trim_pct` / `trim_frac` so
 the same table can be re-run when the sample is larger.
+
+## 9. "Buy the pullback to the 20 EMA" (2026-09-14)
+
+Question from the owner: ASST-style strong names look buyable on a 4H
+pullback to the 20 EMA; is that a rule?  `bot/ema_pullback.py` tests it on
+cached data, long only, with a matched random control.
+
+Rule: daily uptrend (close > SMA21, SMA21 rising over 5 sessions); the prior
+3 bars sat above the EMA; this bar's low touches the EMA and it closes back
+above; buy the close; stop at the bar's low; exit on a close below the EMA,
+the stop, or after 10 bars.  Control: on the same symbol's trend days, a
+random bar within +-15 bars with the SAME stop distance in percent (an
+unmatched control loses 0.7 %/trade to stop width alone, which is what the
+first pass showed).  Window 2026-07-16..2026-09-11, 65 symbols with
+continuous minute bars for 4H, 137 symbols for daily.
+
+| flavour | pullback avg (n) | median | win % | matched random avg | diff, 95 % CI |
+|---|---|---|---|---|---|
+| 4H EMA20 | +1.72 % (75) | -0.40 % | 35 | +1.00 % | +0.72 [-1.90, +2.73] |
+| 4H EMA20, Heat names | +1.71 % (34) | -0.39 % | 32 | +1.57 % | ~0 |
+| daily EMA10 | -0.25 % (106) | -1.52 % | 25 | -0.93 % | n.s. |
+| daily EMA20 | -0.72 % (82) | -2.00 % | 22 | -1.56 % | n.s. |
+
+Sensitivity on the 4H rule (clear 2/3/4 bars, hold 6/10/20): pullback
++1.0 to +2.0 %, control +0.4 to +1.1 %, every difference CI includes zero.
+
+Reading:
+- The 4H mean is carried by a handful of five-session holds in late August
+  (CRM +24.7 %, INFQ +18.5 %, GTLB +17.3 %, HPE +15.1 %), i.e. earnings-season
+  moves in names that happened to be in an uptrend.  Median trade loses,
+  win rate 35 %, 53 % of trades stop out at the pullback low.
+- Once the control gets the same stop width, the pullback timing adds
+  about +0.7 %/trade with an interval three times wider than the estimate.
+  On Heat's own names the difference is nil.
+- On daily bars the rule loses money outright in this window; the control
+  loses more, which says the window was mean-reverting at the daily
+  horizon, not that the rule works.
+
+Verdict: not a signal source.  "Strong stock + pullback to the EMA" is the
+uptrend filter doing the work, and the uptrend filter alone was worth about
++1 % per five-session hold in this window with the same stop.  Data path is
+ready (Robinhood's `get_equity_technical_indicators` returns 4H EMA series
+directly) if a larger sample ever changes the picture.
