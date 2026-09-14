@@ -149,3 +149,24 @@ def test_no_entries_outside_regular_hours():
     run_once(s, shadows, _now(8, 0), ideas=[_idea()])
     assert shadows["i1"].status == "watching"
     assert not any(t == "get_equity_quotes" for t, _ in s.calls)
+
+
+def test_implausible_trigger_never_opens_a_shadow():
+    s = FakeSession(price=57.8)
+    shadows = {}
+    run_once(s, shadows, _now(), ideas=[_idea(trigger_price=1.618)])   # mis-parsed fib ratio
+    assert shadows == {}
+    rows = [__import__("json").loads(l) for l in osh.LEDGER_PATH.read_text(encoding="utf-8").splitlines()]
+    assert any(r["event"] == "expired" and "implausible" in r.get("reason", "") for r in rows)
+
+
+def test_idea_is_shadowed_at_most_once():
+    s = FakeSession(price=100.2)
+    shadows = {}
+    run_once(s, shadows, _now(), ideas=[_idea()])
+    assert shadows["i1"].status == "open"
+    shadows["i1"].status = "closed"
+    run_once(s, shadows, _now(10, 1), ideas=[_idea()])       # closed shadow dropped, idea still approved
+    assert "i1" not in shadows
+    run_once(s, shadows, _now(10, 2), ideas=[_idea()])
+    assert "i1" not in shadows                                # ledger says it already opened once

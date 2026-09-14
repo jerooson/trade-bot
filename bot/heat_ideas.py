@@ -66,6 +66,13 @@ _ENTRY_INTENT_RE = re.compile(
     r"break\s*(?:out|above)|buy|long|reclaim)",
     re.I,
 )
+# ``站上fib 1.618 64.21了``: the ratio names the line, the price follows it.
+_FIB_LABEL_PATTERN = re.compile(
+    r"(?:站上|突破|超过|高于|above|over|reclaim(?:s|ed)?)[^0-9A-Za-z]{0,12}"
+    r"(?:fibs?|fibo)\s*[0-9]+(?:\.[0-9]+)?\s*\$?([0-9]{2,}(?:\.[0-9]+)?)",
+    re.I,
+)
+
 _TRIGGER_PATTERNS = (
     re.compile(
         r"(?:站上|突破|超过|高于|above|over|reclaim(?:s|ed)?|break(?:s|ing)?\s*(?:above|over)?)"
@@ -76,6 +83,7 @@ _TRIGGER_PATTERNS = (
         r"\$?([0-9]+(?:\.[0-9]+)?)\s*(?:以上)?\s*(?:突破|站上|breakout|break\s*above)",
         re.I,
     ),
+    _FIB_LABEL_PATTERN,
     re.compile(
         r"\$?([0-9]+(?:\.[0-9]+)?)\s*(?:附近|左右)?\s*"
         r"(?:买入|买了|买点|建仓|做多|bought|buy)",
@@ -147,9 +155,11 @@ def _classification_from(text: str, trigger: float | None) -> str:
 
 # Words that turn the following number into a ratio / indicator value rather
 # than a dollar level: ``站上 fib 1.414`` is a Fibonacci extension, not $1.414.
+# ``\b`` does not fire between a CJK character and a Latin letter (both are
+# ``\w``), so ``站上fib 1.618`` needs explicit non-letter lookarounds.
 _RATIO_CONTEXT_RE = re.compile(
-    r"(?:\bfibs?\b|\bfibo\b|fibonacci|斐波那契|黄金分割|extension|retrace(?:ment)?|"
-    r"\bema\b|\bsma\b|\bma\b|\bvwap\b|\brsi\b|\batr\b|日线|均线|周线|月线)",
+    r"(?:(?<![A-Za-z])(?:fibs?|fibo|ema|sma|ma|vwap|rsi|atr)(?![A-Za-z])|"
+    r"fibonacci|斐波那契|黄金分割|extension|retrace(?:ment)?|日线|均线|周线|月线)",
     re.I,
 )
 _RATIO_SUFFIX_RE = re.compile(r"\s*(?:%|％|倍|x\b|日线|均线|周线|ema\b|sma\b|ma\b)", re.I)
@@ -186,7 +196,7 @@ def looks_like_fib_ratio(value: float) -> bool:
 def _trigger_from(text: str) -> float | None:
     for pattern in _TRIGGER_PATTERNS:
         for match in pattern.finditer(text or ""):
-            if not _number_is_price_level(text, match):
+            if pattern is not _FIB_LABEL_PATTERN and not _number_is_price_level(text, match):
                 continue
             try:
                 value = float(match.group(1))

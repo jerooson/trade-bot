@@ -38,7 +38,11 @@ from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-from bot.heat_ideas import load_materialized_heat_ideas
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from bot.heat_ideas import is_plausible_trigger, load_materialized_heat_ideas  # noqa: E402
 from bot.leveraged_etfs import result_by_symbol
 
 log = logging.getLogger("bot.option_shadow")
@@ -312,8 +316,26 @@ def _sessions_since(created_at: str, today: date) -> int:
     return n
 
 
-def sync_ideas(shadows: dict[str, Shadow], ideas: list[dict[str, Any]], today: date) -> None:
+def traded_ids(path: Path | None = None) -> set[str]:
+    """Ideas that already produced a paper position (one shadow per idea, ever)."""
+    path = path or LEDGER_PATH
+    if not path.exists():
+        return set()
+    out: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("event") == "open" and rec.get("idea_id"):
+            out.add(str(rec["idea_id"]))
+    return out
+
+
+def sync_ideas(shadows: dict[str, Shadow], ideas: list[dict[str, Any]], today: date,
+               done: set[str] | None = None) -> None:
     """Create watches for approved Heat ideas; expire stale watches."""
+    done = done if done is not None else traded_ids()
     live: set[str] = set()
     for idea in ideas:
         iid = str(idea.get("id") or "")
@@ -321,7 +343,7 @@ def sync_ideas(shadows: dict[str, Shadow], ideas: list[dict[str, Any]], today: d
         direction = str(idea.get("direction") or "").lower()
         if not iid or trig is None or idea.get("decision") != "approved" or direction not in {"long", "short"}:
             continue
-        if _sessions_since(str(idea.get("created_at")), today) > MAX_IDEA_AGE_SESSIONS:
+        if _sessions_since(str(idea.get("created_at")), today) > MAX_IDEA_AGE_SESSIONS or iid in done:
             continue
         live.add(iid)
         if iid in shadows:
@@ -344,7 +366,7 @@ def run_once(session: Session, shadows: dict[str, Shadow], now: datetime, ideas:
     before = json.dumps({k: asdict(v) for k, v in shadows.items()}, sort_keys=True)
     if ideas is None:
         ideas = load_materialized_heat_ideas()
-    sync_ideas(shadows, ideas, now.date())
+    sync_ideas(shadows, ideas, now.date(), done=traded_ids() | {k for k, v in shadows.items() if v.status == "open"})
     if in_regular_hours(now):
         active = [s for s in shadows.values() if s.status in ("watching", "open")]
         prices = underlying_prices(session, sorted({s.ticker for s in active}))
@@ -353,6 +375,12 @@ def run_once(session: Session, shadows: dict[str, Shadow], now: datetime, ideas:
             if px is None:
                 continue
             if s.status == "watching":
+                if not is_plausible_trigger(s.trigger, px):
+                    # a mis-parsed ratio or indicator value (``fib 1.618``) is not a level
+                    s.status = "expired"
+                    append_ledger({"event": "expired", "idea_id": s.idea_id, "ticker": s.ticker,
+                                   "reason": f"implausible_trigger {s.trigger} vs {px}", "ts": now.isoformat()})
+                    continue
                 if crossed(px, s.trigger, s.operator) and now.time() < FLATTEN_TIME:
                     try:
                         open_shadow(session, s, px, now)
@@ -375,7 +403,8 @@ def report(path: Path | None = None) -> str:
     if not path.exists():
         return "no ledger"
     rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
-    closed = [r for r in rows if r["event"] == "closed"]
+    voided = {r["idea_id"] for r in rows if r["event"] == "void"}
+    closed = [r for r in rows if r["event"] == "closed" and r["idea_id"] not in voided]
     watches = sum(1 for r in rows if r["event"] == "watch")
     opens = sum(1 for r in rows if r["event"] == "open")
     lines = [f"watches={watches} opened={opens} closed={len(closed)}"]

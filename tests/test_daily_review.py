@@ -46,7 +46,7 @@ def test_build_and_render(tmp_path):
     assert r["heat"]["count"] == 3 and len(r["heat"]["approved"]) == 1 and len(r["heat"]["needs_review"]) == 1
     assert len(r["heat"]["option_posts"]) == 1
     assert r["day_trades"]["summary"]["n"] == 1 and r["day_trades"]["summary"]["pnl_usd"] == 0.7
-    assert r["day_trades"]["closed"][0]["slippage_vs_cap_pct"] == -0.14
+    assert r["day_trades"]["closed"][0]["slippage_vs_cap_pct"] is None   # cap is on QQQ, fill is TQQQ
     assert [w["ticker"] for w in r["day_trades"]["still_watching"]] == ["AMD"]
     outcomes = {x["ticker"]: x["outcome"] for x in r["heat_vs_bot"]}
     assert outcomes["QQQ"].startswith("traded:eod") and outcomes["SPY"] == "not_approved:needs_review"

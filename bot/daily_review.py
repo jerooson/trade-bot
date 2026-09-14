@@ -116,7 +116,8 @@ def day_trade_section(positions: list[dict[str, Any]], day: date) -> dict[str, A
         lev = p.get("execution_leverage") or 1.0
         exec_tk = p.get("execution_ticker") or p.get("ticker")
         # slippage on the executed instrument vs the entry cap the bot set
-        slip = _pct(fill, p.get("entry_limit_price")) if fill else None
+        # the entry cap is set on the signal ticker; only comparable when we bought it directly
+        slip = _pct(fill, p.get("entry_limit_price")) if fill and exec_tk == p.get("ticker") else None
         row = {"ticker": p.get("ticker"), "execution": exec_tk, "leverage": lev, "source": p.get("source"),
                "trigger": trig, "entered": _hm(p.get("entered_at")), "fill_price": fill,
                "fill_qty": p.get("fill_qty"), "fill_usd": p.get("entry_filled_value"),

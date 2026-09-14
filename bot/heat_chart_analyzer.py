@@ -12,6 +12,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
 import subprocess
 import time
 from datetime import datetime, timezone
