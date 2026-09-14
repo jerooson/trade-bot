@@ -75,7 +75,19 @@ def test_executed_plan_allows_new_watch_for_same_ticker(monkeypatch, workspace_t
     assert second.status_code == 200
     assert second.json()["id"] != first["id"]
 
-    cannot_cancel_executed = client.delete(
-        f"/api/daytrader/manual-plans/{first['id']}"
-    )
-    assert cannot_cancel_executed.status_code == 409
+    # Closed history never pins a GTC plan: it can be cancelled.
+    cancel_after_close = client.delete(f"/api/daytrader/manual-plans/{first['id']}")
+    assert cancel_after_close.status_code == 200
+    assert cancel_after_close.json()["status"] == "cancelled"
+
+    # A live position does block cancellation.
+    positions_path.write_text(json.dumps({
+        "id": "position-2",
+        "ticker": "AAPL",
+        "manual_plan_id": second.json()["id"],
+        "status": "open",
+        "fill_qty": 0.5,
+    }) + "
+", encoding="utf-8")
+    cannot_cancel_live = client.delete(f"/api/daytrader/manual-plans/{second.json()['id']}")
+    assert cannot_cancel_live.status_code == 409

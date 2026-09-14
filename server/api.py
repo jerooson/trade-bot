@@ -910,14 +910,17 @@ def add_manual_day_plan(request: ManualDayPlanRequest) -> dict[str, Any]:
 @app.delete("/api/daytrader/manual-plans/{plan_id}")
 def remove_manual_day_plan(plan_id: str) -> dict[str, Any]:
     positions = _latest_day_trade_positions()
+    # A GTC watch re-arms after every closed trade, so closed history must not
+    # pin the plan forever; only a position with shares or an order in flight
+    # blocks cancellation.
     if any(
         p.get("manual_plan_id") == plan_id
-        and (p.get("fill_qty") or p.get("status") in {"open", "pending_exit", "closed"})
+        and p.get("status") in {"open", "pending_entry", "pending_exit"}
         for p in positions
     ):
         raise HTTPException(
             status_code=409,
-            detail="watch already executed; manage the position instead",
+            detail="watch has a live position; close it first",
         )
     plan = cancel_plan(plan_id, path=MANUAL_DAY_TRADE_PLANS_PATH)
     if plan is None:
