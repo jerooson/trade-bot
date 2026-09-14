@@ -21,3 +21,11 @@ def test_idea_with_only_a_ratio_is_not_auto_eligible():
     idea = parse_heat_idea("NFLX可以关注一下。今天站上了8日线和21日线，需要站上fib 0.236",
                            idea_id="n1", created_at="2026-09-14T16:33:00+00:00")
     assert idea is not None and idea["trigger_price"] is None and idea["auto_eligible"] is False
+
+
+def test_bare_fib_ratio_values_are_not_levels():
+    assert _trigger_from("TSLA 跌破0.886又收回，关注反弹力度") is None
+    assert _trigger_from("NFLX 站上0.236,目标上方黄线") is None
+    assert _trigger_from("突破0.886可以看多") is None
+    assert _trigger_from("BTE 站上 5.02") == 5.02          # a real sub-$10 level survives
+    assert _trigger_from("站上 1.5 的位置") == 1.5           # not a fib ratio

@@ -202,7 +202,9 @@ def _trigger_from(text: str) -> float | None:
                 value = float(match.group(1))
             except (TypeError, ValueError):
                 continue
-            if value > 0:
+            # ``跌破0.886`` / ``站上0.236``: a bare Fibonacci ratio is a line
+            # name, not a dollar level, even without the word ``fib``.
+            if value > 0 and not (value < 5 and looks_like_fib_ratio(value)):
                 return value
     return None
 
