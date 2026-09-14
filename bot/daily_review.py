@@ -193,7 +193,8 @@ def discord_plans_section(signals: list[dict[str, Any]], day: date) -> dict[str,
 
 
 def option_shadow_section(events: list[dict[str, Any]], state: dict[str, Any], day: date) -> dict[str, Any]:
-    today = [e for e in events if _on(e.get("ts"), day)]
+    voided = {e.get("idea_id") for e in events if e.get("event") == "void"}
+    today = [e for e in events if _on(e.get("ts"), day) and e.get("idea_id") not in voided]
     opens = [e for e in today if e["event"] == "open"]
     closed = [e for e in today if e["event"] == "closed"]
     pct = [c["realized_pct"] for c in closed]

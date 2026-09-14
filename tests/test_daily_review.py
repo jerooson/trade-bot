@@ -94,3 +94,16 @@ def test_discord_embeds_respect_limits(tmp_path):
     assert all(len(f["value"]) <= 1024 and len(f["name"]) <= 256 for f in e["fields"])
     total = len(e["title"]) + sum(len(f["name"]) + len(f["value"]) for f in e["fields"]) + len(e.get("description", ""))
     assert total <= 6000
+
+
+def test_voided_option_shadow_trades_are_excluded(tmp_path):
+    p = dr.Paths(tmp_path)
+    _jsonl(p.option_shadow, [
+        {"event": "open", "idea_id": "bad", "ticker": "ASTS", "contract": {"expiration": "2026-09-18", "strike": 58.0, "kind": "call"},
+         "price": 2.21, "underlying": 57.8, "ts": "2026-09-14T13:30:00+00:00"},
+        {"event": "closed", "idea_id": "bad", "ticker": "ASTS", "exit_reason": "eod", "realized_pct": 44.8, "realized_usd": 990.0,
+         "max_gain_pct": 67.4, "ts": "2026-09-14T19:50:00+00:00"},
+        {"event": "void", "idea_id": "bad", "ticker": "ASTS", "reason": "mis-parsed ratio", "ts": "2026-09-14T21:30:00+00:00"},
+    ])
+    r = dr.build(date(2026, 9, 14), p)
+    assert r["option_shadow"]["opened"] == [] and r["option_shadow"]["summary"]["n"] == 0
