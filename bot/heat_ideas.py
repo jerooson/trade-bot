@@ -69,7 +69,7 @@ _ENTRY_INTENT_RE = re.compile(
 # ``站上fib 1.618 64.21了``: the ratio names the line, the price follows it.
 _FIB_LABEL_PATTERN = re.compile(
     r"(?:站上|突破|超过|高于|above|over|reclaim(?:s|ed)?)[^0-9A-Za-z]{0,12}"
-    r"(?:fibs?|fibo)\s*[0-9]+(?:\.[0-9]+)?\s*\$?([0-9]{2,}(?:\.[0-9]+)?)",
+    r"(?:fibs?|fibo)\s*[0-9]+(?:\.[0-9]+)?(?![0-9.])[\s,，]+\$?([0-9]{2,}(?:\.[0-9]+)?)",
     re.I,
 )
 
