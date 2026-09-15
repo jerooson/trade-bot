@@ -22,7 +22,7 @@ class FakeSession:
         if tool == "get_equity_quotes":
             return {"data": {"results": [{"quote": {"symbol": s, "last_trade_price": str(self.price)}} for s in kw["symbols"]]}}
         if tool == "get_option_chains":
-            return {"data": {"chains": [{"symbol": kw["underlying_symbol"], "expiration_dates": ["2026-09-11", "2026-09-14", "2026-09-18"]}]}}
+            return {"data": {"chains": [{"symbol": kw["underlying_symbol"], "expiration_dates": ["2026-09-11", "2026-09-14", "2026-09-18", "2026-09-25"]}]}}
         if tool == "get_option_instruments":
             page = kw.get("cursor")
             if page is None:
@@ -59,7 +59,7 @@ def _idea(**over):
 
 def test_nearest_expiration_and_contract_skip_untradable_and_paginate():
     s = FakeSession()
-    assert nearest_expiration(s, "XYZ", _now().date()) == "2026-09-14"
+    assert nearest_expiration(s, "XYZ", _now().date()) == "2026-09-18"     # Monday -> this Friday
     c = nearest_contract(s, "XYZ", "2026-09-14", "call", 100.4)
     assert c.instrument_id == "k101" and c.strike == 101.0
 
@@ -192,3 +192,12 @@ def test_dip_buy_below_level_has_no_level_stop():
     manage_open(sh, 705.0, bid=1.0, now=_now(10, 5))  # still below the level
     manage_open(sh, 704.0, bid=1.0, now=_now(10, 12)) # 7 minutes later, still below
     assert sh.status == "open" and sh.adverse_since is None
+
+
+def test_target_expiration_is_this_friday_or_next_on_friday():
+    from datetime import date
+    from bot.option_shadow import target_expiration
+    assert target_expiration(date(2026, 9, 14)) == date(2026, 9, 18)   # Monday
+    assert target_expiration(date(2026, 9, 17)) == date(2026, 9, 18)   # Thursday
+    assert target_expiration(date(2026, 9, 18)) == date(2026, 9, 25)   # Friday -> next Friday
+    assert target_expiration(date(2026, 9, 19)) == date(2026, 9, 25)   # Saturday

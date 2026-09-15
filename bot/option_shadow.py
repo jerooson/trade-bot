@@ -7,6 +7,7 @@ nearest-expiry option closest to the money (call for long ideas, put for
 short) at the ask and then manages the paper position with the mechanical
 part of Heat's rules (docs: data/heat_options_playbook.md, private):
 
+    expiry                this week's Friday (next Friday when today is Friday), never 0DTE
     +50 %                 sell half
     +100 %                reduce to the runner (RUNNER_FRACTION of the lot)
     target price reached  reduce to the runner
@@ -145,14 +146,24 @@ def _f(v: Any) -> float | None:
     return x if x > 0 else None
 
 
+def target_expiration(today: date) -> date:
+    """Heat's day-trade expiry: this week's Friday; on a Friday, next Friday (never 0DTE)."""
+    days_ahead = (4 - today.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return today + timedelta(days=days_ahead)
+
+
 def nearest_expiration(session: Session, symbol: str, today: date) -> str | None:
+    """First listed expiration on or after the target Friday (holiday Fridays roll forward)."""
     data = session.call("get_option_chains", underlying_symbol=symbol)
     chains = (data.get("data") or data).get("chains") or []
+    target = target_expiration(today).isoformat()
     dates: list[str] = []
     for ch in chains:
         if str(ch.get("symbol") or "").upper() != symbol.upper():
             continue
-        dates += [d for d in ch.get("expiration_dates") or [] if d >= today.isoformat()]
+        dates += [d for d in ch.get("expiration_dates") or [] if d >= target]
     return min(dates) if dates else None
 
 
