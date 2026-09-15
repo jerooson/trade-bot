@@ -201,3 +201,24 @@ def test_target_expiration_is_this_friday_or_next_on_friday():
     assert target_expiration(date(2026, 9, 17)) == date(2026, 9, 18)   # Thursday
     assert target_expiration(date(2026, 9, 18)) == date(2026, 9, 25)   # Friday -> next Friday
     assert target_expiration(date(2026, 9, 19)) == date(2026, 9, 25)   # Saturday
+
+
+def test_fills_record_book_size_and_flag_thin_books(monkeypatch):
+    monkeypatch.setattr(osh, "CONTRACTS", 4)
+
+    class S(FakeSession):
+        def call(self, tool, **kw):
+            if tool == "get_option_quotes":
+                return {"data": {"results": [{"quote": {"instrument_id": kw["instrument_ids"][0], "bid_price": "1.00",
+                                                        "ask_price": "1.10", "bid_size": 2, "ask_size": 9}}]}}
+            return super().call(tool, **kw)
+
+    s = S(price=100.2)
+    shadows = {}
+    run_once(s, shadows, _now(), ideas=[_idea()])
+    sh = shadows["i1"]
+    assert sh.qty == 4 and sh.fills[0]["ask_size"] == 9 and sh.fills[0]["book_ok"] is True
+    manage_open(sh, 101.0, bid=1.7, now=_now(10, 5), bid_size=1)      # +55% over the 1.10 ask: sell half = 2 > book of 1
+    assert sh.fills[-1]["qty"] == 2 and sh.fills[-1]["book_ok"] is False
+    rows = [__import__("json").loads(l) for l in osh.LEDGER_PATH.read_text(encoding="utf-8").splitlines()]
+    assert [r["book_ok"] for r in rows if r["event"] in ("open", "sell")] == [True, False]

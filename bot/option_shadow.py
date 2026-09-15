@@ -52,7 +52,7 @@ ET = ZoneInfo("America/New_York")
 LEDGER_PATH = Path(os.getenv("OPTION_SHADOW_LEDGER", "logs/option_shadow.jsonl"))
 STATE_PATH = Path(os.getenv("OPTION_SHADOW_STATE", "state/option_shadow.json"))
 POLL_S = float(os.getenv("OPTION_SHADOW_POLL_S", "15"))
-CONTRACTS = int(os.getenv("OPTION_SHADOW_CONTRACTS", "10"))
+CONTRACTS = int(os.getenv("OPTION_SHADOW_CONTRACTS", "4"))
 RUNNER_FRACTION = float(os.getenv("OPTION_SHADOW_RUNNER_FRACTION", "0.2"))
 MAX_IDEA_AGE_SESSIONS = int(os.getenv("OPTION_SHADOW_MAX_IDEA_AGE_SESSIONS", "10"))
 TRIM_HALF_PCT = 50.0
@@ -195,14 +195,19 @@ def nearest_contract(session: Session, symbol: str, expiration: str, kind: str, 
     return best
 
 
-def option_quote(session: Session, instrument_id: str) -> tuple[float | None, float | None]:
-    """(bid, ask) for one contract."""
+def option_quote(session: Session, instrument_id: str) -> tuple[float | None, float | None, int | None, int | None]:
+    """(bid, ask, bid_size, ask_size) for one contract; sizes are top-of-book contracts."""
     data = session.call("get_option_quotes", instrument_ids=[instrument_id])
     for item in (data.get("data") or data).get("results") or []:
         q = item.get("quote") or item
         if str(q.get("instrument_id")) == instrument_id:
-            return _f(q.get("bid_price")), _f(q.get("ask_price"))
-    return None, None
+            def _i(v: Any) -> int | None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+            return _f(q.get("bid_price")), _f(q.get("ask_price")), _i(q.get("bid_size")), _i(q.get("ask_size"))
+    return None, None, None, None
 
 
 def underlying_prices(session: Session, symbols: list[str]) -> dict[str, float]:
@@ -247,16 +252,21 @@ def target_hit(price: float, target: float | None, direction: str) -> bool:
     return price >= target if direction == "long" else price <= target
 
 
-def _sell(s: Shadow, qty: int, bid: float, reason: str, now: datetime) -> None:
+def _sell(s: Shadow, qty: int, bid: float, reason: str, now: datetime, bid_size: int | None = None) -> None:
     qty = max(0, min(qty, s.qty_open))
     if qty == 0:
         return
     pnl = (bid - float(s.entry_price)) * MULTIPLIER * qty
     s.qty_open -= qty
     s.realized_usd += pnl
-    s.fills.append({"ts": now.isoformat(), "side": "sell", "qty": qty, "price": bid, "reason": reason, "pnl_usd": round(pnl, 2)})
+    # book_ok: the whole lot fits inside the top-of-book size, i.e. the paper
+    # fill price is realistic for a market order of this size.
+    book_ok = None if bid_size is None else bid_size >= qty
+    s.fills.append({"ts": now.isoformat(), "side": "sell", "qty": qty, "price": bid, "reason": reason, "pnl_usd": round(pnl, 2),
+                    "bid_size": bid_size, "book_ok": book_ok})
     append_ledger({"event": "sell", "idea_id": s.idea_id, "ticker": s.ticker, "contract": s.contract, "qty": qty,
-                   "price": bid, "reason": reason, "pnl_usd": round(pnl, 2), "qty_open": s.qty_open, "ts": now.isoformat()})
+                   "price": bid, "bid_size": bid_size, "book_ok": book_ok, "reason": reason, "pnl_usd": round(pnl, 2),
+                   "qty_open": s.qty_open, "ts": now.isoformat()})
     if s.qty_open == 0:
         s.status = "closed"
         s.exit_reason = reason
@@ -267,7 +277,7 @@ def _sell(s: Shadow, qty: int, bid: float, reason: str, now: datetime) -> None:
                        "max_gain_pct": round(s.max_gain_pct, 2), "exit_reason": reason, "ts": now.isoformat()})
 
 
-def manage_open(s: Shadow, underlying: float, bid: float | None, now: datetime) -> None:
+def manage_open(s: Shadow, underlying: float, bid: float | None, now: datetime, bid_size: int | None = None) -> None:
     """Apply the mechanical rules to one open shadow."""
     if bid is None:
         return
@@ -276,22 +286,22 @@ def manage_open(s: Shadow, underlying: float, bid: float | None, now: datetime) 
     runner = max(1, round(s.qty * RUNNER_FRACTION))
 
     if now.time() >= FLATTEN_TIME:
-        _sell(s, s.qty_open, bid, "eod", now)
+        _sell(s, s.qty_open, bid, "eod", now, bid_size)
         return
     if gain_pct <= STOP_PCT:
-        _sell(s, s.qty_open, bid, "stop_30pct", now)
+        _sell(s, s.qty_open, bid, "stop_30pct", now, bid_size)
         return
     if adverse(underlying, s.trigger, s.operator, s.direction):
         if s.adverse_since is None:
             s.adverse_since = now.isoformat()
         elif (now - datetime.fromisoformat(s.adverse_since)).total_seconds() >= ADVERSE_HOLD_S:
-            _sell(s, s.qty_open, bid, "stop_level", now)
+            _sell(s, s.qty_open, bid, "stop_level", now, bid_size)
             return
     else:
         s.adverse_since = None
     if not s.trimmed_runner and (gain_pct >= RUNNER_PCT or target_hit(underlying, s.target, s.direction)):
         reason = "trim_runner_100pct" if gain_pct >= RUNNER_PCT else "trim_runner_target"
-        _sell(s, s.qty_open - runner, bid, reason, now)
+        _sell(s, s.qty_open - runner, bid, reason, now, bid_size)
         s.trimmed_runner = True
         s.trimmed_half = True
         return
@@ -308,19 +318,22 @@ def open_shadow(session: Session, s: Shadow, underlying: float, now: datetime) -
     contract = nearest_contract(session, s.ticker, expiration, kind, underlying)
     if contract is None:
         return False
-    bid, ask = option_quote(session, contract.instrument_id)
+    bid, ask, bid_size, ask_size = option_quote(session, contract.instrument_id)
     if ask is None:
         return False
+    book_ok = None if ask_size is None else ask_size >= CONTRACTS
     s.contract = asdict(contract)
     s.entry_ts = now.isoformat()
     s.entry_price = ask
     s.underlying_at_entry = underlying
     s.qty = s.qty_open = CONTRACTS
     s.status = "open"
-    s.fills.append({"ts": now.isoformat(), "side": "buy", "qty": CONTRACTS, "price": ask, "bid": bid})
+    s.fills.append({"ts": now.isoformat(), "side": "buy", "qty": CONTRACTS, "price": ask, "bid": bid,
+                    "ask_size": ask_size, "bid_size": bid_size, "book_ok": book_ok})
     append_ledger({"event": "open", "idea_id": s.idea_id, "ticker": s.ticker, "direction": s.direction,
                    "trigger": s.trigger, "target": s.target, "contract": s.contract, "qty": CONTRACTS,
-                   "price": ask, "bid": bid, "underlying": underlying, "ts": now.isoformat()})
+                   "price": ask, "bid": bid, "ask_size": ask_size, "bid_size": bid_size, "book_ok": book_ok,
+                   "underlying": underlying, "ts": now.isoformat()})
     return True
 
 
@@ -415,8 +428,8 @@ def run_once(session: Session, shadows: dict[str, Shadow], now: datetime, ideas:
             elif s.status == "open":
                 # contracts expire at their own close; a shadow still open past
                 # expiration is force-closed at the last bid we can get
-                bid, _ask = option_quote(session, s.contract["instrument_id"])
-                manage_open(s, px, bid, now)
+                bid, _ask, bid_size, _ask_size = option_quote(session, s.contract["instrument_id"])
+                manage_open(s, px, bid, now, bid_size)
     # drop closed/expired shadows from state (they live in the ledger)
     for iid in [k for k, v in shadows.items() if v.status in ("closed", "expired")]:
         shadows.pop(iid)
@@ -433,7 +446,9 @@ def report(path: Path | None = None) -> str:
     closed = [r for r in rows if r["event"] == "closed" and r["idea_id"] not in voided]
     watches = sum(1 for r in rows if r["event"] == "watch")
     opens = sum(1 for r in rows if r["event"] == "open")
-    lines = [f"watches={watches} opened={opens} closed={len(closed)}"]
+    fills = [r for r in rows if r["event"] in ("open", "sell") and r.get("idea_id") not in voided]
+    thin = [r for r in fills if r.get("book_ok") is False]
+    lines = [f"watches={watches} opened={opens} closed={len(closed)}  fills={len(fills)} thin-book={len(thin)}"]
     if closed:
         pct = [r["realized_pct"] for r in closed]
         usd = [r["realized_usd"] for r in closed]
