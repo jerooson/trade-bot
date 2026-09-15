@@ -306,7 +306,7 @@ def manage_open(s: Shadow, underlying: float, bid: float | None, now: datetime, 
         s.trimmed_half = True
         return
     if not s.trimmed_half and gain_pct >= TRIM_HALF_PCT:
-        _sell(s, s.qty_open - max(runner, s.qty_open // 2), bid, "trim_half_50pct", now)
+        _sell(s, s.qty_open - max(runner, s.qty_open // 2), bid, "trim_half_50pct", now, bid_size)
         s.trimmed_half = True
 
 
