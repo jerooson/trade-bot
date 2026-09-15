@@ -29,3 +29,10 @@ def test_bare_fib_ratio_values_are_not_levels():
     assert _trigger_from("突破0.886可以看多") is None
     assert _trigger_from("BTE 站上 5.02") == 5.02          # a real sub-$10 level survives
     assert _trigger_from("站上 1.5 的位置") == 1.5           # not a fib ratio
+
+
+def test_reclaim_wording_is_a_long_level():
+    idea = parse_heat_idea("QQQ 站回705，开始反弹", idea_id="r1", created_at="2026-09-15T15:05:00+00:00")
+    assert idea is not None and idea["trigger_price"] == 705.0
+    assert idea["direction"] == "long" and idea["trigger_operator"] == "above" and idea["auto_eligible"] is True
+    assert _trigger_from("SPY 收回 770 了") == 770.0

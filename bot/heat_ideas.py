@@ -62,20 +62,20 @@ _MARKET_CONTEXT_RE = re.compile(
 )
 _WATCH_RE = re.compile(r"(?:关注|留意|能否|等待|watch)", re.I)
 _ENTRY_INTENT_RE = re.compile(
-    r"(?:关注|留意|突破|站上|超过|高于|买入|买了|买点|建仓|做多|考虑操作|看好|bought|breakout|"
+    r"(?:关注|留意|突破|站上|站回|收回|收复|超过|高于|买入|买了|买点|建仓|做多|考虑操作|看好|bought|breakout|"
     r"break\s*(?:out|above)|buy|long|reclaim)",
     re.I,
 )
 # ``站上fib 1.618 64.21了``: the ratio names the line, the price follows it.
 _FIB_LABEL_PATTERN = re.compile(
-    r"(?:站上|突破|超过|高于|above|over|reclaim(?:s|ed)?)[^0-9A-Za-z]{0,12}"
+    r"(?:站上|站回|收回|收复|重新站上|突破|超过|高于|above|over|reclaim(?:s|ed)?)[^0-9A-Za-z]{0,12}"
     r"(?:fibs?|fibo)\s*[0-9]+(?:\.[0-9]+)?(?![0-9.])[\s,，]+\$?([0-9]{2,}(?:\.[0-9]+)?)",
     re.I,
 )
 
 _TRIGGER_PATTERNS = (
     re.compile(
-        r"(?:站上|突破|超过|高于|above|over|reclaim(?:s|ed)?|break(?:s|ing)?\s*(?:above|over)?)"
+        r"(?:站上|站回|收回|收复|重新站上|突破|超过|高于|above|over|reclaim(?:s|ed)?|break(?:s|ing)?\s*(?:above|over)?)"
         r"[^0-9]{0,18}\$?([0-9]+(?:\.[0-9]+)?)",
         re.I,
     ),
