@@ -251,8 +251,7 @@ def build(day: date, paths: Paths | None = None, now: datetime | None = None) ->
     now = now or datetime.now(ET)
     raw_ideas = read_jsonl(paths.heat_ideas)
     ideas = materialize_heat_ideas(raw_ideas, read_jsonl(paths.heat_decisions))
-    chatter = [{"time": _hm(e.get("created_at")), "text": str(e.get("text") or "")[:90].replace("
-", " "),
+    chatter = [{"time": _hm(e.get("created_at")), "text": str(e.get("text") or "")[:90].replace("\n", " "),
                 "attachments": len(e.get("attachments") or [])}
                for e in raw_ideas if e.get("event_type") == "chatter" and _on(e.get("created_at"), day)]
     positions = read_latest_day_positions(paths.positions) if paths.positions.exists() else []
