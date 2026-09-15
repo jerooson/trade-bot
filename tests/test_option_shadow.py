@@ -77,9 +77,11 @@ def test_watch_opens_on_cross_at_ask():
 
 
 def test_short_idea_buys_put():
-    s = FakeSession(price=99.0)
+    s = FakeSession(price=101.0)
     shadows = {}
-    run_once(s, shadows, _now(), ideas=[_idea(direction="short", trigger_operator="below")])
+    run_once(s, shadows, _now(), ideas=[_idea(direction="short", trigger_operator="below")])   # arms above the level
+    s.price = 99.0
+    run_once(s, shadows, _now(10, 1), ideas=[_idea(direction="short", trigger_operator="below")])
     assert shadows["i1"].status == "open" and shadows["i1"].contract["kind"] == "put"
 
 
@@ -161,9 +163,11 @@ def test_implausible_trigger_never_opens_a_shadow():
 
 
 def test_idea_is_shadowed_at_most_once():
-    s = FakeSession(price=100.2)
+    s = FakeSession(price=99.0)
     shadows = {}
     run_once(s, shadows, _now(), ideas=[_idea()])
+    s.price = 100.2
+    run_once(s, shadows, _now(10, 1), ideas=[_idea()])
     assert shadows["i1"].status == "open"
     shadows["i1"].status = "closed"
     run_once(s, shadows, _now(10, 1), ideas=[_idea()])       # closed shadow dropped, idea still approved
@@ -213,12 +217,38 @@ def test_fills_record_book_size_and_flag_thin_books(monkeypatch):
                                                         "ask_price": "1.10", "bid_size": 2, "ask_size": 9}}]}}
             return super().call(tool, **kw)
 
-    s = S(price=100.2)
+    s = S(price=99.0)
     shadows = {}
     run_once(s, shadows, _now(), ideas=[_idea()])
+    s.price = 100.2
+    run_once(s, shadows, _now(10, 1), ideas=[_idea()])
     sh = shadows["i1"]
     assert sh.qty == 4 and sh.fills[0]["ask_size"] == 9 and sh.fills[0]["book_ok"] is True
     manage_open(sh, 101.0, bid=1.7, now=_now(10, 5), bid_size=1)      # +55% over the 1.10 ask: sell half = 2 > book of 1
     assert sh.fills[-1]["qty"] == 2 and sh.fills[-1]["book_ok"] is False
     rows = [__import__("json").loads(l) for l in osh.LEDGER_PATH.read_text(encoding="utf-8").splitlines()]
     assert [r["book_ok"] for r in rows if r["event"] in ("open", "sell")] == [True, False]
+
+
+def test_watch_created_beyond_the_level_waits_for_a_retest():
+    s = FakeSession(price=108.5)                       # already above the 100 line at creation
+    shadows = {}
+    run_once(s, shadows, _now(9, 31), ideas=[_idea()])
+    assert shadows["i1"].status == "watching" and shadows["i1"].armed is False
+    s.price = 99.5                                     # retest below
+    run_once(s, shadows, _now(9, 40), ideas=[_idea()])
+    assert shadows["i1"].armed is True and shadows["i1"].status == "watching"
+    s.price = 100.3
+    run_once(s, shadows, _now(9, 45), ideas=[_idea()])
+    assert shadows["i1"].status == "open"
+
+
+def test_one_open_shadow_per_ticker():
+    s = FakeSession(price=99.0)
+    ideas = [_idea(), _idea(id="i2", trigger_price=101.0)]
+    shadows = {}
+    run_once(s, shadows, _now(), ideas=ideas)          # both armed below their levels
+    s.price = 101.5                                    # crosses both
+    run_once(s, shadows, _now(10, 1), ideas=ideas)
+    opened = [k for k, v in shadows.items() if v.status == "open"]
+    assert len(opened) == 1

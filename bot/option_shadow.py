@@ -87,6 +87,7 @@ class Shadow:
     operator: str        # above | below
     target: float | None
     status: str = "watching"      # watching | open | closed | expired
+    armed: bool = False           # price has been seen on the far side of the level since the watch was created
     contract: dict[str, Any] | None = None
     entry_ts: str | None = None
     entry_price: float | None = None     # per-share option premium (ask)
@@ -420,7 +421,16 @@ def run_once(session: Session, shadows: dict[str, Shadow], now: datetime, ideas:
                     append_ledger({"event": "expired", "idea_id": s.idea_id, "ticker": s.ticker,
                                    "reason": f"implausible_trigger {s.trigger} vs {px}", "ts": now.isoformat()})
                     continue
+                # Arm like the day trader: the level must be approached from the
+                # other side.  A watch created while price already sits beyond the
+                # level (QQQ opening above a "站上708" line) waits for a retest.
+                if not s.armed:
+                    if not crossed(px, s.trigger, s.operator):
+                        s.armed = True
+                    continue
                 if crossed(px, s.trigger, s.operator) and now.time() < FLATTEN_TIME:
+                    if any(o.status == "open" and o.ticker == s.ticker for o in shadows.values()):
+                        continue     # one paper position per ticker at a time
                     try:
                         open_shadow(session, s, px, now)
                     except Exception as exc:  # noqa: BLE001 - keep polling other ideas
