@@ -377,3 +377,28 @@ uptrend filter doing the work, and the uptrend filter alone was worth about
 +1 % per five-session hold in this window with the same stop.  Data path is
 ready (Robinhood's `get_equity_technical_indicators` returns 4H EMA series
 directly) if a larger sample ever changes the picture.
+
+## 10. "跌破X又收回": dip-buy or reclaim? (2026-09-15)
+
+Heat's own posts with a numeric level of this form are too few to replay
+(one or two), so the mechanic was tested on his 52 names, 2026-07-16..09-11,
+with three daily "support lines" a dip can reach: SMA21, SMA8 and the prior
+day's low, whenever the line sat within 3 % below the prior close (1,886
+symbol-day events). Two entries at the same line, same live exit rules:
+buy when price first crosses *below* the line (what the bot did on 9/14),
+or buy when price crosses back *above* it after having been below (reclaim),
+with and without the 1-minute close confirmation.
+
+| line | dip-buy (n) | reclaim, touch (n) | reclaim, close (n) |
+|---|---|---|---|
+| SMA21 | -0.10 % (120) | -0.12 % (112) | +0.03 % (99) |
+| SMA8 | +0.15 % (201) | +0.23 % (197) | +0.10 % (166) |
+| prior-day low | +0.01 % (451) | +0.05 % (422) | +0.02 % (378) |
+
+Everything is within a tenth of a percent of zero; stop-1 % and hold
+variants do not change that. Neither entry is a strategy on its own, and the
+reclaim version is at best a few hundredths better than the dip-buy. The
+parser choice therefore cannot be settled by P&L; it is about meaning: the
+sentence says "it must get back above 706", so the actionable event is the
+reclaim, and a reclaim entry has a natural stop (the dip low) that a dip-buy
+does not. Decision left to the owner; not changed.
