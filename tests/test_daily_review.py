@@ -107,3 +107,15 @@ def test_voided_option_shadow_trades_are_excluded(tmp_path):
     ])
     r = dr.build(date(2026, 9, 14), p)
     assert r["option_shadow"]["opened"] == [] and r["option_shadow"]["summary"]["n"] == 0
+
+
+def test_unrecognised_heat_chatter_is_listed(tmp_path):
+    p = dr.Paths(tmp_path)
+    _jsonl(p.heat_ideas, [
+        {"event_type": "chatter", "id": "c1", "text": "QQQ 站回705，开始反弹", "attachments": [],
+         "created_at": "2026-09-15T15:05:00+00:00"},
+    ])
+    r = dr.build(date(2026, 9, 15), p)
+    assert r["heat"]["chatter"][0]["text"].startswith("QQQ 站回705")
+    assert "Not recognised as signals (1)" in dr.render_markdown(r)
+    assert any("未识别为信号" in f["value"] for f in dr.discord_embeds(r)[0]["fields"])

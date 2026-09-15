@@ -400,6 +400,20 @@ def build_client(config: ListenerConfig) -> discord.Client:
                     "discord": _discord_metadata(message),
                 })
                 log.info("HEAT_CHART idea=%s attachments=%d", idea_id, len(attachments))
+            return
+
+        # Everything else Heat says is kept as chatter so the daily review can
+        # show what the parser did not recognise (nothing is ever traded from it).
+        if body:
+            append_heat_jsonl(config.heat_log_path, {
+                "event_type": "chatter",
+                "id": str(message.id),
+                "text": body[:1000],
+                "attachments": attachments,
+                "created_at": created_at,
+                "discord": _discord_metadata(message),
+            })
+            log.info("HEAT_CHATTER %s", body[:60].replace("\n", " "))
 
     return client
 

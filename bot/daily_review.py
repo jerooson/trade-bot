@@ -249,12 +249,17 @@ def _load_json(path: Path) -> dict[str, Any]:
 def build(day: date, paths: Paths | None = None, now: datetime | None = None) -> dict[str, Any]:
     paths = paths or Paths()
     now = now or datetime.now(ET)
-    ideas = materialize_heat_ideas(read_jsonl(paths.heat_ideas), read_jsonl(paths.heat_decisions))
+    raw_ideas = read_jsonl(paths.heat_ideas)
+    ideas = materialize_heat_ideas(raw_ideas, read_jsonl(paths.heat_decisions))
+    chatter = [{"time": _hm(e.get("created_at")), "text": str(e.get("text") or "")[:90].replace("
+", " "),
+                "attachments": len(e.get("attachments") or [])}
+               for e in raw_ideas if e.get("event_type") == "chatter" and _on(e.get("created_at"), day)]
     positions = read_latest_day_positions(paths.positions) if paths.positions.exists() else []
     report = {
         "date": day.isoformat(),
         "generated_at": now.isoformat(),
-        "heat": heat_section(ideas, day),
+        "heat": {**heat_section(ideas, day), "chatter": chatter},
         "chart_analyzer": chart_section(read_jsonl(paths.chart_analyses), day),
         "day_trades": day_trade_section(positions, day),
         "heat_vs_bot": heat_vs_bot(ideas, positions, day),
@@ -294,6 +299,8 @@ def render_markdown(r: dict[str, Any]) -> str:
         L += [f"| {i['time']} | {i['ticker']} | {i['direction']} | {i['operator']} {_num(i['trigger'])} | {i['status']} | {i['text']} |" for i in h["approved"]]
     if h["needs_review"]:
         L += ["", f"Still needs review ({len(h['needs_review'])}):"] + [f"- {i['time']} {i['ticker']} [{i['attachments']} img] {i['text']}" for i in h["needs_review"]]
+    if h.get("chatter"):
+        L += ["", f"Not recognised as signals ({len(h['chatter'])}):"] + [f"- {c['time']} {c['text']}" for c in h["chatter"]]
     if h["option_posts"]:
         L += ["", f"Option posts recorded: {len(h['option_posts'])}"] + [f"- {i['time']} {i['ticker']} {i['text']}" for i in h["option_posts"]]
     c = r["chart_analyzer"]
@@ -524,7 +531,7 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
     fields.append(_field("📈 日内交易", trade_lines))
 
     # --- Heat: one entry per post, time-ordered: status line + his words ---
-    heat_lines = [f"{h['count']} 条 · 自动批准 {len(h['approved'])} · 待审 {len(h['needs_review'])} · 期权帖 {len(h['option_posts'])}"]
+    heat_lines = [f"{h['count']} 条 · 自动批准 {len(h['approved'])} · 待审 {len(h['needs_review'])} · 期权帖 {len(h['option_posts'])} · 未识别 {len(h.get('chatter') or [])}"]
     for x in r["heat_vs_bot"]:
         outcome = x["outcome"]
         icon = ("✅" if outcome.startswith("traded") else "⏳" if outcome == "watching_not_triggered"
@@ -534,6 +541,9 @@ def discord_embeds(r: dict[str, Any]) -> list[dict[str, Any]]:
         heat_lines.append(f"{icon} **{_when(x, r['date'])} {x['ticker'] or '?'}**{lvl} · {_parse_label(x)} → {_outcome_label(x)}")
         if x.get("text"):
             heat_lines.append(f"> {x['text'][:80]}")
+    for c in h.get("chatter") or []:
+        heat_lines.append(f"💬 **{c['time']}** 未识别为信号{' 🖼' if c['attachments'] else ''}")
+        heat_lines.append(f"> {c['text'][:80]}")
     fields += _split_field("🔥 Heat 信号 → bot 动作", heat_lines)
 
     dp = r["discord_plans_recorded"]
