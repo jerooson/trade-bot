@@ -175,7 +175,12 @@ def nearest_contract(session: Session, symbol: str, expiration: str, kind: str, 
         nxt = body.get("next")
         if not nxt:
             break
-        cursor = nxt.split("cursor=")[-1].split("&")[0] if "cursor=" in str(nxt) else str(nxt)
+        # ``next`` is a full URL whose cursor is percent-encoded (``%3D%3D``);
+        # the tool wants the decoded value.
+        from urllib.parse import parse_qs, urlparse
+        cursor = (parse_qs(urlparse(str(nxt)).query).get("cursor") or [None])[0]
+        if not cursor:
+            break
     return best
 
 
@@ -211,7 +216,17 @@ def crossed(price: float, trigger: float, operator: str) -> bool:
     return price >= trigger if operator == "above" else price <= trigger
 
 
-def adverse(price: float, trigger: float, operator: str) -> bool:
+def adverse(price: float, trigger: float, operator: str, direction: str = "long") -> bool:
+    """Breakout failed: price back on the wrong side of the level.
+
+    Only meaningful when the level was crossed in the trade's direction
+    (long above / short below).  A long entered on a dip *below* the level
+    (``跌破706，必须站上去``) starts on the wrong side by construction, so the
+    level stop does not apply; the -30 % option stop and the EOD flatten do.
+    """
+    breakout = (direction == "long" and operator == "above") or (direction == "short" and operator == "below")
+    if not breakout:
+        return False
     return price < trigger if operator == "above" else price > trigger
 
 
@@ -255,7 +270,7 @@ def manage_open(s: Shadow, underlying: float, bid: float | None, now: datetime) 
     if gain_pct <= STOP_PCT:
         _sell(s, s.qty_open, bid, "stop_30pct", now)
         return
-    if adverse(underlying, s.trigger, s.operator):
+    if adverse(underlying, s.trigger, s.operator, s.direction):
         if s.adverse_since is None:
             s.adverse_since = now.isoformat()
         elif (now - datetime.fromisoformat(s.adverse_since)).total_seconds() >= ADVERSE_HOLD_S:

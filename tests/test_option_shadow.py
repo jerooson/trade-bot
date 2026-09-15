@@ -170,3 +170,25 @@ def test_idea_is_shadowed_at_most_once():
     assert "i1" not in shadows
     run_once(s, shadows, _now(10, 2), ideas=[_idea()])
     assert "i1" not in shadows                                # ledger says it already opened once
+
+
+def test_pagination_cursor_is_url_decoded():
+    class S(FakeSession):
+        def call(self, tool, **kw):
+            if tool == "get_option_instruments" and kw.get("cursor") is None:
+                return {"data": {"instruments": [{"id": "k95", "strike_price": "95.0000", "tradability": "tradable"}],
+                                 "next": "http://x/options/instruments/?chain_symbol=XYZ&cursor=cD02OTMuMDAwMA%3D%3D&type=call"}}
+            if tool == "get_option_instruments":
+                assert kw["cursor"] == "cD02OTMuMDAwMA=="
+                return {"data": {"instruments": [{"id": "k101", "strike_price": "101.0000", "tradability": "tradable"}], "next": None}}
+            return super().call(tool, **kw)
+    c = nearest_contract(S(), "XYZ", "2026-09-14", "call", 100.4)
+    assert c.instrument_id == "k101"
+
+
+def test_dip_buy_below_level_has_no_level_stop():
+    sh = _open_shadow()
+    sh.operator, sh.trigger = "below", 706.0          # long entered on a dip below 706
+    manage_open(sh, 705.0, bid=1.0, now=_now(10, 5))  # still below the level
+    manage_open(sh, 704.0, bid=1.0, now=_now(10, 12)) # 7 minutes later, still below
+    assert sh.status == "open" and sh.adverse_since is None
