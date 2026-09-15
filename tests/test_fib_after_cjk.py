@@ -36,3 +36,15 @@ def test_reclaim_wording_is_a_long_level():
     assert idea is not None and idea["trigger_price"] == 705.0
     assert idea["direction"] == "long" and idea["trigger_operator"] == "above" and idea["auto_eligible"] is True
     assert _trigger_from("SPY 收回 770 了") == 770.0
+
+
+def test_break_then_reclaim_is_traded_from_above():
+    idea = parse_heat_idea("QQQ又跌破706了，必须站上去", idea_id="q1", created_at="2026-09-14T14:23:00+00:00")
+    assert idea["trigger_price"] == 706.0 and idea["direction"] == "long" and idea["trigger_operator"] == "above"
+    idea = parse_heat_idea("TSLA 又跌破 fib 0.886 353.19，今天收盘需要站上去", idea_id="t1", created_at="2026-09-14T14:23:00+00:00")
+    assert idea["trigger_price"] == 353.19 and idea["trigger_operator"] == "above"
+
+
+def test_plain_break_without_reclaim_stays_below():
+    idea = parse_heat_idea("SMH 跌破 554.66 可以考虑做空", idea_id="s1", created_at="2026-09-14T14:23:00+00:00")
+    assert idea["trigger_price"] == 554.66 and idea["trigger_operator"] == "below" and idea["direction"] == "short"

@@ -46,6 +46,7 @@ _BELOW_RE = re.compile(
     re.I,
 )
 _RISK_RE = re.compile(r"(?:极高风险|高风险|风险很高|谨慎|小仓位|轻仓)", re.I)
+_RECLAIM_RE = re.compile(r"(?:站上|站回|收回|收复|站稳|重新站上|reclaim)", re.I)
 _SWING_DCA_RE = re.compile(
     r"(?:\bDCA\b|\bswing\b|multi[- ]?day|抄底|分批|波段|中长线|隔夜|持有几天)",
     re.I,
@@ -68,7 +69,7 @@ _ENTRY_INTENT_RE = re.compile(
 )
 # ``站上fib 1.618 64.21了``: the ratio names the line, the price follows it.
 _FIB_LABEL_PATTERN = re.compile(
-    r"(?:站上|站回|收回|收复|重新站上|突破|超过|高于|above|over|reclaim(?:s|ed)?)[^0-9A-Za-z]{0,12}"
+    r"(?:站上|站回|收回|收复|重新站上|突破|超过|高于|跌破|低于|above|over|below|under|reclaim(?:s|ed)?)[^0-9A-Za-z]{0,12}"
     r"(?:fibs?|fibo)\s*[0-9]+(?:\.[0-9]+)?(?![0-9.])[\s,，]+\$?([0-9]{2,}(?:\.[0-9]+)?)",
     re.I,
 )
@@ -290,7 +291,10 @@ def parse_heat_idea(
     ):
         return None
 
-    trigger_operator = "below" if _BELOW_RE.search(body) else "above"
+    # ``跌破706了，必须站上去``: the break is the warning, the reclaim is the
+    # actionable event, so the level is traded from above.  Only a plain break
+    # with no reclaim wording (``跌破X可以做空``) is a below-level trigger.
+    trigger_operator = "below" if (_BELOW_RE.search(body) and not _RECLAIM_RE.search(body)) else "above"
     mapping_supported = bool(direction and candidate_symbols(ticker, direction))
     # Heat explicitly labels some trades as unusually risky. Preserve the
     # parsed level for a fast review, but never auto-approve those messages.
